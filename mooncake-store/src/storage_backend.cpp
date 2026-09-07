@@ -1666,12 +1666,17 @@ VLOG(1) << "Written bucket with id: " << bucket_id;
         // Pre-check for duplicates before modifying any state
         for (const auto& key : committed_keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-                duplicate_found = true;
-                break;
+                LOG(WARNING)
+                    << "Duplicate key detected in BatchOffload: " << key
+                    << ", bucket_id=" << bucket_id
+                    << ". Returning OBJECT_ALREADY_EXISTS.";
+                lock.unlock();
+                CleanupOrphanedBucket(bucket_id);
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
         }
 
-// No duplicates found, safe to commit
+        // No duplicates found, safe to commit
         total_size_ += bucket_data_size + bucket_meta_size;
         object_bucket_map_.reserve(object_bucket_map_.size() +
                                    committed_keys.size());
@@ -1682,25 +1687,9 @@ VLOG(1) << "Written bucket with id: " << bucket_id;
                 LOG(ERROR) << "Unexpected duplicate key after pre-check: "
                            << committed_keys[i] << ", bucket_id=" << bucket_id;
             }
-            auto ts = 0LL;
-            // Update LRU timestamp for in case of eviction.
-            if (bucket_backend_config_.eviction_policy ==
-                BucketEvictionPolicy::LRU) {
-                ts =
-                    std::chrono::steady_clock::now().time_since_epoch().count();
-                bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
-            }
-            buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(ts, bucket_id);
         }
-        if (duplicate_found) {
-            LOG(ERROR) << "Reserved key became duplicated before commit, "
-                          "bucket_id="
-                       << bucket_id;
-            lock.unlock();
-            CleanupOrphanedBucket(bucket_id);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
+        buckets_.emplace(bucket_id, std::move(bucket));
+        lru_index_.emplace(0LL, bucket_id);
     }
     // Lock released. From this point forward, concurrent BatchLoad
     // can find the keys and read from the committed bucket files.
@@ -1709,22 +1698,6 @@ VLOG(1) << "Written bucket with id: " << bucket_id;
     // metadatas[i].transport_endpoint is empty here (it gets populated by
     // complete_handler before the RPC); int64_t fields carry the metadata
     // from BuildBucket unchanged.
-    if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket_keys, metadatas);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket_keys.size()
-                       << ", Bucket id: " << bucket_id;
-            // Master was NOT notified. The local index has entries that
-            // Master doesn't know about — a "client can read but Master
-            // doesn't know" ghost replica. Rollback the local commit
-            // (removes index entries + waits for inflight reads + deletes
-            // on-disk files).
-            RollbackCommittedBucket(bucket_id, bucket_keys);
-            return tl::make_unexpected(error_code);
-        }
-    }
-
     if (complete_handler != nullptr) {
         auto error_code =
             complete_handler(committed_keys, metadatas_for_notify);
@@ -2643,99 +2616,6 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
                          << ", error: " << ec.message();
         }
     }
-}
-
-void BucketStorageBackend::RollbackCommittedBucket(
-    int64_t bucket_id, const std::vector<std::string>& keys) {
-    std::shared_ptr<BucketMetadata> bucket_meta;
-
-    // Phase 1: Remove from metadata maps under exclusive lock.
-    // This prevents new readers from finding the keys.
-    {
-        SharedMutexLocker lock(&mutex_);
-
-        auto bucket_it = buckets_.find(bucket_id);
-        if (bucket_it == buckets_.end()) {
-            LOG(WARNING) << "RollbackCommittedBucket: bucket " << bucket_id
-                         << " not found in buckets_ — already removed?";
-            // Still clean up disk files in case they are orphaned
-            CleanupOrphanedBucket(bucket_id);
-            return;
-        }
-
-        // Save a reference for inflight-read waiting
-        bucket_meta = bucket_it->second;
-
-        // Remove all keys from object_bucket_map_
-        for (const auto& key : keys) {
-            auto obj_it = object_bucket_map_.find(key);
-            if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
-                    obj_it->second.data_size + obj_it->second.key_size;
-                object_bucket_map_.erase(obj_it);
-            }
-        }
-
-        // Remove bucket metadata
-        total_size_ -= bucket_meta->meta_size;
-        lru_index_.erase(
-            {bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
-             bucket_id});
-        buckets_.erase(bucket_it);
-    }
-
-    // Phase 2: Wait for inflight reads to drain.
-    // Readers that found the key before we removed it from the map
-    // hold a BucketReadGuard that keeps inflight_reads_ > 0.
-    // In practice this should never block: the bucket was committed and
-    // rolled back within microseconds — no reader had time to acquire a
-    // guard. But guard against the edge case anyway.
-    //
-    // Uses the same spin-then-sleep pattern as DeleteBucket (not the
-    // spin-then-yield pattern of FinalizeEviction) because rollback is a
-    // rare error-recovery path where CPU friendliness matters more than
-    // latency.
-    {
-        constexpr int kMaxSpinIterations = 1000;
-        constexpr auto kSleepDuration = std::chrono::microseconds(100);
-        constexpr auto kMaxWaitTime = std::chrono::seconds(10);
-        int spin_count = 0;
-        auto wait_start = std::chrono::steady_clock::now();
-        while (bucket_meta->inflight_reads_.load(std::memory_order_acquire) >
-               0) {
-            if (++spin_count > kMaxSpinIterations) {
-                std::this_thread::sleep_for(kSleepDuration);
-                spin_count = 0;
-                if (std::chrono::steady_clock::now() - wait_start >
-                    kMaxWaitTime) {
-                    LOG(ERROR)
-                        << "RollbackCommittedBucket: timed out waiting "
-                        << "for inflight reads on bucket " << bucket_id
-                        << " (inflight="
-                        << bucket_meta->inflight_reads_.load(
-                               std::memory_order_relaxed)
-                        << "). Leaving orphaned files on disk; they will "
-                        << "be cleaned up by Init() on next restart.";
-                    // Return WITHOUT deleting files. A reader is still
-                    // holding a guard, so deleting the files could cause
-                    // I/O errors on the read path. This matches
-                    // DeleteBucket's behavior (returns INTERNAL_ERROR
-                    // instead of deleting). The orphan will be recovered
-                    // by Init()'s orphan scan.
-                    return;
-                }
-            } else {
-                PAUSE();
-            }
-        }
-    }
-
-    // Phase 3: Delete on-disk files now that no readers remain.
-    CleanupOrphanedBucket(bucket_id);
-
-    LOG(INFO) << "RollbackCommittedBucket: rolled back bucket " << bucket_id
-              << " with " << keys.size() << " keys";
 }
 
 std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator

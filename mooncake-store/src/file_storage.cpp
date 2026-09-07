@@ -1057,7 +1057,7 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
 
         std::vector<std::string> single_key{storage_key};
         std::vector<int64_t> single_size{size};
-        auto allocate_res = AllocateBatch(single_key, single_size);
+        auto allocate_res = AllocateBatch(single_key, single_size, *client_buffer_allocator_);
         if (!allocate_res) {
             LOG(WARNING) << "SSD prefetch: AllocateBatch failed for key=" << key
                          << ", error=" << allocate_res.error();
@@ -1093,7 +1093,7 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
             }
             continue;
         }
-        std::vector<Slice> tx_slices{slice_it->second};
+        std::vector<Slice> tx_slices = slice_it->second;
         ErrorCode write_err = client_->PromotionWrite(
             alloc_result.value().memory_descriptor, tx_slices);
         if (write_err != ErrorCode::OK) {

@@ -5849,7 +5849,11 @@ RealClient::batch_get_into_internal(
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
-for (auto &offload_objects_it : offload_objects) {
+[[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
+    [[maybe_unused]] auto start_read_store_time =
+        std::chrono::steady_clock::now();
+
+    for (auto &offload_objects_it : offload_objects) {
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
             offload_objects_it.first, offload_objects_it.second);
         if (!batch_get_offload_result) {
