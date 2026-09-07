@@ -1015,19 +1015,12 @@ class BucketStorageBackend : public StorageBackendInterface {
     void CleanupOrphanedBucket(int64_t bucket_id);
 
     /**
-     * @brief Rollback a committed bucket from the local index when
-     * NotifyOffloadSuccess fails after local commit. Removes keys from
-     * object_bucket_map_, removes the bucket from buckets_ and lru_index_,
-     * waits for inflight reads to drain, then cleans up on-disk files.
-     *
-     * Called from BatchOffload when complete_handler fails after the local
-     * index has already been committed.
-     *
-     * @param bucket_id The bucket ID to roll back.
-     * @param keys The keys that were committed.
+     * @brief Undo a successful metadata commit when NotifyOffloadSuccess fails.
+     * Caller must delete on-disk bucket files separately via CleanupOrphanedBucket.
      */
     void RollbackCommittedBucket(int64_t bucket_id,
-                                 const std::vector<std::string>& keys);
+                                 const std::vector<std::string>& keys,
+                                 int64_t data_size, int64_t meta_size);
 
     // Holds eviction state between PrepareEviction and FinalizeEviction.
     // PrepareEviction removes buckets from metadata maps and returns this.

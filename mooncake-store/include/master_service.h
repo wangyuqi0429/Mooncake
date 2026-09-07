@@ -462,7 +462,7 @@ class MasterService {
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
-     * @brief Read-only single-key replica list query for admin use.
+* @brief Read-only single-key replica list query for admin use.
      * Unlike GetReplicaList, this does not grant leases, trigger
      * promotion, or update cache-hit metrics.
      */
@@ -485,6 +485,26 @@ class MasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                                 const TenantId& tenant_id);
+
+    /**
+     * @brief Read-only replica metadata for SSD prefetch.
+     *
+     * Unlike GetReplicaList, does not grant a lease, bump access metrics, or
+     * enqueue promotion-on-hit work.
+     */
+    auto GetReplicaListForPrefetch(const std::string& key)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
+    /**
+     * @brief Register an in-flight promotion task for SSD prefetch.
+     *
+     * Records a PromotionTask on the master without the promotion-on-hit
+     * frequency/watermark gates and without pushing onto the holder client's
+     * promotion_objects heartbeat queue. The caller must execute the transfer
+     * via FileStorage::PrefetchKeys (PromotionAllocStart path).
+     */
+    auto RegisterPrefetchTask(const UUID& client_id, const std::string& key)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Start a put operation for an object
@@ -1664,13 +1684,15 @@ class MasterService {
         uint64_t pending_quota_charge_bytes{0};
         std::chrono::system_clock::time_point start_time;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
-        // Execution failures so far in this admission chain. Read by
+// Execution failures so far in this admission chain. Read by
         // NotifyPromotionFailure before the task is erased and re-recorded as
         // execution_failures+1 until kMaxPromotionExecutionFailures. Note the
         // asymmetry with PromotionCandidate::execution_failures: admission
         // copies candidate -> task verbatim, failure re-record writes
         // task+1 -> candidate.
         uint32_t execution_failures{0};
+        bool from_prefetch{
+            false};  // set by RegisterPrefetchTask; enables protect lease
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards

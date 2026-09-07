@@ -215,6 +215,19 @@ constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
 constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
     "enable_client_http_server";
 constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+// Backoff window (seconds) for best-effort SSD prefetch after DRAM is
+// saturated: while active, prefetch is skipped so eviction/offload can
+// reclaim memory instead of competing with promotion. 0 disables the backoff.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_COOLDOWN_SEC =
+    "ssd_prefetch_cooldown_sec";
+// De-duplication / rate-limit TTL (seconds): the same key is prefetched at
+// most once per this period, suppressing duplicate triggers from concurrent
+// probes.
+constexpr const char* CONFIG_KEY_SSD_PREFETCH_DEDUP_TTL_SEC =
+    "ssd_prefetch_dedup_ttl_sec";
+// Max wait budget (milliseconds) on get when an SSD-only key has a prefetch
+// in flight. Polls every 1 ms and returns early once promotion completes.
+constexpr const char* CONFIG_KEY_SSD_GET_WAIT_MS = "ssd_get_wait_ms";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
@@ -222,6 +235,35 @@ static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
+static constexpr size_t DEFAULT_SSD_PREFETCH_COOLDOWN_SEC = 5;
+static constexpr size_t DEFAULT_SSD_PREFETCH_DEDUP_TTL_SEC = 30;
+// SSD->DRAM promotion p90 ~3 ms; 10 ms is enough headroom without wasting TTFT.
+static constexpr size_t DEFAULT_SSD_GET_WAIT_MS = 10;
+
+inline std::string NormalizeTenantId(const std::string& tenant_id) {
+    return tenant_id.empty() ? "default" : tenant_id;
+}
+
+inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
+                                              const std::string& key) {
+    const auto normalized_tenant = NormalizeTenantId(tenant_id);
+    std::string scoped_key;
+    scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
+    scoped_key.append(normalized_tenant);
+    scoped_key.push_back('\0');
+    scoped_key.append(key);
+    return scoped_key;
+}
+
+inline std::pair<std::string, std::string> ParseTenantScopedStorageKey(
+    const std::string& storage_key) {
+    const auto separator = storage_key.find('\0');
+    if (separator == std::string::npos) {
+        return {"default", storage_key};
+    }
+    return {NormalizeTenantId(storage_key.substr(0, separator)),
+            storage_key.substr(separator + 1)};
+}
 
 struct OffloadTaskItem {
     std::string tenant_id;
