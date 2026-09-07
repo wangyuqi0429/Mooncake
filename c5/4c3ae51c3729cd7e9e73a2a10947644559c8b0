@@ -1,0 +1,36 @@
+mooncake-store/src/master_service.cpp
+  s_2cc8bcf65244e3::t_179b1a36dd6be3 9329
+  s_2cc8bcf65244e3::t_ac7e6f3345fcd3 4257
+  s_2cc8bcf65244e3::t_1b6ba64e708522 4229
+mooncake-store/src/file_storage.cpp
+  s_2cc8bcf65244e3::t_fd38da7ba5cc61 1096
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "c54c3ae51c3729cd7e9e73a2a10947644559c8b0",
+  "prompts": {},
+  "sessions": {
+    "s_2cc8bcf65244e3": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9e2cdd5529a0ceb4ad5470",
+        "model": "DeepSeek-V4-Pro-Official__dev"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "external_session_id": "6a9e2cdd5529a0ceb4ad5470",
+        "source_scene": "unknown",
+        "client_type": "ide",
+        "operation_id": "6a9e2d905529a0ceb4ad54e1",
+        "session_id": "6a9e2cdd5529a0ceb4ad5470",
+        "tool_use_id": "6a9e2d905529a0ceb4ad54e1",
+        "tool_id": "Edit",
+        "edit_kind": "file_edit",
+        "tool_type": "agent",
+        "dedupe_key": "6a9e2cdd5529a0ceb4ad5470:6a9e2d905529a0ceb4ad54e1:afterEdit:e600fb89",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
