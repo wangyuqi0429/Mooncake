@@ -1093,7 +1093,7 @@ tl::expected<void, ErrorCode> FileStorage::PrefetchKeys(
             }
             continue;
         }
-        std::vector<Slice> tx_slices = slice_it->second;
+        std::vector<Slice> tx_slices{slice_it->second};
         ErrorCode write_err = client_->PromotionWrite(
             alloc_result.value().memory_descriptor, tx_slices);
         if (write_err != ErrorCode::OK) {

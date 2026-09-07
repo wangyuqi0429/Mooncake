@@ -4226,7 +4226,7 @@ auto MasterService::GetReplicaListForPrefetch(const std::string& key)
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     // NOTE: prefetch path is not tenant-aware; scope to the default tenant.
-    MetadataAccessorRO accessor(this, MakeObjectIdentity(key, "default"));
+    MetadataAccessorRO accessor(this, MakeObjectIdentity(key, TenantId::Default()));
     if (!accessor.Exists()) {
         VLOG(1) << "prefetch_metadata key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -4254,7 +4254,7 @@ auto MasterService::RegisterPrefetchTask(const UUID& client_id,
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // NOTE: prefetch path is not tenant-aware; scope to the default tenant.
-    MetadataAccessorRW accessor(this, MakeObjectIdentity(key, "default"));
+    MetadataAccessorRW accessor(this, MakeObjectIdentity(key, TenantId::Default()));
     if (!accessor.Exists()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -9326,7 +9326,7 @@ SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
     // Prefetch-promoted keys get the same lease as exist/get so DRAM survives
     // until the subsequent get() (see ssd-prefetch.md §5.3).
     if (from_prefetch) {
-        GrantLeaseForGroup(tenant_state, object_id.user_key, metadata);
+        metadata.GrantReadLease(std::chrono::milliseconds(default_kv_lease_ttl_));
     }
     return {};
 }
