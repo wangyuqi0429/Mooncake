@@ -1,0 +1,86 @@
+docs/yh/deployment.md
+  s_77532864f56382::t_a7ec257882f10d 101,157
+  s_0ec02903e14d7f::t_5cca47a1821c2b 47
+  s_0ae32c90870dab::t_875c978102a1a1 443,722
+docs/source/design/transfer-engine/kunpeng_ub_transport.md
+  s_30f4ea2b6bfd7f::t_a3f4d6b42acb52 27-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "aedf5cab173aebc556eb3dc6377e06e0f415f569",
+  "prompts": {},
+  "humans": {
+    "h_3bb1a18ecd2247": {
+      "author": "Wang_YQi <wangyuqi40@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_0ae32c90870dab": {
+      "agent_id": {
+        "tool": "trae-code-edit",
+        "id": "ai_tab-2026091416143401000315717078093F9",
+        "model": "default"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "external_session_id": "2026091416143401000315717078093F9",
+        "client_type": "ide",
+        "tool": "trae-code-edit",
+        "edit_kind": "file_edit",
+        "source_scene": "cue"
+      }
+    },
+    "s_0ec02903e14d7f": {
+      "agent_id": {
+        "tool": "trae-code-edit",
+        "id": "ai_tab-20260914161459010002154057914520A",
+        "model": "default"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "external_session_id": "20260914161459010002154057914520A",
+        "tool": "trae-code-edit",
+        "edit_kind": "file_edit",
+        "source_scene": "cue"
+      }
+    },
+    "s_30f4ea2b6bfd7f": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa7a7003a1cc920eeeafce7",
+        "model": "DeepSeek-V4-Pro-Official__dev"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "operation_id": "6aa7ac763a1cc920eeeafd46",
+        "tool_use_id": "6aa7ac763a1cc920eeeafd46",
+        "edit_kind": "file_edit",
+        "source_scene": "unknown",
+        "external_session_id": "6aa7a7003a1cc920eeeafce7",
+        "dedupe_key": "6aa7a7003a1cc920eeeafce7:6aa7ac763a1cc920eeeafd46:afterEdit:8729e010",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6aa7a7003a1cc920eeeafce7",
+        "tool_id": "Edit",
+        "client_type": "ide",
+        "tool_type": "agent"
+      }
+    },
+    "s_77532864f56382": {
+      "agent_id": {
+        "tool": "trae-code-edit",
+        "id": "ai_tab-2026091416145501000005900144150F3",
+        "model": "default"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "external_session_id": "2026091416145501000005900144150F3",
+        "source_scene": "cue",
+        "tool": "trae-code-edit"
+      }
+    }
+  }
+}
