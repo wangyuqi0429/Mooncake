@@ -1,0 +1,53 @@
+mooncake-transfer-engine/src/transport/kunpeng_transport/urma/urma_endpoint.cpp
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 638,666-669,672-676
+mooncake-transfer-engine/src/transport/kunpeng_transport/ub_context.cpp
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 445-447,450,456-457,492-495,504-508,645
+mooncake-transfer-engine/include/transport/kunpeng_transport/urma/urma_endpoint.h
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 65
+mooncake-transfer-engine/include/transport/kunpeng_transport/ub_transport.h
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 17-21,24-25,34,47,94-142,179-193
+mooncake-store/src/real_client.cpp
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 1208-1212,1217-1227,2497-2500,2502-2504,2515-2525,3806-3819,5905-5907,5910,5917,5922-5924,5971-5973,5999-6000,6010-6013,6016,6024,6035,6045-6070,6078-6080,6105-6106,6116-6119,6123,6132,6140-6142,6144,6203-6217,6273,6491-6516
+mooncake-integration/store/mooncake_perf_points.def
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 182-216
+mooncake-store/benchmarks/CMakeLists.txt
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 41-50
+mooncake-integration/store/store_py.cpp
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 19,2088-2090,2098,2104-2106,2119-2121,2133-2137,2246-2249,2251-2259,2283-2285,2287-2290,2297-2310,2313-2319,2703-2705,2709-2712,2957-2959,2962,2966,2968-2970,2984-2986,2988,2991-2993,3011-3013,3015-3018
+mooncake-store/benchmarks/store_connector_bench.cpp
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 1-495
+mooncake-transfer-engine/include/transport/kunpeng_transport/ub_context.h
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 198-199,201-202,209
+mooncake-transfer-engine/src/transport/kunpeng_transport/ub_transport.cpp
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 16-19,21-22,24,27,37-67,77-82,88-393,444-454,499-501,604-652,655,673,690,730,740,778,789-791
+mooncake-store/src/client_service.cpp
+  s_3abf89fe5f1c3a::t_77ef96b4dc1e4a 1427-1429,1464,1480
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "f5690676d5b684745601706474aef02d314f0704",
+  "prompts": {},
+  "sessions": {
+    "s_3abf89fe5f1c3a": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa20a46ad3edc2726b333cf",
+        "model": "DeepSeek-V4-Pro-Official__dev"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "tool_use_id": "6aa75cd23a1cc920eeeaf797",
+        "display_model_name": "DeepSeek-V4-Pro 正式版",
+        "tool_name": "RunCommand",
+        "client_type": "ide",
+        "edit_kind": "bash",
+        "external_session_id": "6aa20a46ad3edc2726b333cf",
+        "operation_id": "6aa75cd23a1cc920eeeaf797",
+        "session_id": "6aa20a46ad3edc2726b333cf",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
