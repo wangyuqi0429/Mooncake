@@ -1,0 +1,124 @@
+mooncake-store/src/rpc_service.cpp
+  s_d3001b78e43c79::t_5653329e33e714 2298-2314
+  s_d3001b78e43c79::t_e1ab40656031b2 486-492
+  s_d3001b78e43c79::t_63f633a581e1b3 652
+  s_d3001b78e43c79::t_e1fbd4c4b518a6 458
+  s_d3001b78e43c79::t_a1a45c264fccf7 641
+  s_d3001b78e43c79::t_cb95eb86e1414a 476-485,493-494
+  s_d3001b78e43c79::t_5a7064de4ce40f 874,883-900
+  s_d3001b78e43c79::t_6c474f8fafdb9f 912-913,924-925
+  s_d3001b78e43c79::t_f4fa34fddf10de 539-540
+  s_d3001b78e43c79::t_f077333ae793bf 938,949
+  s_d3001b78e43c79::t_1cc8f7f5ffb64f 2055-2107
+  s_d3001b78e43c79::t_06874c9375f192 519-520
+mooncake-store/src/master_service.cpp
+  s_d3001b78e43c79::t_c3901ed912a0ac 5540-5545
+  s_d3001b78e43c79::t_c21cec55ac6d0e 5272-5273
+  s_d3001b78e43c79::t_a6432228d3bba0 5649-5650,5653
+  s_d3001b78e43c79::t_a3eabd33eb724a 6065-6066,6068-6069,6074-6075,6078,6083-6084,6086
+  s_d3001b78e43c79::t_d522b12e486ebf 778-794
+  s_d3001b78e43c79::t_9d6026bc76bdf8 5537-5538
+  s_d3001b78e43c79::t_c45182a1f2d6e7 5386-5392
+mooncake-store/src/types.cpp
+  s_d3001b78e43c79::t_e2659b5662f8c9 82-88
+mooncake-store/include/partition/vsegment_types.h
+  s_d3001b78e43c79::t_2b69d4ceed2120 112-188
+  s_d3001b78e43c79::t_bba18eb655a81f 1-111,189-190
+mooncake-store/include/cvm/etcd_view_store.h
+  s_d3001b78e43c79::t_9518a9d3854856 8
+  s_d3001b78e43c79::t_b5a40b6ddfef70 143-181
+mooncake-store/include/cvm/cvm_keys.h
+  s_d3001b78e43c79::t_83c32d68a0257a 132-159
+mooncake-store/include/master_client.h
+  s_d3001b78e43c79::t_000118237fd79d 245,247-249
+  s_d3001b78e43c79::t_d0a534a5b4427d 291-292
+  s_d3001b78e43c79::t_67638f1c796e53 272-273
+  s_d3001b78e43c79::t_c2e05a03c60ef8 327,329-331,340-341,347-348
+mooncake-store/src/master_client.cpp
+  s_d3001b78e43c79::t_b7c5e21aaa22a5 1127-1128,1139
+  s_d3001b78e43c79::t_b87e0cbe8c1cad 1391-1392,1404-1405
+  s_d3001b78e43c79::t_d085de34372f2b 959,978-980
+  s_d3001b78e43c79::t_b91f15e7960a9e 1052-1053,1066-1067
+  s_d3001b78e43c79::t_2f9c6e31d6837c 1463-1464,1475
+  s_d3001b78e43c79::t_612c2a6e52646d 1302,1320
+mooncake-store/include/segment.h
+  s_d3001b78e43c79::t_5c3b551a984cc6 450-481
+  s_d3001b78e43c79::t_abc0a31c891bc9 529-530,533-534
+  s_d3001b78e43c79::t_0e2430830f8b47 574-575
+  s_d3001b78e43c79::t_1a6d9f83173dfe 16
+  s_d3001b78e43c79::t_74fcf9099422ed 531-532
+mooncake-store/src/segment.cpp
+  s_d3001b78e43c79::t_37fdaa2a3f4b43 1578-1582,1584-1585,1588-1590
+  s_d3001b78e43c79::t_ec7a507e584f86 1583,1586-1587
+mooncake-store/include/replica.h
+  s_d3001b78e43c79::t_db315ffbd6265f 627-642
+  s_d3001b78e43c79::t_e14a7bae0911bc 209-218
+  s_d3001b78e43c79::t_ec37da4b59d53a 558-567
+  s_d3001b78e43c79::t_7bbd8fba93460a 518
+mooncake-store/include/rpc_service.h
+  s_d3001b78e43c79::t_ea0fca8e403a4f 82,90-91,96-97
+  s_d3001b78e43c79::t_9b087c73cee207 134,142-143,148-149
+  s_d3001b78e43c79::t_febe00edcc1577 17
+  s_d3001b78e43c79::t_0fb2c8628f3cbb 350-368
+mooncake-store/include/rpc_types.h
+  s_d3001b78e43c79::t_26c9690c5943f4 56-72
+mooncake-store/include/transfer_task.h
+  s_d3001b78e43c79::t_5973e26d6c7931 644
+  s_d3001b78e43c79::t_a3b9d81e688004 538-553
+  s_d3001b78e43c79::t_eee8e83978cc78 643
+  s_d3001b78e43c79::t_e8a17ff733666a 24,537,697
+  s_d3001b78e43c79::t_3a1a515859e5f0 698-707
+mooncake-store/src/transfer_task.cpp
+  s_d3001b78e43c79::t_e0d0749c238251 1002-1008
+  s_d3001b78e43c79::t_d7823058bfc22f 1020-1024,1028,1034-1036,1040
+  s_d3001b78e43c79::t_0501bdbde1b09b 1014-1018,1025-1026,1029-1032,1037-1038,1041-1042,1045-1047
+  s_d3001b78e43c79::t_f4b0f6034d0fdf 1019,1027,1033,1039,1043-1044
+mooncake-store/src/client_service.cpp
+  s_d3001b78e43c79::t_a8b56059c7ee47 2198,2203-2204,2215,2219-2220,2239-2240
+  s_d3001b78e43c79::t_4a0477d5bc1a77 2124-2125
+  s_d3001b78e43c79::t_8671333bea532c 2136-2137
+  s_d3001b78e43c79::t_92c37d564a8d33 2070,2072,2082-2083,2094
+mooncake-store/include/types.h
+  s_d3001b78e43c79::t_9b45e483137b5b 418-429
+mooncake-store/include/ha/oplog/oplog_types.h
+  s_d3001b78e43c79::t_da5861e3f2aa43 62-111
+mooncake-store/include/master_service.h
+  s_d3001b78e43c79::t_29c8a5d41249e5 568-569,573-574,2280
+  s_d3001b78e43c79::t_59d9224147842f 92-118
+  s_d3001b78e43c79::t_0297e5dfb30a9d 202-214
+  s_d3001b78e43c79::t_86c69903fa72ab 591-592
+  s_d3001b78e43c79::t_ead05b1ce505fa 631-632,636-637,644-645
+  s_d3001b78e43c79::t_7ec9028eb3351a 2277-2279
+mooncake-store/include/metadata_store.h
+  s_d3001b78e43c79::t_c6c30ebafcd35b 110-154
+  s_d3001b78e43c79::t_2cd3ef07841260 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "e483ec60a0956c773f9acc2f9ec1407d4f529aa5",
+  "prompts": {},
+  "sessions": {
+    "s_d3001b78e43c79": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa75edd3a1cc920eeeaf7a4",
+        "model": "DeepSeek-V4-Pro-Official__dev"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "source_scene": "unknown",
+        "tool_type": "agent",
+        "dedupe_key": "6aa75edd3a1cc920eeeaf7a4:6aa79d783a1cc920eeeafc7a:afterEdit:be0d1242",
+        "tool_id": "Edit",
+        "external_session_id": "6aa75edd3a1cc920eeeaf7a4",
+        "edit_kind": "file_edit",
+        "runtime_client": "trae-tob-git-ai",
+        "client_type": "ide",
+        "tool_use_id": "6aa79d783a1cc920eeeafc7a",
+        "session_id": "6aa75edd3a1cc920eeeaf7a4",
+        "operation_id": "6aa79d783a1cc920eeeafc7a"
+      }
+    }
+  }
+}
