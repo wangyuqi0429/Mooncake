@@ -1,0 +1,50 @@
+mooncake-store/src/master_service.cpp
+  s_5a0971de6330d7::t_c406e1108e0509 1535-1562
+  s_5a0971de6330d7::t_b4efa163f46741 1525-1534
+mooncake-store/include/master_service.h
+  s_5a0971de6330d7::t_19896e9d7edd10 2345-2347
+mooncake-store/include/rpc_service.h
+  s_5a0971de6330d7::t_b8f9e3c0d4e796 309-313
+mooncake-store/src/rpc_service.cpp
+  s_5a0971de6330d7::t_fdbc31c081ebec 1958-1961
+mooncake-store/src/cvm/slot_migrator.cpp
+  s_5a0971de6330d7::t_97bdeff5fb14e3 15,17-39,41
+  s_5a0971de6330d7::t_a1671ef2e348d8 230-238,240-242
+  h_3bb1a18ecd2247 16,40,42,103-105
+mooncake-store/src/master_admin_service.cpp
+  s_5a0971de6330d7::t_8b6b93096330af 302-305
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "9cbcdbb6dfae5e45d957344a4dbc7bf488d33423",
+  "prompts": {},
+  "humans": {
+    "h_3bb1a18ecd2247": {
+      "author": "Wang_YQi <wangyuqi40@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_5a0971de6330d7": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa909bc3a1cc920eeeafdea",
+        "model": "DeepSeek-V4-Pro-Official__dev"
+      },
+      "human_author": "Wang_YQi <wangyuqi40@huawei.com>",
+      "custom_attributes": {
+        "tool_use_id": "6aa93be63a1cc920eeeaffd8",
+        "runtime_client": "trae-tob-git-ai",
+        "operation_id": "6aa93be63a1cc920eeeaffd8",
+        "external_session_id": "6aa909bc3a1cc920eeeafdea",
+        "tool_type": "agent",
+        "dedupe_key": "6aa909bc3a1cc920eeeafdea:6aa93be63a1cc920eeeaffd8:afterEdit:2068ca95",
+        "edit_kind": "file_edit",
+        "client_type": "ide",
+        "session_id": "6aa909bc3a1cc920eeeafdea",
+        "source_scene": "unknown",
+        "tool_id": "Edit"
+      }
+    }
+  }
+}
