@@ -752,12 +752,7 @@ std::optional<std::string> MasterClient::ResolveSubmaster(
 }
 
 void MasterClient::SwitchToSubmasterByAddress(const std::string& address) {
-    const std::string old_address = client_accessor_.GetAddress();
     client_accessor_.GetOrCreateClientPool(address);
-    if (old_address != address) {
-        LOG(INFO) << "SwitchToSubmasterByAddress: [" << old_address << "] -> ["
-                  << address << "]";
-    }
 }
 
 ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
