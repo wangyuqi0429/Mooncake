@@ -2285,6 +2285,15 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     if (mount_result == ErrorCode::OK) {
         RecomputeTenantEffectiveQuotas();
     }
+    // segment（重）挂载成功后，该 endpoint 不再视为 invalid。升主恢复
+    // （RestoreFromStandbySnapshot）在 client 尚未重挂时会把 segment 的
+    // transport_endpoint/name 标记进 invalid_replica_endpoints_，若此处不清除，
+    // 这些 replica 会因 IsReplicaReadable 永久返回 false 而 REPLICA_IS_NOT_READY。
+    {
+        std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        invalid_replica_endpoints_.erase(segment.te_endpoint);
+        invalid_replica_endpoints_.erase(segment.name);
+    }
     PublishSegmentOwnerForCvm(segment);
     return {};
 }
@@ -2625,8 +2634,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                     (void)restore.replicas[i]->replace_memory_buffer(
                         std::move(restore.buffers[i]));
                 }
-                invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
-                invalid_replica_endpoints_.erase(restore.segment.name);
+                {
+                    std::lock_guard<std::shared_mutex> lock(
+                        invalid_endpoints_mutex_);
+                    invalid_replica_endpoints_.erase(
+                        restore.segment.te_endpoint);
+                    invalid_replica_endpoints_.erase(restore.segment.name);
+                }
                 standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
                 standby_allocator_keepalive_.erase(restore.segment.name);
             }
@@ -4165,7 +4179,10 @@ void MasterService::RestoreFromStandbySnapshot(
     standby_accounted_memory_bytes_.clear();
     standby_memory_segments_.clear();
     standby_allocator_keepalive_.clear();
-    invalid_replica_endpoints_.clear();
+    {
+        std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        invalid_replica_endpoints_.clear();
+    }
     for (const auto& seg : segments) {
         if (seg.is_memory_segment) {
             standby_memory_segments_.push_back(seg);
@@ -4177,6 +4194,7 @@ void MasterService::RestoreFromStandbySnapshot(
             }
         }
         if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
+            std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
             invalid_replica_endpoints_.insert(seg.transport_endpoint);
             if (seg.segment_name != seg.transport_endpoint) {
                 invalid_replica_endpoints_.insert(seg.segment_name);
@@ -4272,6 +4290,8 @@ void MasterService::RestoreFromStandbySnapshot(
                             [alloc->getSegmentName()] +=
                             mem_desc.buffer_descriptor.size_;
                     } else {
+                        std::lock_guard<std::shared_mutex> lock(
+                            invalid_endpoints_mutex_);
                         invalid_replica_endpoints_.insert(endpoint);
                     }
                 } else if (desc.is_nof_replica()) {
@@ -4319,10 +4339,15 @@ void MasterService::RestoreFromStandbySnapshot(
     }
 
     // 4. Log the result.
+    size_t invalid_endpoints_count = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        invalid_endpoints_count = invalid_replica_endpoints_.size();
+    }
     LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
               << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
-              << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
+              << ", invalid_endpoints=" << invalid_endpoints_count;
 }
 
 auto MasterService::QueryIp(const UUID& client_id)
@@ -4623,7 +4648,11 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
     } else if (descriptor.is_local_disk_replica()) {
         endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
     }
-    return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+    if (!endpoint) {
+        return true;
+    }
+    std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
+    return !invalid_replica_endpoints_.contains(*endpoint);
 }
 
 bool MasterService::IsMemoryReplicaEvictable(const Replica& replica) const {

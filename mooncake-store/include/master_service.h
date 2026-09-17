@@ -2625,6 +2625,11 @@ class MasterService {
 
     // Invalid endpoints from standby that don't exist locally
     std::unordered_set<std::string> invalid_replica_endpoints_;
+    // Guards invalid_replica_endpoints_. The read path (IsReplicaReadable, on
+    // GetReplicaList) runs on many threads without snapshot_mutex_, while the
+    // set is written during standby restore / remount / mount. A shared_mutex
+    // lets concurrent readers proceed and serializes writers.
+    mutable std::shared_mutex invalid_endpoints_mutex_;
 
     // Keep DummyBufferAllocator alive after standby restore.
     // Key: transport_endpoint, Value: allocator.
