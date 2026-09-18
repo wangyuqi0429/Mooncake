@@ -207,6 +207,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cvm_http_port_(config.cvm_http_port),
       cvm_http_host_(config.cvm_http_host),
       submaster_count_(config.submaster_count),
+      cvm_segment_default_medium_(config.cvm_segment_default_medium),
+      cvm_segments_vsegment_exclusive_(config.cvm_segments_vsegment_exclusive),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
@@ -1369,6 +1371,30 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         !alive_ids.empty() &&
         std::find(alive_ids.begin(), alive_ids.end(), old_owner) ==
             alive_ids.end();
+    if (old_owner_gone && !old_owner.empty() && old_owner != master_id_ &&
+        vsegment_service_) {
+        const auto partition_id = std::to_string(slot);
+        const auto& quotas = vsegment_service_->quota_snapshot().quotas;
+        const bool has_quota = std::any_of(
+            quotas.begin(), quotas.end(), [&](const auto& quota) {
+                return quota.partition_id == partition_id;
+            });
+        const bool has_recovered_state = std::any_of(
+            recovered_vsegment_snapshots_.begin(),
+            recovered_vsegment_snapshots_.end(), [&](const auto& state) {
+                return state.partition_id == partition_id;
+            });
+        vsegment::PartitionVSegmentSnapshot installed;
+        if (has_quota && !has_recovered_state &&
+            vsegment_service_->SnapshotPartition(partition_id, &installed) !=
+                ErrorCode::OK) {
+            // A dead owner does not make its physical quota empty. Recreating
+            // an allocator without its snapshot could overwrite live extents.
+            LOG(ERROR) << "Missing vsegment recovery state for lost owner "
+                       << old_owner << ", Partition=" << partition_id;
+            return ErrorCode::PERSISTENT_FAIL;
+        }
+    }
     if (old_owner.empty() || old_owner == master_id_ || old_owner_gone) {
         // 无旧 owner（冷启动 / 旧 owner 消亡 / 自身原主）：元数据视为空，客户端重建。
         return RefreshVSegmentOwnership(std::to_string(slot));
@@ -1648,8 +1674,21 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     }
     const std::string seg_id = UuidToString(segment.id);
 
+    // 查询 allocator 实时已用字节数，供 planner 按 [used_bytes, capacity)
+    // 切分 vsegment 可分配范围，避免与其他分配器占用范围重叠。查询失败
+    // 时保守上报 0（等同 exclusive 空集群），由 planner 后续校验兜底。
+    size_t used_bytes = 0;
+    size_t capacity_bytes = 0;
+    {
+        auto segment_access = segment_manager_.getSegmentAccess();
+        segment_access.QuerySegments(segment.name, used_bytes, capacity_bytes);
+    }
+
     // 1. Write neutral SegmentDescriptor to segments/{seg_id} (idempotent,
-    //    without lease — one copy per segment, no owner).
+    //    without lease — one copy per segment, no owner).资源事实字段
+    //    （medium / io_alignment / supports_unaligned_io / failure_domain /
+    //    used_bytes / vsegment_exclusive）由本集群配置 + allocator 实时
+    //    状态填充，供 vsegment 自动发现使用，不应由用户在配额文件中手写。
     cvm::SegmentDescriptor desc;
     desc.segment_id = seg_id;
     desc.segment_name = segment.name;
@@ -1657,6 +1696,16 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
     desc.te_endpoint = segment.te_endpoint;
     desc.protocol = segment.protocol;
     desc.host_id = segment.host_id;
+    // 优先用 client 上报的 segment.medium（支持混合介质集群：不同 segment
+    // 可上报不同 medium，如 "cpu:0"/"cuda:0"/"ssd:0"）；缺省回退集群默认。
+    desc.medium = segment.medium.empty() ? cvm_segment_default_medium_
+                                         : segment.medium;
+    desc.io_alignment = 1;  // 保守默认；Planner 取 max(profile, segment)
+    desc.supports_unaligned_io = true;
+    desc.failure_domain =
+        segment.host_id.empty() ? desc.segment_id : segment.host_id;
+    desc.used_bytes = used_bytes;
+    desc.vsegment_exclusive = cvm_segments_vsegment_exclusive_;
     ErrorCode err =
         cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);
     if (err != ErrorCode::OK) {
@@ -1826,13 +1875,18 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
             cvm_prev_primary_ids_ = cvm_last_primary_ids_;
             std::vector<std::string> joined;
             std::vector<std::string> left;
-            std::set_difference(ids.begin(), ids.end(),
-                                cvm_last_primary_ids_.begin(),
-                                cvm_last_primary_ids_.end(),
+            // Membership is ranked by registration revision, not by id.
+            // Sort copies for set_difference; preserve ring tie-break order.
+            auto current_ids = ids;
+            auto previous_ids = cvm_last_primary_ids_;
+            std::sort(current_ids.begin(), current_ids.end());
+            std::sort(previous_ids.begin(), previous_ids.end());
+            std::set_difference(current_ids.begin(), current_ids.end(),
+                                previous_ids.begin(), previous_ids.end(),
                                 std::back_inserter(joined));
-            std::set_difference(cvm_last_primary_ids_.begin(),
-                                cvm_last_primary_ids_.end(), ids.begin(),
-                                ids.end(), std::back_inserter(left));
+            std::set_difference(previous_ids.begin(), previous_ids.end(),
+                                current_ids.begin(), current_ids.end(),
+                                std::back_inserter(left));
             auto join = [](const std::vector<std::string>& v) {
                 std::string s;
                 for (const auto& e : v) {

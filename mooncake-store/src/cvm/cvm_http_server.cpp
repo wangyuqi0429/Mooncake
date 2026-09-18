@@ -139,6 +139,13 @@ std::string CvmHttpServer::GetSegmentViewJson() const {
             seg["te_endpoint"] = desc.te_endpoint;
             seg["protocol"] = desc.protocol;
             seg["host_id"] = desc.host_id;
+            // 资源事实（供 vsegment 自动发现 + 运维查看）
+            seg["medium"] = desc.medium;
+            seg["io_alignment"] =
+                static_cast<Json::Value::UInt64>(desc.io_alignment);
+            seg["supports_unaligned_io"] = desc.supports_unaligned_io;
+            seg["failure_domain"] = desc.failure_domain;
+            seg["vsegment_exclusive"] = desc.vsegment_exclusive;
         }
 
         Json::Value masters(Json::arrayValue);

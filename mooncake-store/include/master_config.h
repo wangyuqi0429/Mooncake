@@ -82,6 +82,11 @@ struct MasterConfig {
     // HTTP server disabled.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：本集群 segment 的物理介质标识与「vsegment 专用且空」声明。
+    // 见 MasterServiceConfig 同名字段说明。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
@@ -227,6 +232,10 @@ class MasterServiceSupervisorConfig {
     // HTTP server disabled.
     uint16_t cvm_http_port = 0;
     std::string cvm_http_host = "0.0.0.0";
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：见 MasterServiceConfig 同名字段说明。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =
@@ -367,6 +376,9 @@ class MasterServiceSupervisorConfig {
         submaster_count = config.submaster_count;
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
 
         enable_metrics_report_to_backend =
             config.enable_metrics_report_to_backend;
@@ -562,6 +574,17 @@ class WrappedMasterServiceConfig {
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
     // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
     uint32_t submaster_count = 1;
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用，不应由用户在配额文件中手写）：
+    //   cvm_segment_default_medium —— 本集群 segment 的物理介质标识，与
+    //       VSegmentProfile.required_medium 匹配。默认 "REGISTERED_MEMORY"。
+    //       未来由底层 allocator 在 mount 时上报真实介质。
+    //   cvm_segments_vsegment_exclusive —— 声明本集群 segment 为「vsegment
+    //       专用且当前为空」。true 时自动发现可直接按 capacity 切分；false
+    //       时自动发现拒绝，需通过空间管理机制显式声明可分配范围（避免把
+    //       总容量当作空闲空间）。仅在初始化阶段整个集群专供 vsegment 时置 true。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -656,6 +679,9 @@ class WrappedMasterServiceConfig {
         submaster_count = config.submaster_count;
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         enable_disk_eviction = config.enable_disk_eviction;
@@ -777,6 +803,9 @@ class WrappedMasterServiceConfig {
         submaster_count = config.submaster_count;
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
@@ -1240,6 +1269,17 @@ class MasterServiceConfig {
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调，先到先得）。
     // 默认 1 保持单主行为；>1 时多 submaster 均分 slot，超出 k 名自动降级为 standby。
     uint32_t submaster_count = 1;
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用，不应由用户在配额文件中手写）：
+    //   cvm_segment_default_medium —— 本集群 segment 的物理介质标识，与
+    //       VSegmentProfile.required_medium 匹配。默认 "REGISTERED_MEMORY"。
+    //       未来由底层 allocator 在 mount 时上报真实介质。
+    //   cvm_segments_vsegment_exclusive —— 声明本集群 segment 为「vsegment
+    //       专用且当前为空」。true 时自动发现可直接按 capacity 切分；false
+    //       时自动发现拒绝，需通过空间管理机制显式声明可分配范围（避免把
+    //       总容量当作空闲空间）。仅在初始化阶段整个集群专供 vsegment 时置 true。
+    std::string cvm_segment_default_medium = "REGISTERED_MEMORY";
+    bool cvm_segments_vsegment_exclusive = false;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
@@ -1329,6 +1369,9 @@ class MasterServiceConfig {
         cvm_http_port = config.cvm_http_port;
         cvm_http_host = config.cvm_http_host;
         submaster_count = config.submaster_count;
+        cvm_segment_default_medium = config.cvm_segment_default_medium;
+        cvm_segments_vsegment_exclusive =
+            config.cvm_segments_vsegment_exclusive;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator =

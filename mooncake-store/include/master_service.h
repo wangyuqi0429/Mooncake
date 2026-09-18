@@ -2260,6 +2260,11 @@ class MasterService {
     const std::string cvm_http_host_;
     // 集群中允许同时 serving 的 submaster 上限（CVM 名额协调）。
     const uint32_t submaster_count_;
+    // 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现
+    // 使用）：本集群 segment 的物理介质标识与「vsegment 专用且空」声明。
+    // 见 MasterServiceConfig 同名字段说明。
+    const std::string cvm_segment_default_medium_;
+    const bool cvm_segments_vsegment_exclusive_;
     // Drives slot-metadata handoff for this submaster (deterministic ring; no
     // etcd publication). Only started in HA mode when a stable master_id is
     // configured.

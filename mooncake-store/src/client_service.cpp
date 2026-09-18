@@ -3737,6 +3737,11 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        // 方案 a：直接用 location 字符串作为 medium 上报。location 形如
+        // "cpu:0" / "cuda:0" / "ssd:0"，planner 的 --required_medium 用相同
+        // 字符串匹配即可。支持混合介质集群：不同 segment 可上报不同 medium。
+        // master 的 PublishSegmentOwnerForCvm 优先用此值，缺省回退集群默认。
+        segment.medium = location;
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {

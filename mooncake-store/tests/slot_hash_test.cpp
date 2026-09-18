@@ -7,11 +7,35 @@
 #include <vector>
 
 #include "crc32c.h"
+#include "cvm/cvm_types.h"
 #include "partition/kv_hash_map.h"
 #include "tenant_id.h"
 
 namespace mooncake::test {
 namespace {
+
+TEST(SlotHashTest, RegistrationRankTakesPrecedenceOverMasterId) {
+    cvm::MasterRegistration early;
+    early.master_id = "z-early";
+    early.create_revision = 10;
+    cvm::MasterRegistration late;
+    late.master_id = "a-late";
+    late.create_revision = 20;
+    EXPECT_TRUE(cvm::MasterRegistrationRankLess(early, late));
+    late.create_revision = 10;
+    EXPECT_TRUE(cvm::MasterRegistrationRankLess(late, early));
+}
+
+TEST(SlotHashTest, RegistrationOrderedRingAgreesWithOwnerLookup) {
+    const std::vector<std::string> ids = {"z-early", "a-late"};
+    for (const auto& id : ids) {
+        const auto slots = cvm::ResolveOwnedSlotsOnRing(ids, id);
+        // Sample the full range without rebuilding the ring for every slot.
+        for (size_t i = 0; i < slots.size(); i += 127) {
+            EXPECT_EQ(cvm::ResolveSlotOwnerOnRing(ids, slots[i]), id);
+        }
+    }
+}
 
 TEST(SlotHashTest, SlotOfUsesLow14Bits) {
     EXPECT_EQ(cvm::SlotOf(0u), 0u);

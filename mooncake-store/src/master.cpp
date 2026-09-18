@@ -306,6 +306,18 @@ DEFINE_uint32(cvm_http_port, 0,
               "disabled.");
 DEFINE_string(cvm_http_host, "0.0.0.0",
               "Bind host for the CVM external HTTP API (CvmHttpServer).");
+// 资源事实（Store 注册时上报到 SegmentDescriptor，供 vsegment 自动发现）。
+DEFINE_string(cvm_segment_default_medium, "REGISTERED_MEMORY",
+              "Default physical medium reported for segments at mount time. "
+              "Must match VSegmentProfile.required_medium used by the vsegment "
+              "quota planner. Default \"REGISTERED_MEMORY\".");
+DEFINE_bool(cvm_segments_vsegment_exclusive, false,
+            "Optional hint: declare that this cluster's segments are "
+            "dedicated to vsegment and currently empty. true makes the "
+            "planner verify used_bytes==0 (fast path, full capacity used); "
+            "false (default) makes the planner use [used_bytes, capacity) "
+            "as the allocatable range. No longer required — users need not "
+            "set this for normal deployment.");
 
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
@@ -1078,6 +1090,19 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.cvm_http_host = FLAGS_cvm_http_host;
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_segment_default_medium", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_segment_default_medium =
+            FLAGS_cvm_segment_default_medium;
+    }
+    if ((google::GetCommandLineFlagInfo("cvm_segments_vsegment_exclusive",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.cvm_segments_vsegment_exclusive =
+            FLAGS_cvm_segments_vsegment_exclusive;
     }
     if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
          !info.is_default) ||
