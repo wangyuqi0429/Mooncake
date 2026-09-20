@@ -238,14 +238,17 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
         return Fail(ErrorCode::INVALID_PARAMS,
                     "invalid quota planning request");
     }
+    // 保留 request.partition_ids 的原始顺序（数字序），仅用 set 去重校验。
+    // 不能用 set 重排：数字序 "0".."16383" 会被字典序打乱（如 "1386" < "13860"），
+    // 导致 base_offset 布局与 VerifyDiscoveredSnapshot 的遍历顺序不一致。
     std::set<std::string> partition_ids;
+    std::vector<std::string> ordered_partitions;
     for (const auto& id : request.partition_ids) {
         if (id.empty() || !partition_ids.insert(id).second)
             return Fail(ErrorCode::INVALID_PARAMS,
                         "empty or duplicate partition id");
+        ordered_partitions.push_back(id);
     }
-    std::vector<std::string> ordered_partitions(partition_ids.begin(),
-                                                 partition_ids.end());
 
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = request.config_generation;
