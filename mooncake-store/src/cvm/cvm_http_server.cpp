@@ -658,3 +658,6 @@ ErrorCode CvmHttpServer::TriggerVSegmentQuota(
                "\"}";
     return err;
 }
+
+}  // namespace cvm
+}  // namespace mooncake
