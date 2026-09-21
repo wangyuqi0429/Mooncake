@@ -56,6 +56,11 @@ YLT_REFL(MountEntry, segment_id, mounted_at_ms, partition_slot_starts);
 
 // Neutral descriptor of a segment — authoritative copy lives under
 // segments/{segment_id} and is written once per segment (idempotent).
+//
+// 资源事实字段（medium / io_alignment / supports_unaligned_io /
+// failure_domain / vsegment_exclusive）由 Store 在 mount 注册时上报，供
+// PartitionQuotaPlanner 自动发现使用，不应由用户在配额文件中手写。旧
+// JSON 缺这些字段时反序列化为默认值，向后兼容。
 struct SegmentDescriptor {
     std::string segment_id;
     std::string segment_name;
@@ -71,9 +76,31 @@ struct SegmentDescriptor {
         uint64_t length{0};
     };
     std::vector<Partition> partitions;
+
+    // ---- 资源事实（Store 注册时上报，供自动发现使用）----
+    // 物理介质标识，与 VSegmentProfile.required_medium 匹配，例如
+    // "REGISTERED_MEMORY"、"DRAM"、"NVMe"。空表示未上报，自动发现会拒绝。
+    std::string medium;
+    // I/O 对齐字节数。Planner 取 max(profile.io_alignment, segment.io_alignment)。
+    uint64_t io_alignment{1};
+    // 是否支持非对齐 I/O。false 时该 psegment 不参与 vsegment 条带化。
+    bool supports_unaligned_io{true};
+    // 故障域标识，缺省由 host_id 兜底，可由部署标签补充。
+    std::string failure_domain;
+    // 当前已分配字节数（由 allocator 实时维护）。自动发现按
+    // [used_bytes, capacity) 作为 vsegment 可切分范围，避免与其他
+    // 分配器占用范围重叠。旧 JSON 缺该字段时反序列化为 0，等同
+    // exclusive 空集群，向后兼容。
+    uint64_t used_bytes{0};
+    // 可选 hint：是否为「vsegment 专用且当前为空」的 psegment。true 时
+    // 自动发现要求 used_bytes==0，快路径直接按 capacity 切分；false 时
+    // 自动发现按 [used_bytes, capacity) 切分。不再强制声明。
+    bool vsegment_exclusive{false};
 };
 YLT_REFL(SegmentDescriptor, segment_id, segment_name, capacity, te_endpoint,
-         protocol, host_id, partitions);
+         protocol, host_id, partitions, medium, io_alignment,
+         supports_unaligned_io, failure_domain, used_bytes,
+         vsegment_exclusive);
 
 // ---------------------------------------------------------------------------
 // Master registration: liveness + role, persisted under an etcd lease

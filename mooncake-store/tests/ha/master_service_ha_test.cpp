@@ -238,6 +238,14 @@ class MasterServiceHATest : public ::testing::Test {
         return service.CheckSlotServiceability(slot);
     }
 
+    static ErrorCode ImportFromLostOwner(MasterService& service, uint16_t slot) {
+        service.cvm_prev_primary_ids_ = {"lost-owner"};
+        service.cvm_last_primary_ids_ = {service.master_id()};
+        service.cvm_alive_master_ids_ = {service.master_id()};
+        service.cvm_ring_revision_ = 10;
+        return service.ImportSlotMetadata(slot);
+    }
+
     class AcceptVSegmentCommitter : public vsegment::VSegmentStateCommitter {
        public:
         ErrorCode Commit(const vsegment::PartitionVSegmentSnapshot&,
@@ -673,6 +681,31 @@ TEST_F(MasterServiceHATest, VSegmentRpcRejectsUnreadyAndReleasedPartitions) {
 }
 
 #ifdef STORE_USE_ETCD
+TEST_F(MasterServiceHATest, LostOwnerCannotRecreateUnrecoveredVSegmentQuota) {
+    vsegment::PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "test-policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {{.name = "default",
+                            .member_count = 1,
+                            .stripe_size = 64,
+                            .member_extent_size = 256,
+                            .io_alignment = 8,
+                            .required_medium = "DRAM"}};
+    quota.quotas = {{"7", "default", "DRAM", {{"segment-a", 0, 512}}}};
+    auto vsegments = std::make_shared<vsegment::VSegmentService>(quota);
+    MasterServiceConfig config;
+    config.master_id = "new-owner";
+    MasterService service(config);
+    service.SetVSegmentService(vsegments);
+    ExpectSlots(service, {7});
+    EXPECT_EQ(ImportFromLostOwner(service, 7), ErrorCode::PERSISTENT_FAIL);
+    EXPECT_EQ(SlotStatus(service, 7), ErrorCode::SLOT_MIGRATING);
+    EXPECT_TRUE(vsegments->SnapshotAllPartitions().empty());
+    // A Partition without a physical quota keeps the ordinary KV behavior.
+    EXPECT_EQ(ImportFromLostOwner(service, 8), ErrorCode::OK);
+}
+
 TEST_F(MasterServiceHATest, SlotExportRetainsVSegmentStateUntilImportAck) {
     vsegment::PartitionPhysicalQuotaSnapshot quota;
     quota.config_generation = 1;

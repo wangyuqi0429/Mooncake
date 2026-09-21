@@ -60,15 +60,20 @@ YLT_REFL(PartitionVSegmentConfig, partition_id, profile_name,
 
 struct PSegmentGeometry {
     std::string segment_id;
+    // 可用于 vsegment 切分的容量（不含已被其他分配器占用的 used_bytes）。
     uint64_t capacity{0};
+    // vsegment 切分起点（= desc.used_bytes）。默认 0，向后兼容旧 JSON。
+    // Plan 按 [base_offset, base_offset + capacity) 切分 extent，避免与
+    // 其他分配器占用范围 [0, used_bytes) 重叠。
+    uint64_t base_offset{0};
     uint64_t io_alignment{1};
     std::string medium;
     bool healthy{true};
     bool supports_unaligned_io{true};
     std::string failure_domain;
 };
-YLT_REFL(PSegmentGeometry, segment_id, capacity, io_alignment, medium, healthy,
-         supports_unaligned_io, failure_domain);
+YLT_REFL(PSegmentGeometry, segment_id, capacity, base_offset, io_alignment,
+         medium, healthy, supports_unaligned_io, failure_domain);
 
 struct PartitionPhysicalQuota {
     std::string partition_id;

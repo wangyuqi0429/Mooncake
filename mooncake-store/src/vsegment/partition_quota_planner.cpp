@@ -9,6 +9,8 @@
 #include <unordered_map>
 
 #include "etcd_helper.h"
+#include "crc32c.h"
+#include "cvm/slot_hash.h"
 
 namespace mooncake::vsegment {
 namespace {
@@ -23,6 +25,210 @@ uint64_t AlignDown(uint64_t value, uint64_t alignment) {
 
 }  // namespace
 
+ErrorCode BuildDiscoveredQuotaPlan(
+    const VSegmentUserPolicy& policy,
+    const std::vector<cvm::SegmentDescriptor>& descriptors,
+    const std::vector<cvm::MasterRegistration>& masters,
+    const std::vector<std::pair<std::string, cvm::MountEntry>>& mounts,
+    PartitionQuotaPlanRequest* request, std::string* detail,
+    bool allow_non_exclusive) {
+    (void)allow_non_exclusive;  // 已默认接受非独占 segment，保留参数兼容旧调用
+    if (!request) return ErrorCode::INVALID_PARAMS;
+    if (policy.member_count == 0 || policy.stripe_size == 0 ||
+        policy.member_extent_size == 0) {
+        if (detail)
+            *detail = "member_count, stripe_size and member_extent_size are "
+                      "required user policy parameters";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (policy.reserved_ratio < 0.0 || policy.reserved_ratio >= 1.0) {
+        if (detail) *detail = "reserved_ratio must be in [0, 1)";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (policy.default_profile.empty() || policy.profile_name.empty()) {
+        if (detail)
+            *detail = "default_profile and profile_name must not be empty";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    PartitionQuotaPlanRequest next;
+    next.config_generation = policy.config_generation;
+    next.default_profile = policy.default_profile;
+    next.reserved_ratio = policy.reserved_ratio;
+    // required_medium 模式：
+    //   - 非空（用户显式指定）：单一 profile，只接受匹配 medium 的 segment
+    //   - 空（auto）：系统自动发现所有介质，为每种介质建独立 profile
+    //     （继承 member_count/stripe_size/member_extent_size），每种介质
+    //     的 segment 分别切分给各 partition。default_profile 选首个发现的
+    //     介质对应的 profile。
+    const bool auto_medium_mode = policy.required_medium.empty();
+    if (!auto_medium_mode) {
+        next.profile_specs = {{policy.profile_name, policy.member_count,
+                               policy.stripe_size, policy.member_extent_size,
+                               policy.io_alignment, policy.required_medium,
+                               policy.initial_vsegment_count}};
+        auto error = ValidateProfile(next.profile_specs.front(), detail);
+        if (error != ErrorCode::OK) return error;
+    }
+
+    // 在线 master 集合（用于过滤 mount 记录：仅 live master 的 mount 才算
+    // 该 psegment 在线）。
+    std::set<std::string> live_masters;
+    for (const auto& master : masters)
+        if (!master.master_id.empty()) live_masters.insert(master.master_id);
+    std::set<std::string> mounted;
+    for (const auto& [master, mount] : mounts)
+        if (live_masters.count(master)) mounted.insert(mount.segment_id);
+
+    // 从 SegmentDescriptor 自动发现资源事实（介质/对齐/对齐能力/故障域），
+    // 不再硬编码。按 [used_bytes, capacity) 作为 vsegment 可切分范围，避免
+    // 与其他分配器占用范围重叠。vsegment_exclusive 降级为可选 hint：true
+    // 时校验 used_bytes==0（快路径，直接按 capacity 切分）；false 时按
+    // [used_bytes, capacity) 切分，无需用户手动声明。
+    std::set<std::string> seen;
+    std::vector<std::string> insufficient_space;
+    for (const auto& desc : descriptors) {
+        if (desc.segment_id.empty() || !seen.insert(desc.segment_id).second) {
+            if (detail) *detail = "empty or duplicate CVM segment id";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (!mounted.count(desc.segment_id) || desc.capacity == 0 ||
+            desc.te_endpoint.empty())
+            continue;  // 离线或无效，跳过
+        if (desc.medium.empty()) {
+            if (detail) {
+                *detail = "segment " + desc.segment_id +
+                          " has empty medium; allocator must report resource "
+                          "facts at mount time";
+            }
+            return ErrorCode::INVALID_PARAMS;
+        }
+        // vsegment_exclusive=true 时要求 used_bytes==0，否则声明与实际不符。
+        if (desc.vsegment_exclusive && desc.used_bytes > 0) {
+            if (detail) {
+                *detail = "segment " + desc.segment_id +
+                          " declared vsegment_exclusive=true but used_bytes=" +
+                          std::to_string(desc.used_bytes) +
+                          " > 0; exclusive segment must be empty";
+            }
+            return ErrorCode::INVALID_PARAMS;
+        }
+        // 可用空间 = 总容量 - 已用字节。used_bytes > capacity 视为 0 可用。
+        uint64_t available = (desc.used_bytes >= desc.capacity)
+                                 ? 0
+                                 : desc.capacity - desc.used_bytes;
+        if (available < policy.member_extent_size) {
+            insufficient_space.push_back(desc.segment_id);
+            continue;  // 可用空间不足，跳过
+        }
+        // failure_domain 缺省由 host_id 兜底，仍为空时用 segment_id 兜底，
+        // 保证 PSegmentGeometry.failure_domain 非空（便于后续故障域隔离）。
+        std::string failure_domain = desc.failure_domain;
+        if (failure_domain.empty())
+            failure_domain = desc.host_id.empty() ? desc.segment_id
+                                                  : desc.host_id;
+        // capacity=可用容量，base_offset=used_bytes（切分起点）。
+        next.segments.push_back({desc.segment_id, available,
+                                 desc.used_bytes,
+                                 desc.io_alignment == 0 ? 1 : desc.io_alignment,
+                                 desc.medium, /*healthy=*/true,
+                                 desc.supports_unaligned_io, failure_domain});
+    }
+    // auto 模式：按介质分组，为每种 segment 数 >= member_count 的介质自动
+    // 建独立 profile；segment 数不足的介质跳过（其 segment 不参与分配）。
+    // 非 auto 模式：保留匹配 required_medium 的 segment，总数 < member_count
+    // 即失败（原行为）。
+    if (auto_medium_mode) {
+        std::map<std::string, size_t> per_medium_count;
+        for (const auto& seg : next.segments)
+            ++per_medium_count[seg.medium];
+        std::set<std::string> accepted_media;
+        for (const auto& [medium, count] : per_medium_count) {
+            if (count >= policy.member_count) accepted_media.insert(medium);
+        }
+        std::vector<PSegmentGeometry> accepted_segments;
+        for (const auto& seg : next.segments)
+            if (accepted_media.count(seg.medium))
+                accepted_segments.push_back(seg);
+        next.segments = std::move(accepted_segments);
+        // 为每个接受的介质建独立 profile（继承用户配的 3 个核心参数）。
+        for (const auto& medium : accepted_media) {
+            next.profile_specs.push_back(
+                {policy.profile_name + "-" + medium, policy.member_count,
+                 policy.stripe_size, policy.member_extent_size,
+                 policy.io_alignment, medium,
+                 policy.initial_vsegment_count});
+        }
+        if (next.profile_specs.empty()) {
+            if (detail) {
+                std::ostringstream os;
+                os << "auto medium mode: no medium has >= member_count="
+                   << policy.member_count
+                   << " segments; per-medium counts: ";
+                bool first = true;
+                for (const auto& [medium, count] : per_medium_count) {
+                    if (!first) os << ", ";
+                    first = false;
+                    os << medium << "=" << count;
+                }
+                *detail = os.str();
+            }
+            return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+        }
+        // default_profile 选首个接受的介质（按字典序，确定性好复现）。
+        next.default_profile = next.profile_specs.front().name;
+        // 校验每个自动建的 profile。
+        for (const auto& profile : next.profile_specs) {
+            auto error = ValidateProfile(profile, detail);
+            if (error != ErrorCode::OK) return error;
+        }
+    } else {
+        // 非 auto 模式：校验匹配 required_medium 的 segment 数 >= member_count。
+        size_t matched = 0;
+        for (const auto& seg : next.segments)
+            if (seg.medium == policy.required_medium) ++matched;
+        if (matched < policy.member_count) {
+            if (detail) {
+                std::ostringstream os;
+                os << "insufficient segments with usable free space for "
+                      "member_count="
+                   << policy.member_count
+                   << ", medium=" << policy.required_medium
+                   << ", discovered=" << matched;
+                if (!insufficient_space.empty()) {
+                    os << " (additionally " << insufficient_space.size()
+                       << " segments skipped due to insufficient free space: ";
+                    for (size_t i = 0; i < insufficient_space.size(); ++i) {
+                        if (i) os << ",";
+                        os << insufficient_space[i];
+                    }
+                    os << ")";
+                }
+                *detail = os.str();
+            }
+            return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+        }
+    }
+    if (next.segments.empty()) {
+        if (detail) *detail = "no segments with usable free space discovered";
+        return ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT;
+    }
+    std::sort(next.segments.begin(), next.segments.end(),
+              [](const auto& a, const auto& b) {
+                  return a.segment_id < b.segment_id;
+              });
+    // Partition 列表由 KV PT 生成（确定性哈希方案，slot 即 partition）。
+    for (uint16_t slot = 0; slot < cvm::kSlotCount; ++slot)
+        next.partition_ids.push_back(std::to_string(slot));
+    std::string serialized;
+    struct_json::to_json(next, serialized);
+    Crc32c crc;
+    crc.Extend(serialized.data(), serialized.size());
+    next.policy_digest = "plan-crc32c-" + std::to_string(crc.Final());
+    *request = std::move(next);
+    return ErrorCode::OK;
+}
+
 PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
     const PartitionQuotaPlanRequest& request) const {
     if (request.config_generation == 0 || request.policy_digest.empty() ||
@@ -32,14 +238,17 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
         return Fail(ErrorCode::INVALID_PARAMS,
                     "invalid quota planning request");
     }
+    // 保留 request.partition_ids 的原始顺序（数字序），仅用 set 去重校验。
+    // 不能用 set 重排：数字序 "0".."16383" 会被字典序打乱（如 "1386" < "13860"），
+    // 导致 base_offset 布局与 VerifyDiscoveredSnapshot 的遍历顺序不一致。
     std::set<std::string> partition_ids;
+    std::vector<std::string> ordered_partitions;
     for (const auto& id : request.partition_ids) {
         if (id.empty() || !partition_ids.insert(id).second)
             return Fail(ErrorCode::INVALID_PARAMS,
                         "empty or duplicate partition id");
+        ordered_partitions.push_back(id);
     }
-    std::vector<std::string> ordered_partitions(partition_ids.begin(),
-                                                 partition_ids.end());
 
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = request.config_generation;
@@ -124,7 +333,7 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
                     if (per_partition == 0) continue;
                     quotas[ordered_partitions[partition_index]].extents.push_back(
                         {segment.segment_id,
-                         per_partition * partition_index,
+                         segment.base_offset + per_partition * partition_index,
                          per_partition});
                 }
             }

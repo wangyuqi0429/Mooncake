@@ -89,6 +89,11 @@ const (
 const (
 	storeDialKeepAliveTime    = 10 * time.Second
 	storeDialKeepAliveTimeout = 3 * time.Second
+	// storeMaxMsgSize caps the gRPC message size for the store client (planner /
+	// master). It must accommodate large values such as the vsegment partition
+	// quota snapshot, which can exceed the go.etcd.io/client/v3 default of 2MB
+	// (e.g. 16384 partitions x 2 segments ~= 4.6MB). Aligned with NewEtcdClient.
+	storeMaxMsgSize = 32 * 1024 * 1024 // 32MB
 )
 
 func newStoreClientConfig(validEndpoints []string) clientv3.Config {
@@ -97,6 +102,8 @@ func newStoreClientConfig(validEndpoints []string) clientv3.Config {
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
+		MaxCallSendMsgSize:   storeMaxMsgSize,
+		MaxCallRecvMsgSize:   storeMaxMsgSize,
 	}
 }
 

@@ -481,9 +481,15 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    // 物理介质标识，由 client 在 MountSegment 时从 location 参数提取并上报
+    // （如 "cpu:0" / "cuda:0" / "ssd:0"）。PublishSegmentOwnerForCvm 优先用
+    // 此值填充 SegmentDescriptor.medium，缺省回退 master 的
+    // --cvm_segment_default_medium。支持混合介质集群：不同 segment 可上报
+    // 不同 medium，planner 按 profile.required_medium 自动过滤。
+    std::string medium{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id, medium);
 
 /**
  * @brief Allocation strategy type for segment allocation
