@@ -1893,6 +1893,11 @@ void WrappedMasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
     master_service_.SetCvmLeaseId(lease_id);
 }
 
+void WrappedMasterService::SetCvmController(
+    cvm::CvmController* controller) {
+    master_service_.SetCvmController(controller);
+}
+
 ErrorCode WrappedMasterService::StartSlotOwnerHeartbeat() {
     return master_service_.StartSlotOwnerHeartbeat();
 }
@@ -2040,6 +2045,40 @@ WrappedMasterService::InterMasterAckSlotImported(
         },
         [] {}, [] {});
 }
+
+tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+WrappedMasterService::InterMasterExportSlotBatch(
+    uint16_t first_slot, uint16_t last_slot,
+    const std::string& requester_master_id) {
+    return execute_rpc(
+        "InterMasterExportSlotBatch",
+        [&] {
+            return master_service_.InterMasterExportSlotBatch(
+                first_slot, last_slot, requester_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("range=[", first_slot, ",", last_slot,
+                             "], requester=", requester_master_id);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<bool, ErrorCode>
+WrappedMasterService::InterMasterAckSlotRangeImported(
+    uint16_t first_slot, uint16_t last_slot,
+    const std::string& importer_master_id) {
+    return execute_rpc(
+        "InterMasterAckSlotRangeImported",
+        [&] {
+            return master_service_.InterMasterAckSlotRangeImported(
+                first_slot, last_slot, importer_master_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("range=[", first_slot, ",", last_slot,
+                             "], importer=", importer_master_id);
+        },
+        [] {}, [] {});
+}
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -2075,6 +2114,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::InterMasterAckSlotImported>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterExportSlotBatch>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::InterMasterAckSlotRangeImported>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);

@@ -103,15 +103,65 @@ inline bool MasterRegistrationRankLess(const MasterRegistration& a,
     return a.master_id < b.master_id;
 }
 
+// 成员存活判定（lease 仍持有 = 存活）：控制面（晋升/补位/自愈）与数据面
+//（reshard driver）、HTTP 入口的共用谓词。单一实现防止各处判定漂移
+//（如误用 role 字段、误排序）。
+inline bool IsMemberAlive(const std::vector<MasterRegistration>& members,
+                          const std::string& master_id) {
+    for (const auto& m : members) {
+        if (m.master_id == master_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Cluster-wide ring configuration persisted under /cvm/{ns}/cluster_meta
 // (确定性哈希方案 §15.3). Clients and masters derive the same primary_ids =
 // sort(members by create_revision)[0:submaster_count]（先到先得，见
 // MasterRegistrationRankLess）from this count, so slot ownership no longer
 // needs to be persisted per slot.
+//
+// slot_group_count（§16.14.2）：RingSlot 槽位组数 G。旧数据缺省 1（YLT_REFL
+// 反序列化落默认值），退化为单 primary、与 §15 环等价，向上兼容可回滚。
+// G 在集群创建时设定、运行期恒不变（变更属冷操作，§16.8 前提）。
 struct RingMeta {
     uint32_t submaster_count{1};
+    uint32_t slot_group_count{1};
 };
-YLT_REFL(RingMeta, submaster_count);
+YLT_REFL(RingMeta, submaster_count, slot_group_count);
+
+// ---------------------------------------------------------------------------
+// RingSlot 槽位组归属（§16.14.1），持久化于 /cvm/{ns}/ring_slots/{rank}。
+// ---------------------------------------------------------------------------
+
+// 槽位组归属记录（rank 是 key 里的稳定值，value 内冗余供校验）。
+// 不绑任何 lease：liveness 由 masters/{id} 的 lease 唯一承担（§16.14.4），
+// 本结构只保存归属状态；owner 变更统一走 epoch CAS（fencing token）。
+struct RingSlotAssign {
+    uint32_t rank{0};                     // 槽位组索引 0..G-1（冗余，读取时校验 key 与 value 一致，防写错槽）
+    std::string primary_id;               // 当前 serving 该段的 primary master_id（兼管时同一 primary_id 出现在多个 rank）
+    std::vector<std::string> standby_ids; // 配对 standby（按晋升优先级升序，1:1 配对时仅 1 个元素，§16.18.1）
+    int32_t state{0};                     // SlotState: kStable=0 / kMigrating=1（P2 恒 kStable，为 P4 reshard 预留）
+    std::string migrating_to_id;          // reshard 目标 primary（kStable 时为空）
+    uint64_t epoch{0};                    // 乐观锁版本号，owner 每次切换 +1（跨代 fencing）
+};
+YLT_REFL(RingSlotAssign, rank, primary_id, standby_ids, state,
+         migrating_to_id, epoch);
+
+// ---------------------------------------------------------------------------
+// reshard 意图（§16.19.1），持久化于 /cvm/{ns}/reshard_intent/{rank}。
+// ---------------------------------------------------------------------------
+
+// 显式迁移意图：管理员（扩缩容）或原生认领者写入；目标 primary 的
+// reshard driver 消费（断点续传：节点重启后意图仍在），完成后删除。
+// 与 ring_slots 一样是「持久化状态 = 唯一真相」的延续。
+struct ReshardIntent {
+    uint32_t rank{0};              // 目标槽位组
+    std::string source_primary_id; // 迁出方（快照仍由其持有，ack 前不删）
+    std::string target_primary_id; // 迁入方（driver 持有者）
+};
+YLT_REFL(ReshardIntent, rank, source_primary_id, target_primary_id);
 
 }  // namespace cvm
 }  // namespace mooncake

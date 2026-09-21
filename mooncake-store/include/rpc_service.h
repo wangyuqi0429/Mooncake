@@ -10,6 +10,11 @@
 
 #include "master_service.h"
 #include "types.h"
+
+// master_service.h 已引入 cvm/cvm_controller.h；显式声明依赖类型。
+namespace mooncake::cvm {
+class CvmController;
+}
 #include "rpc_types.h"
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
@@ -294,6 +299,7 @@ class WrappedMasterService {
     // CVM slot ownership publishing, driven by the HA supervisor. These
     // forward to the wrapped MasterService (NOT RPC endpoints).
     void SetCvmLeaseId(EtcdLeaseId lease_id);
+    void SetCvmController(cvm::CvmController* controller);
     ErrorCode StartSlotOwnerHeartbeat();
     void StopSlotOwnerHeartbeat();
 
@@ -365,6 +371,22 @@ class WrappedMasterService {
     // the staged export). Returns true when a staged export existed.
     tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
         uint16_t slot, const std::string& importer_master_id);
+
+    // ----- 段级批量迁移（§16.19.2，P4 reshard）-----
+
+    // 源侧批量导出：[first_slot, last_slot] 闭区间内所有 slot 的元数据快照
+    //（staged 优先，缺失时即时构建——kMigrating 冻结写后快照稳定）。幂等：
+    // ack 前源不清数据，重复拉取返回相同内容。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
+                               const std::string& requester_master_id);
+
+    // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
+    //（DropSlotMetadataRange）。源未观察到归属已切走时返回
+    // SLOT_MIGRATING（目标稍后重试，重发无损）。
+    tl::expected<bool, ErrorCode> InterMasterAckSlotRangeImported(
+        uint16_t first_slot, uint16_t last_slot,
+        const std::string& importer_master_id);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,

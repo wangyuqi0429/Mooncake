@@ -587,6 +587,10 @@ void MasterService::SetCvmLeaseId(EtcdLeaseId lease_id) {
     cvm_lease_id_ = lease_id;
 }
 
+void MasterService::SetCvmController(cvm::CvmController* controller) {
+    cvm_controller_ = controller;
+}
+
 tl::expected<std::optional<PutStartResult>, ErrorCode>
 MasterService::TryVSegmentPutStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
@@ -961,6 +965,14 @@ ErrorCode MasterService::StartInterMasterRpc() {
     }
     LOG(INFO) << "Started InterMasterRpcClient: master_id=" << master_id_
               << ", cluster_namespace=" << cluster_id_;
+
+    // P4 reshard driver（§16.19.1）：目标侧状态机线程，随 inter-master RPC
+    // 生命周期启停（driver 的拉取/ack 依赖 inter_master_rpc_）。cvm_controller_
+    // 未注入/缓存未就绪时 DriveReshardIntent 自行跳过等待，无顺序依赖。
+    if (!reshard_driver_running_.exchange(true)) {
+        reshard_driver_thread_ =
+            std::thread(&MasterService::ReshardDriverLoop, this);
+    }
     return ErrorCode::OK;
 }
 
@@ -1216,9 +1228,13 @@ void MasterService::EnqueueRemoteFreeIfTracked(const TenantId& tenant_id,
 }
 
 tl::expected<SlotMetadataExport, ErrorCode> MasterService::BuildSlotMetadataExport(
-    uint16_t slot) const {
+    uint16_t slot, bool require_not_owned) const {
     std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
-    if (CheckSlotServiceability(slot) != ErrorCode::SLOT_NOT_OWNED) {
+    // §15 单 slot 交接语义：仅在本机已失去归属时导出（staged 供新 owner
+    // 拉取）。P4 reshard 批量导出（require_not_owned=false）跳过该门控：
+    // 源仍持有归属，但 kMigrating barrier 已冻结写，快照稳定。
+    if (require_not_owned &&
+        CheckSlotServiceability(slot) != ErrorCode::SLOT_NOT_OWNED) {
         return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
     }
     SlotMetadataExport export_payload;
@@ -1347,6 +1363,123 @@ MasterService::InterMasterAckSlotImported(uint16_t slot,
     return had_staged;
 }
 
+tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+MasterService::InterMasterExportSlotBatch(
+    uint16_t first_slot, uint16_t last_slot,
+    const std::string& /*requester_master_id*/) {
+    // §16.19.2 段级批量导出：staged 缓存优先（心跳 on_release 可能已
+    // stage），缺失时即时构建。与单 slot 版不同，即时构建不做「必须已失去
+    // 归属」门控（require_not_owned=false）：reshard pull 发生在源仍持有
+    // 归属时（kMigrating 冻结写保证快照稳定）；源切 owner 后仍持有未 ack
+    // 的本地数据（断点续传重拉），重拉幂等。uint32 循环变量防 last=16383
+    // 时 ++ 回绕。
+    if (first_slot > last_slot) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<SlotMetadataExport> batch;
+    batch.reserve(static_cast<size_t>(last_slot) - first_slot + 1);
+    for (uint32_t slot = first_slot; slot <= last_slot; ++slot) {
+        const auto key = static_cast<uint16_t>(slot);
+        {
+            std::lock_guard<std::mutex> lock(pending_slot_exports_mutex_);
+            auto it = pending_slot_exports_.find(key);
+            if (it != pending_slot_exports_.end()) {
+                batch.push_back(it->second);
+                continue;
+            }
+        }
+        auto payload = BuildSlotMetadataExport(key, /*require_not_owned=*/false);
+        if (!payload.has_value()) {
+            LOG(WARNING) << "InterMasterExportSlotBatch: build failed slot="
+                         << key << ", err=" << toString(payload.error());
+            return tl::make_unexpected(payload.error());
+        }
+        batch.push_back(std::move(*payload));
+    }
+    return batch;
+}
+
+ErrorCode MasterService::DropSlotMetadataRange(uint16_t first_slot,
+                                              uint16_t last_slot) {
+    // 单趟扫描：按 key 的 slot 落在 [first, last] 闭区间判定删除，避免逐
+    // slot 反复全量扫描 metadata 分片（rank 段可达数千 slot）。EraseMetadata
+    // 的 kHandoff 配额模式与单 slot 版一致（数据字节留在 segment）。
+    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (auto tenant_it = shard->tenants.begin();
+             tenant_it != shard->tenants.end();) {
+            auto& tenant_state = tenant_it->second;
+            for (auto it = tenant_state.metadata.begin();
+                 it != tenant_state.metadata.end();) {
+                const uint16_t slot =
+                    cvm::KeySlot(tenant_it->first, it->first);
+                if (slot >= first_slot && slot <= last_slot) {
+                    it = EraseMetadata(tenant_state, it, tenant_it->first,
+                                       QuotaEraseMode::kHandoff);
+                } else {
+                    ++it;
+                }
+            }
+            if (tenant_state.Empty()) {
+                tenant_it = shard->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
+        }
+    }
+    return ErrorCode::OK;
+}
+
+tl::expected<bool, ErrorCode>
+MasterService::InterMasterAckSlotRangeImported(
+    uint16_t first_slot, uint16_t last_slot,
+    const std::string& /*importer_master_id*/) {
+    // §16.16.2 阶段4/5：目标安装完成后通知源清理。段内所有 slot 必须已
+    // 观察到归属切走（本机 expected/ready 位图随心跳 resolver 刷新）；
+    // 否则返回 SLOT_MIGRATING，目标稍后重试（源不清数据，重发无损）。
+    std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
+    for (uint32_t slot = first_slot; slot <= last_slot; ++slot) {
+        if (CheckSlotServiceability(static_cast<uint16_t>(slot)) !=
+            ErrorCode::SLOT_NOT_OWNED) {
+            return tl::make_unexpected(ErrorCode::SLOT_MIGRATING);
+        }
+    }
+    bool had_staged = false;
+    {
+        std::lock_guard<std::mutex> staged_lock(pending_slot_exports_mutex_);
+        for (uint32_t slot = first_slot; slot <= last_slot; ++slot) {
+            had_staged =
+                pending_slot_exports_.erase(static_cast<uint16_t>(slot)) > 0 ||
+                had_staged;
+        }
+    }
+    ErrorCode err = DropSlotMetadataRange(first_slot, last_slot);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "InterMasterAckSlotRangeImported: drop failed range=["
+                     << first_slot << "," << last_slot << "], err=" << err;
+        return tl::make_unexpected(err);
+    }
+    if (vsegment_service_) {
+        for (uint32_t slot = first_slot; slot <= last_slot; ++slot) {
+            const auto partition_id = std::to_string(slot);
+            vsegment::PartitionVSegmentSnapshot state;
+            err = vsegment_service_->SnapshotPartition(partition_id, &state);
+            if (err == ErrorCode::OK) {
+                err = vsegment_service_->RemovePartition(partition_id,
+                                                          state.route_epoch);
+                if (err != ErrorCode::OK) return tl::make_unexpected(err);
+            } else if (err != ErrorCode::STALE_ROUTE) {
+                return tl::make_unexpected(err);
+            }
+        }
+    }
+    // 段级汇总一条日志（区间压缩语义），不逐 slot 打印。
+    LOG(INFO) << "InterMasterAckSlotRangeImported: dropped slot range ["
+              << first_slot << "," << last_slot << "]"
+              << (had_staged ? " (staged exports cleared)" : "");
+    return had_staged;
+}
+
 ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     // 推导迁移前一任 owner（旧环）。空环 / 无旧 owner（冷启动、旧 owner
     // 消亡）→ 无可拉取对象，直接视为就绪（元数据为空，客户端重建）。
@@ -1392,59 +1525,426 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     }
     const SlotMetadataExport& export_payload = pull_result.value();
 
+    // §15 路径路由：成员环推导（owner 必须是本机——本机因环变化 gained
+    // 该 slot 才会进入此处）。安装主体已抽取到 InstallSlotMetadataExport，
+    // 供单 slot 交接与 P4 段级批量导入复用。
+    partition::PartitionRoute route;
+    ViewVersionId route_version = 0;
+    auto route_error = LoadEffectivePartitionRoute(
+        cluster_id_, std::to_string(slot), route, route_version, primary_ids,
+        ring_revision);
+    if (route_error != ErrorCode::OK) {
+        return route_error;
+    }
+
+    const ErrorCode install_error =
+        InstallSlotMetadataExport(export_payload, route);
+    if (install_error != ErrorCode::OK) {
+        return install_error;
+    }
+
+    // RPC 直传：导入完成后通知旧 owner 删除本地元数据（ack）。ack 失败仅告警
+    // 不阻断——旧 owner 残留元数据由其观察/lease 逻辑兜底清理。
+    auto ack_result =
+        inter_master_rpc_->AckSlotImported(old_owner, slot, master_id_);
+    if (!ack_result.has_value()) {
+        LOG(WARNING) << "ImportSlotMetadata: ack failed slot=" << slot
+                     << ", old_owner=" << old_owner
+                     << ", err=" << toString(ack_result.error());
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::ImportSlotRangeFrom(
+    const std::string& source_master_id, uint32_t rank, uint16_t first_slot,
+    uint16_t last_slot) {
+    // §16.19.2 段级拉取 + 安装（P4 reshard 驱动主体）。调用前置：owner CAS
+    // 已完成（ring_slots[rank].primary_id == 本机），源在 ack 前保留全部
+    // 未清数据（重拉幂等）；快照稳定由两重保证——kMigrating 期间源写被
+    // barrier 冻结、切 owner 后源停服，段内数据不再变化。
+    // 空 source（空 rank 原生认领）无元数据可拉，直接返回。
+    if (first_slot > last_slot) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (source_master_id.empty() || source_master_id == master_id_) {
+        return ErrorCode::OK;
+    }
+    if (!inter_master_rpc_) {
+        LOG(WARNING) << "ImportSlotRangeFrom: inter_master_rpc_ not ready, "
+                        "rank="
+                     << rank;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto pull = inter_master_rpc_->ExportSlotBatch(
+        source_master_id, first_slot, last_slot, master_id_);
+    if (!pull.has_value()) {
+        LOG(WARNING) << "ImportSlotRangeFrom: ExportSlotBatch failed rank="
+                     << rank << " range=[" << first_slot << "," << last_slot
+                     << "] source=" << source_master_id
+                     << ", err=" << toString(pull.error());
+        return pull.error();
+    }
+
+    // 安装前重读 ring_slots 显式路由：owner 必须仍是本机（InstallSlotMetadata
+    // Export 的防御门控）；epoch 即本段当前归属代，作 vsegment route_epoch。
+    // 若 owner 已被再次切走（管理员并发改判），放弃本轮，由下一扫描重读。
+    cvm::RingSlotAssign assign;
+    ViewVersionId version = 0;
+    ErrorCode err = cvm::EtcdViewStore::LoadRingSlotAssign(cluster_id_, rank,
+                                                           assign, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (assign.primary_id != master_id_) {
+        LOG(WARNING) << "ImportSlotRangeFrom: rank=" << rank
+                     << " owner changed to " << assign.primary_id
+                     << " mid-import, aborting";
+        return ErrorCode::STALE_ROUTE;
+    }
+
+    for (const auto& export_payload : pull.value()) {
+        // 防御：源返回数据必须落在请求区间内。
+        if (export_payload.slot < first_slot || export_payload.slot > last_slot) {
+            LOG(WARNING) << "ImportSlotRangeFrom: out-of-range slot="
+                         << export_payload.slot << " rank=" << rank
+                         << ", skipped";
+            continue;
+        }
+        partition::PartitionRoute route;
+        route.partition_id.partition_id =
+            std::to_string(export_payload.slot);
+        route.owner_submaster_id = master_id_;
+        route.route_epoch = assign.epoch;
+        route.state =
+            static_cast<int32_t>(partition::PartitionState::kActive);
+        const ErrorCode install_err =
+            InstallSlotMetadataExport(export_payload, route);
+        if (install_err != ErrorCode::OK) {
+            // 失败即中止：已安装部分幂等（重复 key 跳过），下一轮重拉重装。
+            LOG(WARNING) << "ImportSlotRangeFrom: install failed rank="
+                         << rank << " slot=" << export_payload.slot
+                         << ", err=" << toString(install_err)
+                         << " (will retry, idempotent)";
+            return install_err;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+bool MasterService::DriveReshardIntent(const cvm::ReshardIntent& intent) {
+    // §16.19.1 目标侧状态机（coordinator = target）。调用方已过滤
+    // target==本机；返回 true = 已完成（含 ack）或意图失效，调用方删 intent。
+    if (intent.target_primary_id != master_id_) {
+        return false;
+    }
+    const uint32_t rank = intent.rank;
+
+    // 同 rank 并发驱动互斥（driver 线程 + 潜在外部触发共用）。
+    {
+        std::lock_guard<std::mutex> lock(reshard_inflight_mutex_);
+        if (reshard_inflight_.count(rank) > 0) {
+            return false;
+        }
+        reshard_inflight_.emplace(rank, 0);
+    }
+    struct InflightGuard {
+        std::mutex& mutex;
+        std::map<uint32_t, uint64_t>& inflight;
+        uint32_t rank;
+        ~InflightGuard() {
+            std::lock_guard<std::mutex> lock(mutex);
+            inflight.erase(rank);
+        }
+    } inflight_guard{reshard_inflight_mutex_, reshard_inflight_, rank};
+
+    // G 视图就绪判定 + rank 合法性。缓存未就绪（watch 首扫未完成）→ 等待；
+    // rank >= G 属跨代残留（G 变更是冷操作，换代码后旧 intent 残留）→ 失效。
+    if (cvm_controller_ == nullptr ||
+        !cvm_controller_->HasCachedRingSlotAssigns()) {
+        return false;
+    }
+    const uint32_t group_count = cvm_controller_->GetCachedSlotGroupCount();
+    if (group_count == 0 || rank >= group_count) {
+        LOG(WARNING) << "DriveReshardIntent: stale intent rank=" << rank
+                     << " >= group_count=" << group_count << ", discarding";
+        return true;
+    }
+    const auto slots = cvm::RankOwnedSlots(rank, group_count);
+    if (slots.empty()) {
+        return false;  // 防御，正常不发生
+    }
+    const uint16_t first_slot = slots.front();
+    const uint16_t last_slot = slots.back();
+
+    cvm::RingSlotAssign assign;
+    ViewVersionId version = 0;
+    ErrorCode err = cvm::EtcdViewStore::LoadRingSlotAssign(cluster_id_, rank,
+                                                           assign, version);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        // 空 rank 原生认领（§16.15.3）：key 不存在 = 从未分配，无迁移阶段，
+        // kKeyNotExists 事务声明本机为 primary（并发认领仅一个成功）。空段
+        // 无元数据可拉，slot 就绪由心跳 gained→on_slot_acquired 路径完成。
+        cvm::RingSlotAssign created;
+        created.rank = rank;
+        created.primary_id = master_id_;
+        created.state = static_cast<int32_t>(cvm::SlotState::kStable);
+        err = cvm::EtcdViewStore::CreateRingSlotAssign(cluster_id_, created);
+        if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+            LOG(WARNING) << "DriveReshardIntent: claim race lost rank=" << rank
+                         << ", discarding intent";
+            return true;  // 他人已认领，本意图失效
+        }
+        if (err != ErrorCode::OK) {
+            return false;
+        }
+        LOG(INFO) << "DriveReshardIntent: claimed empty rank=" << rank
+                  << " primary=" << master_id_;
+        return true;
+    }
+    if (err != ErrorCode::OK) {
+        return false;  // etcd 瞬时故障，下一轮重试
+    }
+    {
+        std::lock_guard<std::mutex> lock(reshard_inflight_mutex_);
+        reshard_inflight_[rank] = assign.epoch;
+    }
+
+    if (assign.primary_id != master_id_) {
+        if (assign.primary_id != intent.source_primary_id) {
+            // 意图记录的源已非当前 owner（源死亡被晋升覆盖 / 管理员改判）。
+            // 意图永久不可满足 → 失效，删（返回 true）——否则每 5s 扫描
+            // 重复 WARNING 刷屏且永不清理。需要迁移由管理员重新发起
+            //（§16.16.7）。
+            LOG(WARNING) << "DriveReshardIntent: source no longer owner, "
+                            "discarding stale intent rank="
+                         << rank << " intent_source="
+                         << intent.source_primary_id << " current_owner="
+                         << assign.primary_id;
+            return true;
+        }
+        if (static_cast<cvm::SlotState>(assign.state) ==
+                cvm::SlotState::kMigrating &&
+            assign.migrating_to_id != master_id_) {
+            // 他方迁移进行中（同 rank 互斥，§16.19.1）：epoch 已被并发推进，
+            // 本意图永久排队无意义 → 失效删除；需要时管理员重发。
+            LOG(WARNING) << "DriveReshardIntent: another migration in "
+                            "progress, discarding stale intent rank="
+                         << rank << " migrating_to="
+                         << assign.migrating_to_id;
+            return true;
+        }
+        // 阶段1：CAS kMigrating（migrating_to=本机）。源 watch 即时冻结该段
+        // 写（§16.19.3），读继续由源服务。kMigrating 语义下
+        // AdoptRankViaCAS 不删 intent（本路径的配套状态）。
+        cvm::RingSlotAssign migrating;
+        err = cvm::EtcdViewStore::AdoptRankViaCAS(
+            cluster_id_, rank, assign.epoch, assign.primary_id,
+            cvm::SlotState::kMigrating, master_id_, migrating, nullptr,
+            "reshard begin", assign.primary_id, /*success_as_warning=*/false,
+            /*clear_intent=*/false);
+        if (err == ErrorCode::STALE_ROUTE) {
+            return false;  // 他方已动，下一轮重读
+        }
+        if (err != ErrorCode::OK) {
+            return false;
+        }
+        assign = migrating;
+        // 阶段2：CAS 切 owner（primary=本机, kStable）。客户端读路由原子切到
+        // 本机；写冻结窗口持续到安装完成（§16.19.4，目标侧 expected 但
+        // 未 ready 期间返回 SLOT_MIGRATING）。standby 列表保留在 rank 上
+        //（nullptr 不替换），配对回放由 CvmController 重绑。intent 保留
+        //（clear_intent=false）：阶段3 安装/阶段4 ack 未完成前是断点续传
+        // 依据，driver 全流程完成后才删。
+        cvm::RingSlotAssign owned;
+        err = cvm::EtcdViewStore::AdoptRankViaCAS(
+            cluster_id_, rank, assign.epoch, master_id_,
+            cvm::SlotState::kStable, std::string(), owned, nullptr,
+            "reshard owner switch", assign.primary_id,
+            /*success_as_warning=*/false, /*clear_intent=*/false);
+        if (err != ErrorCode::STALE_ROUTE && err != ErrorCode::OK) {
+            return false;
+        }
+        // STALE：他方已切（如晋升覆盖），下一轮重读后走下方恢复路径。
+    } else if (static_cast<cvm::SlotState>(assign.state) ==
+               cvm::SlotState::kMigrating) {
+        // 断点续传重入：阶段1 后崩溃（owner 仍源、kMigrating 指向本机）→
+        // 补切 owner。
+        if (assign.migrating_to_id != master_id_) {
+            // 本机持有但正迁往他方（管理员改判）→ 本意图失效，删除。
+            LOG(WARNING) << "DriveReshardIntent: rank owned by me but "
+                            "migrating away, discarding stale intent rank="
+                         << rank << " migrating_to="
+                         << assign.migrating_to_id;
+            return true;
+        }
+        cvm::RingSlotAssign owned;
+        err = cvm::EtcdViewStore::AdoptRankViaCAS(
+            cluster_id_, rank, assign.epoch, master_id_,
+            cvm::SlotState::kStable, std::string(), owned, nullptr,
+            "reshard resume", assign.primary_id, /*success_as_warning=*/false,
+            /*clear_intent=*/false);
+        if (err != ErrorCode::OK) {
+            return false;
+        }
+    }
+    // owner==本机且 kStable：阶段2 已完成（安装后崩溃 / ack 后残留）→
+    // 重放拉取 + 安装（幂等：重复 key 跳过）+ 补 ack。
+
+    // 阶段3：段级拉快照 + 安装。
+    err = ImportSlotRangeFrom(intent.source_primary_id, rank, first_slot,
+                              last_slot);
+    if (err != ErrorCode::OK) {
+        // 失败分类：源已消亡（lease 过期，masters/ 无记录）→ 元数据不可达，
+        // 按「空元数据 + 客户端重建」收尾（与 §15.7 单 slot 交接的
+        // old_owner_gone 语义一致）；已安装部分保留，缺口由客户端重写补齐。
+        // 源仍存活 → 瞬时故障，下一轮重试。
+        if (!intent.source_primary_id.empty() &&
+            intent.source_primary_id != master_id_) {
+            std::vector<cvm::MasterRegistration> masters;
+            ViewVersionId masters_version = 0;
+            if (cvm::EtcdViewStore::LoadAllMasters(cluster_id_, masters,
+                                                   masters_version) ==
+                    ErrorCode::OK &&
+                !cvm::IsMemberAlive(masters, intent.source_primary_id)) {
+                LOG(ERROR) << "DriveReshardIntent: source died mid-reshard, "
+                              "finalizing rank with already-installed "
+                              "metadata (gaps rebuilt by clients) rank="
+                           << rank << " source=" << intent.source_primary_id;
+                MarkSlotsReady(slots);
+                return true;
+            }
+        }
+        return false;
+    }
+    MarkSlotsReady(slots);
+
+    // 阶段4：段级 ack（源清段内元数据 + staged 导出）。源尚未观察到归属切走
+    // 时返回 SLOT_MIGRATING → 本轮放弃，下一轮恢复路径重放（重拉幂等）。
+    if (!intent.source_primary_id.empty() &&
+        intent.source_primary_id != master_id_) {
+        if (!inter_master_rpc_) {
+            return false;
+        }
+        auto ack = inter_master_rpc_->AckSlotRangeImported(
+            intent.source_primary_id, first_slot, last_slot, master_id_);
+        if (!ack.has_value()) {
+            LOG(WARNING) << "DriveReshardIntent: ack failed rank=" << rank
+                         << " (will retry) err=" << toString(ack.error());
+            return false;
+        }
+    }
+    LOG(INFO) << "DriveReshardIntent: completed rank=" << rank << " slots=["
+              << first_slot << "," << last_slot
+              << "] source=" << intent.source_primary_id
+              << " target=" << master_id_;
+    return true;
+}
+
+void MasterService::ReshardDriverLoop() {
+    LOG(INFO) << "ReshardDriverLoop: started master_id=" << master_id_;
+    // 扫描间隔：reshard 是低频操作（管理员扩缩容 / 新成员原生认领触发），
+    // 5s 轮询足够及时；intent 持久化在 etcd，漏一轮下一轮补（断点续传）。
+    constexpr auto kScanInterval = std::chrono::seconds(5);
+    size_t last_logged_mine = static_cast<size_t>(-1);
+    while (reshard_driver_running_.load()) {
+        std::vector<cvm::ReshardIntent> intents;
+        ViewVersionId version = 0;
+        ErrorCode err = cvm::EtcdViewStore::LoadAllReshardIntents(
+            cluster_id_, intents, version);
+        if (err == ErrorCode::OK) {
+            size_t mine = 0;
+            size_t completed = 0;
+            for (const auto& intent : intents) {
+                if (intent.target_primary_id != master_id_) {
+                    continue;
+                }
+                ++mine;
+                if (DriveReshardIntent(intent)) {
+                    const ErrorCode del =
+                        cvm::EtcdViewStore::DeleteReshardIntent(cluster_id_,
+                                                                intent.rank);
+                    if (del == ErrorCode::OK) {
+                        ++completed;
+                    } else {
+                        LOG(WARNING) << "ReshardDriverLoop: delete intent "
+                                        "failed rank="
+                                     << intent.rank << " err=" << del
+                                     << " (will re-drive)";
+                    }
+                }
+            }
+            // 防刷屏：仅本机意图数变化时打印汇总（含归零）。
+            if (mine != last_logged_mine) {
+                LOG(INFO) << "ReshardDriverLoop: intents targeting me="
+                          << mine << (completed
+                                          ? " (completed this scan)"
+                                          : "");
+                last_logged_mine = mine;
+            }
+        } else if (err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+            LOG(WARNING) << "ReshardDriverLoop: LoadAllReshardIntents "
+                            "failed: "
+                         << err;
+        }
+        std::this_thread::sleep_for(kScanInterval);
+    }
+    LOG(INFO) << "ReshardDriverLoop: stopped";
+}
+
+ErrorCode MasterService::InstallSlotMetadataExport(
+    const SlotMetadataExport& export_payload,
+    const partition::PartitionRoute& effective_route) {
+    const uint16_t slot = export_payload.slot;
+    // 防御：路由 owner 必须是本机（调用方已解析；不匹配说明视图已过期）。
+    if (effective_route.owner_submaster_id != master_id_) {
+        return ErrorCode::STALE_ROUTE;
+    }
+
     if (export_payload.vsegment_partition.has_value()) {
         if (!vsegment_service_ || !ordered_oplog_writer_) {
-            LOG(ERROR) << "ImportSlotMetadata: vsegment state has no local "
-                          "runtime slot="
+            LOG(ERROR) << "InstallSlotMetadataExport: vsegment state has no "
+                          "local runtime slot="
                        << slot;
             return ErrorCode::INVALID_PARAMS;
         }
         const std::string partition_id = std::to_string(slot);
         const auto& transferred = *export_payload.vsegment_partition;
         if (transferred.partition_id != partition_id) {
-            LOG(ERROR) << "ImportSlotMetadata: vsegment Partition mismatch";
+            LOG(ERROR) << "InstallSlotMetadataExport: vsegment Partition "
+                          "mismatch";
             return ErrorCode::INVALID_PARAMS;
-        }
-        partition::PartitionRoute route;
-        ViewVersionId version = 0;
-        auto route_error = LoadEffectivePartitionRoute(
-            cluster_id_, partition_id, route, version, primary_ids,
-            ring_revision);
-        if (route_error != ErrorCode::OK ||
-            route.owner_submaster_id != master_id_) {
-            return route_error == ErrorCode::OK ? ErrorCode::STALE_ROUTE
-                                                : route_error;
         }
         vsegment::PartitionVSegmentSnapshot current;
         const auto current_error =
             vsegment_service_->SnapshotPartition(partition_id, &current);
         if (current_error == ErrorCode::OK && !current.vsegments.empty()) {
             if (current.metadata_revision != transferred.metadata_revision) {
-                LOG(ERROR) << "ImportSlotMetadata: target Partition is not "
-                              "empty slot="
+                LOG(ERROR) << "InstallSlotMetadataExport: target Partition "
+                              "is not empty slot="
                            << slot;
                 return ErrorCode::INVALID_VERSION;
             }
         } else {
             if (current_error == ErrorCode::OK) {
                 auto remove_error = vsegment_service_->RemovePartition(
-                    partition_id, route.route_epoch);
+                    partition_id, effective_route.route_epoch);
                 if (remove_error != ErrorCode::OK) return remove_error;
             } else if (current_error != ErrorCode::STALE_ROUTE) {
                 return current_error;
             }
             auto state = transferred;
-            state.route_epoch = route.route_epoch;
+            state.route_epoch = effective_route.route_epoch;
             auto committer =
                 std::make_shared<vsegment::OrderedOpLogVSegmentCommitter>(
                     ordered_oplog_writer_.get());
             std::string detail;
             auto add_error = vsegment_service_->AddPartition(
-                partition_id, route.route_epoch, std::move(committer), &state,
-                &detail);
+                partition_id, effective_route.route_epoch, std::move(committer),
+                &state, &detail);
             if (add_error != ErrorCode::OK) {
-                LOG(ERROR) << "ImportSlotMetadata: failed to install vsegment "
-                              "state slot="
+                LOG(ERROR) << "InstallSlotMetadataExport: failed to install "
+                              "vsegment state slot="
                            << slot << ", detail=" << detail;
                 return add_error;
             }
@@ -1465,7 +1965,8 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     for (const auto& entry : export_payload.objects) {
         auto [tenant_id, user_key] = resolve(entry);
         if (!tenant_id.IsValid()) {
-            LOG(WARNING) << "ImportSlotMetadata: invalid tenant for slot="
+            LOG(WARNING) << "InstallSlotMetadataExport: invalid tenant for "
+                            "slot="
                          << slot << ", key=" << entry.key;
             continue;
         }
@@ -1475,7 +1976,6 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
         objects_by_shard[shard_idx].push_back(&entry);
     }
 
-    size_t imported = 0;
     for (const auto& [shard_idx, shard_objects] : objects_by_shard) {
         MetadataShardAccessorRW shard(this, shard_idx);
         auto now = std::chrono::system_clock::now();
@@ -1537,9 +2037,12 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
                     std::move(replicas), false, false, standby_meta.data_type,
                     standby_meta.group_id, tenant_id, user_key));
             if (!inserted) {
-                // 新获得 slot 时理论上不应碰撞；若碰撞则跳过以避免重复记账。
-                LOG(WARNING) << "ImportSlotMetadata: duplicate key slot=" << slot
-                             << ", key=" << entry.key << ", skipped";
+                // 新获得 slot 时理论上不应碰撞；若碰撞则跳过以避免重复记账
+                //（P4 reshard 与心跳 on_slot_acquired 并发导入时可能重复，
+                // 重复项由先完成者记账，后者跳过，无损）。
+                LOG(WARNING) << "InstallSlotMetadataExport: duplicate key "
+                                "slot="
+                             << slot << ", key=" << entry.key << ", skipped";
                 continue;
             }
             auto& metadata = metadata_it->second;
@@ -1566,12 +2069,12 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
                     metadata.committed_quota_charge_bytes = committed_charge;
                 } else {
                     LOG(WARNING)
-                        << "ImportSlotMetadata: quota reserve failed tenant="
+                        << "InstallSlotMetadataExport: quota reserve failed "
+                           "tenant="
                         << tenant_id.value() << ", bytes=" << committed_charge
                         << ", err=" << reserve_result.error();
                 }
             }
-            ++imported;
         }
     }
 
@@ -1579,16 +2082,6 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     // the source's export intact for the next acquire attempt.
     const auto activation = RefreshVSegmentOwnership(std::to_string(slot));
     if (activation != ErrorCode::OK) return activation;
-
-    // RPC 直传：导入完成后通知旧 owner 删除本地元数据（ack）。ack 失败仅告警
-    // 不阻断——旧 owner 残留元数据由其观察/lease 逻辑兜底清理。
-    auto ack_result =
-        inter_master_rpc_->AckSlotImported(old_owner, slot, master_id_);
-    if (!ack_result.has_value()) {
-        LOG(WARNING) << "ImportSlotMetadata: ack failed slot=" << slot
-                     << ", old_owner=" << old_owner
-                     << ", err=" << toString(ack_result.error());
-    }
     return ErrorCode::OK;
 }
 #else
@@ -1612,11 +2105,16 @@ void MasterService::EnqueueRemoteFreeIfTracked(
     QuotaEraseMode /*quota_mode*/) {}
 
 tl::expected<SlotMetadataExport, ErrorCode> MasterService::BuildSlotMetadataExport(
-    uint16_t /*slot*/) const {
+    uint16_t /*slot*/, bool /*require_not_owned*/) const {
     return SlotMetadataExport{};
 }
 
 ErrorCode MasterService::DropSlotMetadataLocal(uint16_t /*slot*/) {
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::DropSlotMetadataRange(uint16_t /*first_slot*/,
+                                              uint16_t /*last_slot*/) {
     return ErrorCode::OK;
 }
 
@@ -1625,6 +2123,12 @@ ErrorCode MasterService::ExportSlotMetadata(uint16_t /*slot*/) {
 }
 
 ErrorCode MasterService::ImportSlotMetadata(uint16_t /*slot*/) {
+    return ErrorCode::OK;
+}
+
+ErrorCode MasterService::InstallSlotMetadataExport(
+    const SlotMetadataExport& /*export_payload*/,
+    const partition::PartitionRoute& /*effective_route*/) {
     return ErrorCode::OK;
 }
 
@@ -1638,6 +2142,31 @@ tl::expected<bool, ErrorCode> MasterService::InterMasterAckSlotImported(
     uint16_t /*slot*/, const std::string& /*importer*/) {
     return false;
 }
+
+tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+MasterService::InterMasterExportSlotBatch(uint16_t /*first_slot*/,
+                                          uint16_t /*last_slot*/,
+                                          const std::string& /*requester*/) {
+    return std::vector<SlotMetadataExport>{};
+}
+
+tl::expected<bool, ErrorCode> MasterService::InterMasterAckSlotRangeImported(
+    uint16_t /*first_slot*/, uint16_t /*last_slot*/,
+    const std::string& /*importer*/) {
+    return false;
+}
+
+ErrorCode MasterService::ImportSlotRangeFrom(
+    const std::string& /*source_master_id*/, uint32_t /*rank*/,
+    uint16_t /*first_slot*/, uint16_t /*last_slot*/) {
+    return ErrorCode::OK;
+}
+
+bool MasterService::DriveReshardIntent(const cvm::ReshardIntent& /*intent*/) {
+    return false;
+}
+
+void MasterService::ReshardDriverLoop() {}
 #endif
 
 #ifdef STORE_USE_ETCD
@@ -1758,9 +2287,73 @@ void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
 }
 
 std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
+    // ring_slots 缓存优先（§16.15.5）：本机是哪些 rank 的 primary_id，拥有
+    // 这些 rank 的连续 slot 段（兼管多 rank 取并集）。缓存空（shadow write
+    // 未启用的新集群）回退 §15 环推导，两模型并行灰度。
+    // 启用判定必须用「存在归属记录」而非 G>0：旧集群（§15）的 cluster_meta
+    // 反序列化后 G 也落默认 1，用 G 判定会把旧集群 primary 误判为 standby
+    //（0 slot）。
+    if (cvm_controller_ != nullptr &&
+        cvm_controller_->HasCachedRingSlotAssigns()) {
+        const uint32_t group_count =
+            cvm_controller_->GetCachedSlotGroupCount();
+        std::vector<cvm::RingSlotAssign> mine;
+        for (uint32_t rank = 0; rank < group_count; ++rank) {
+            cvm::RingSlotAssign a;
+            if (cvm_controller_->GetCachedRingSlotAssign(rank, a) &&
+                a.primary_id == master_id_) {
+                mine.push_back(std::move(a));
+            }
+        }
+        if (!mine.empty()) {
+            std::vector<uint16_t> owned;
+            for (const auto& a : mine) {
+                const auto segment =
+                    cvm::RankOwnedSlots(a.rank, group_count);
+                owned.insert(owned.end(), segment.begin(), segment.end());
+            }
+            std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+            const std::size_t new_count = owned.size();
+            if (!owned_slot_count_logged_ ||
+                new_count != last_logged_owned_count_) {
+                LOG(INFO) << "ResolveOwnedSlotsForCvm: owned slot count "
+                             "changed (ring_slots)"
+                          << ", master_id=" << master_id_
+                          << ", groups=" << group_count
+                          << ", owned_slots=" << new_count
+                          << ", previous=" << last_logged_owned_count_;
+                owned_slot_count_logged_ = true;
+                last_logged_owned_count_ = new_count;
+            }
+            cvm_last_resolved_owned_slots_ = owned;
+            return owned;
+        }
+        // 缓存有记录但本机非任何 rank 的 primary：本机 standby，返回空段。
+        // 同样走 sticky 更新（下述旧路径的 sticky 语义在此不再适用——
+        // standby 拥有 0 slot 是显式状态，非解析失败）。降级转移（如
+        // primary N→0）打一次变更日志，稳态零输出。
+        {
+            std::lock_guard<std::mutex> lock(cvm_resolver_mutex_);
+            if (!owned_slot_count_logged_ || last_logged_owned_count_ != 0) {
+                LOG(INFO) << "ResolveOwnedSlotsForCvm: owned slot count "
+                             "changed (ring_slots)"
+                          << ", master_id=" << master_id_
+                          << ", owned_slots=0"
+                          << ", previous=" << last_logged_owned_count_
+                          << " (standby: not primary of any rank)";
+                owned_slot_count_logged_ = true;
+                last_logged_owned_count_ = 0;
+            }
+            cvm_last_resolved_owned_slots_.clear();
+        }
+        return {};
+    }
+
     // etcd 读取失败：sticky 策略——沿用上一轮成功解析的结果（可能为空）。
     // 绝不回退为全量接管：瞬时抖动引发的全量认领会与对端产生覆盖战
     // （双方反复重写对方 slot 记录，导致 slot 分布持续震荡不收敛）。
+    // 回退瞬态打点（节流）：expected 集推导的幽灵风险观测（§16.14.6）。
+    MaybeWarnGhostFallback("ResolveOwnedSlots", 0);
     std::vector<cvm::MasterRegistration> masters;
     ViewVersionId version;
     ErrorCode err =
@@ -1869,6 +2462,24 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
 
 std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
     uint16_t slot) const {
+    // ring_slots 缓存优先（§16.15.5）：SlotToRank 纯函数定位 rank，读该
+    // rank 的 primary_id。缓存空回退 §15 环反查，两模型并行灰度。
+    // 回退瞬态打点（节流）：写/转发判定的幽灵风险观测（§16.14.6）。
+    if (cvm_controller_ != nullptr) {
+        const uint32_t group_count =
+            cvm_controller_->GetCachedSlotGroupCount();
+        cvm::RingSlotAssign a;
+        if (group_count > 0 &&
+            cvm_controller_->GetCachedRingSlotAssign(
+                cvm::SlotToRank(slot, group_count), a)) {
+            if (a.primary_id.empty()) {
+                return std::nullopt;  // 晋升未完成 → 调用方 SLOT_NOT_OWNED
+            }
+            return a.primary_id;
+        }
+        MaybeWarnGhostFallback("ResolveSlotOwner", slot);
+    }
+
     std::vector<cvm::MasterRegistration> masters;
     ViewVersionId version;
     ErrorCode err =
@@ -1900,6 +2511,7 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
 void MasterService::PublishSegmentOwnerForCvm(const Segment&) {}
 void MasterService::RemoveSegmentOwnerForCvm(const UUID&) {}
 std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() { return {}; }
+void MasterService::MaybeWarnGhostFallback(const char*, uint16_t) const {}
 std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
     uint16_t /*slot*/) const {
     return std::nullopt;
@@ -1969,6 +2581,75 @@ ErrorCode MasterService::CheckSlotServiceability(uint16_t slot) const {
     return ErrorCode::SLOT_NOT_OWNED;
 }
 
+void MasterService::MaybeWarnGhostFallback(const char* where,
+                                           uint16_t slot) const {
+    // 幽灵写瞬态告警（§16.14.6 验证辅助）：模型曾启用（seen）但本 slot
+    // 的归属缓存未命中（G 未加载 / rank 记录缺失）→ 判定正在走旧环回退，
+    // 结果可能与 etcd 真实归属不一致。旧集群（从未 seen）回退是正常
+    // 稳态，不告警。数据面 QPS 高：30s 节流一条，CAS 保证多线程只打一次。
+    if (cvm_controller_ == nullptr ||
+        !cvm_controller_->HasSeenRingSlotsModel()) {
+        return;
+    }
+    const uint32_t group_count =
+        cvm_controller_->GetCachedSlotGroupCount();
+    cvm::RingSlotAssign assign;
+    if (group_count > 0 &&
+        cvm_controller_->GetCachedRingSlotAssign(
+            cvm::SlotToRank(slot, group_count), assign)) {
+        return;  // 缓存命中：正常路径
+    }
+    const int64_t now_ms = std::chrono::duration_cast<
+        std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+    const int64_t last =
+        last_ghost_fallback_warn_ms_.load(std::memory_order_relaxed);
+    if (now_ms - last < 30000) {
+        return;
+    }
+    if (last_ghost_fallback_warn_ms_.compare_exchange_strong(
+            last, now_ms, std::memory_order_relaxed)) {
+        LOG(WARNING) << "GHOST-WRITE-RISK " << where
+                     << ": ring_slots model active but slot ownership "
+                        "cache missed, legacy-ring fallback in use "
+                        "(may diverge from etcd): master_id="
+                     << master_id_ << ", slot=" << slot
+                     << ", cached_group_count=" << group_count;
+    }
+}
+
+ErrorCode MasterService::CheckSlotWritable(uint16_t slot) const {
+    // §16.19.3 写路径校验（读写分离）：ready/expected 判定复用读路径的
+    // CheckSlotServiceability，其上叠加 reshard 迁出 barrier——本机是该
+    // slot 所在 rank 的 primary，但 ring_slots 显示 kMigrating 且
+    // migrating_to 非本机（正在迁出）→ 冻结写返回 SLOT_MIGRATING。读路径
+    // 继续走 CheckSlotServiceability（源在 kMigrating 期间仍服务读）。
+    // fail-safe 取向「宁可误冻结，不可漏冻结」：kMigrating 置位由
+    // RingSlotsWatch 即时驱动（watch 滞后仅短暂多冻/漏窗口 < 刷新周期）。
+    const ErrorCode svc = CheckSlotServiceability(slot);
+    if (svc != ErrorCode::OK) {
+        return svc;  // SLOT_MIGRATING（gaining）/ SLOT_NOT_OWNED 原样透传
+    }
+    if (cvm_controller_ != nullptr) {
+        const uint32_t group_count =
+            cvm_controller_->GetCachedSlotGroupCount();
+        cvm::RingSlotAssign assign;
+        if (group_count > 0 &&
+            cvm_controller_->GetCachedRingSlotAssign(
+                cvm::SlotToRank(slot, group_count), assign) &&
+            static_cast<cvm::SlotState>(assign.state) ==
+                cvm::SlotState::kMigrating &&
+            assign.migrating_to_id != master_id_) {
+            return ErrorCode::SLOT_MIGRATING;  // 迁出 barrier：冻结写
+        }
+    }
+    // 判定通过（返回 OK）：若处于「模型已启用但缓存空」的旧环回退瞬态，
+    // 此 OK 可能基于过时推导——打点（节流）供线上复现定位。
+    MaybeWarnGhostFallback("CheckSlotWritable", slot);
+    return ErrorCode::OK;
+}
+
 ErrorCode MasterService::CheckVSegmentServiceability(
     const std::string& partition_id) const {
     if (!partition_id.empty() && partition_id.size() <= 5 &&
@@ -1986,6 +2667,14 @@ MasterService::~MasterService() {
 
     // Stop the SlotOwnerHeartbeat thread before tearing down the rest.
     StopSlotOwnerHeartbeat();
+
+    // Stop the P4 reshard driver before the inter-master RPC client it uses
+    //（拉取/ack 依赖 inter_master_rpc_，须先 join 再销毁客户端）。
+    reshard_driver_running_ = false;
+    if (reshard_driver_thread_.joinable()) {
+        reshard_driver_thread_.join();
+    }
+
     StopInterMasterRpc();
 
     // Stop and join the threads
@@ -5683,7 +6372,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     {
         const uint16_t slot =
             cvm::KeySlot(object_id.tenant_id, object_id.user_key);
-        const ErrorCode svc = CheckSlotServiceability(slot);
+        // 写路径走 CheckSlotWritable（§16.19.3）：kMigrating 迁出段冻结写
+        //（barrier），与读路径的 CheckSlotServiceability 读写分离。
+        const ErrorCode svc = CheckSlotWritable(slot);
         if (svc == ErrorCode::SLOT_MIGRATING) {
             LOG(INFO) << "PutStart rejected with SLOT_MIGRATING: key="
                       << object_id.user_key << " slot=" << slot;
@@ -6391,7 +7082,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     {
         const uint16_t slot =
             cvm::KeySlot(object_id.tenant_id, object_id.user_key);
-        const ErrorCode svc = CheckSlotServiceability(slot);
+        // 写路径走 CheckSlotWritable（§16.19.3，与 PutStart 对称）：Upsert
+        // 为覆盖式写，kMigrating 迁出段同样冻结。
+        const ErrorCode svc = CheckSlotWritable(slot);
         if (svc == ErrorCode::SLOT_MIGRATING) {
             LOG(INFO) << "UpsertStart rejected with SLOT_MIGRATING: key="
                       << object_id.user_key << " slot=" << slot;

@@ -159,5 +159,56 @@ inline std::string ResolveSlotOwnerOnRing(const std::vector<std::string>& ids,
     return ids[it->owner_index];
 }
 
+// ---------------------------------------------------------------------------
+// RingSlot 槽位组（§16.3/§16.5）：slot → rank 连续段纯函数
+//
+// slot 归属推导链（P3 起）：
+//   slot → rank  = SlotToRank(slot, G)   确定性纯函数，不持久化
+//   rank → owner = ring_slots[rank]      稳定显式状态，持久化 O(G)
+//
+// G（槽位组数）在集群创建时设定、运行期恒不变（变更属冷操作，§16.8 前提）。
+// 所有调用点必须使用同一个 G（从 RingMeta.slot_group_count 读取后传递），
+// 服务端与客户端对同一输入必须推导出字节级一致的结果。
+// ---------------------------------------------------------------------------
+
+// 将 slot 映射到槽位组 rank ∈ [0, group_count)。
+//
+// 连续段划分（rank 单调、无空洞、无重叠、全覆盖）：
+//   SlotToRank(s, G) = floor(s * G / 16384)
+//   rank r 独占 s ∈ [ceil(r*16384/G), ceil((r+1)*16384/G))
+// 两式的整除方向是对偶的（一向下、一向上），G 不整除 16384 时（如
+// G=3 → 段长 5462/5461/5461）也只有这一组合能保证互逆，双向 floor 会
+// 在段界 slot 上出现「SlotToRank(s)=r-1 但 s ∈ RankOwnedSlots(r)」的
+// 归属裂缝。G=1 退化为单 primary 全量（与 §15 单主等价，回滚保证）。
+inline uint32_t SlotToRank(uint16_t slot, uint32_t group_count) {
+    // 先提升到 32 位再乘：16383 * 16384 = 2^28，uint32_t 足够，
+    // 但 uint16 直接乘可能截断，必须显式 cast。
+    return static_cast<uint32_t>(slot) * group_count / kSlotCount;
+}
+
+// 返回 rank 所拥有的 slot 段（升序、连续），即
+// [ceil(rank*16384/G), ceil((rank+1)*16384/G))。
+//
+// 防御：group_count == 0 或 rank >= group_count 返回空（正常不应发生）。
+// 循环变量必须为 uint32_t：G > 16384 时段尾会超出 uint16_t 域（见上）。
+inline std::vector<uint16_t> RankOwnedSlots(uint32_t rank,
+                                            uint32_t group_count) {
+    if (group_count == 0 || rank >= group_count) {
+        return {};
+    }
+    // 上取整对偶（见 SlotToRank 注释）：ceil(x/G) = (x + G - 1) / G。
+    // rank < G <= 16384 时 (rank+1)*16384 + G - 1 < 2^28，无溢出。
+    const uint32_t first =
+        (rank * kSlotCount + group_count - 1) / group_count;        // 段首（含）
+    const uint32_t last =
+        ((rank + 1) * kSlotCount + group_count - 1) / group_count;  // 段尾（不含）
+    std::vector<uint16_t> slots;
+    slots.reserve(last - first);
+    for (uint32_t s = first; s < last; ++s) {
+        slots.push_back(static_cast<uint16_t>(s));
+    }
+    return slots;
+}
+
 }  // namespace cvm
 }  // namespace mooncake

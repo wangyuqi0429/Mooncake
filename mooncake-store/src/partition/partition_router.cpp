@@ -28,6 +28,10 @@ void PartitionRouter::LoadSlotOwners(
     const size_t valid = next.size();
     {
         SharedMutexLocker locker(&mutex_);
+        // 显式逐 slot 加载属测试/旧路径：覆盖 rank 表，保证 ResolveSubmaster
+        // 走 slot_to_submaster_ 兜底分支。
+        group_count_ = 1;
+        rank_to_primary_.clear();
         slot_to_submaster_ = std::move(next);
     }
     LOG(INFO) << "PartitionRouter loaded " << valid << " slot->submaster"
@@ -36,9 +40,7 @@ void PartitionRouter::LoadSlotOwners(
 
 ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
     const std::string& cluster_namespace) {
-    // 本地建环（§15.4）：读 cluster_meta 得到 submaster_count，读成员列表，
-    // 用与服务端完全一致的确定性算法推导 slot → master_id，无需 etcd 持久化
-    // 每个 slot 的归属。
+    // cluster_meta：G（slot_group_count）+ 回退用 submaster_count。
     cvm::RingMeta meta;
     ViewVersionId meta_revision = 0;
     ErrorCode err = cvm::EtcdViewStore::LoadClusterMeta(
@@ -49,6 +51,46 @@ ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
         return err;
     }
 
+    // ---- RingSlot 路由（§16.17.3）：ring_slots → rank 表 ----
+    // G 防御 clamp：旧数据 slot_group_count 缺省 1（YLT_REFL 默认值）。
+    const uint32_t group_count =
+        std::max<uint32_t>(1, meta.slot_group_count);
+
+    std::vector<cvm::RingSlotAssign> assigns;
+    ViewVersionId assigns_revision = 0;
+    err = cvm::EtcdViewStore::LoadAllRingSlotAssigns(
+        cluster_namespace, assigns, assigns_revision);
+    if (err == ErrorCode::OK && !assigns.empty()) {
+        // rank → primary（不区分 state：kMigrating 期间 primary_id 仍指
+        // 源 A，读路由仍走源，§16.16 阶段 1）。缺失/空 primary 的 rank
+        // 无路由（ResolveSubmaster → nullopt → 客户端退避）。
+        std::vector<std::string> rank_to_primary(group_count);
+        size_t filled = 0;
+        for (auto& a : assigns) {
+            if (a.rank < group_count && !a.primary_id.empty()) {
+                rank_to_primary[a.rank] = std::move(a.primary_id);
+                ++filled;
+            }
+        }
+
+        {
+            SharedMutexLocker locker(&mutex_);
+            group_count_ = group_count;
+            rank_to_primary_ = std::move(rank_to_primary);
+            slot_to_submaster_.clear();
+        }
+        LOG(INFO) << "PartitionRouter loaded ring_slots route: groups="
+                  << group_count << ", filled_ranks=" << filled
+                  << " (from " << assigns.size() << " ring_slots records)";
+        return ErrorCode::OK;
+    }
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "PartitionRouter load ring_slots failed: err=" << err
+                     << ", falling back to local ring derivation";
+    }
+
+    // ---- 回退：本地建环（§16.17.6 新旧混跑，ring_slots 空的旧服务端）----
+    // 读成员列表，用与服务端完全一致的确定性算法推导 slot → master_id。
     std::vector<cvm::MasterRegistration> members;
     ViewVersionId members_revision = 0;
     err = cvm::EtcdViewStore::LoadAllMasters(cluster_namespace, members,
@@ -85,17 +127,32 @@ ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
     const size_t valid = next.size();
     {
         SharedMutexLocker locker(&mutex_);
+        group_count_ = 1;
+        rank_to_primary_.clear();
         slot_to_submaster_ = std::move(next);
     }
     LOG(INFO) << "PartitionRouter derived " << valid
               << " slot->submaster entries locally (primaries=" << ids.size()
-              << ", submaster_count=" << submaster_count << ")";
+              << ", submaster_count=" << submaster_count
+              << ", ring_slots empty, legacy fallback)";
     return ErrorCode::OK;
 }
 
 std::optional<std::string> PartitionRouter::ResolveSubmaster(
     uint16_t slot) const {
     SharedMutexLocker locker(&mutex_, shared_lock);
+    // ring_slots rank 表优先（§16.17.2）：SlotToRank 纯函数定位，O(1)。
+    // rank 越界 / 表项空 → nullopt（客户端 SLOT_NOT_OWNED 退避）。
+    if (!rank_to_primary_.empty()) {
+        const uint32_t rank = cvm::SlotToRank(slot, group_count_);
+        if (rank >= rank_to_primary_.size() ||
+            rank_to_primary_[rank].empty()) {
+            LOG(WARNING) << "PartitionRouter no submaster for slot " << slot
+                         << " (rank " << rank << " unrouted)";
+            return std::nullopt;
+        }
+        return rank_to_primary_[rank];
+    }
     auto it = slot_to_submaster_.find(slot);
     if (it == slot_to_submaster_.end()) {
         LOG(WARNING) << "PartitionRouter no submaster for slot " << slot;
@@ -113,7 +170,9 @@ void PartitionRouter::Clear() {
     size_t old_size = 0;
     {
         SharedMutexLocker locker(&mutex_);
-        old_size = slot_to_submaster_.size();
+        old_size = rank_to_primary_.size() + slot_to_submaster_.size();
+        group_count_ = 1;
+        rank_to_primary_.clear();
         slot_to_submaster_.clear();
     }
     LOG(INFO) << "PartitionRouter cleared " << old_size << " entries";
@@ -121,6 +180,17 @@ void PartitionRouter::Clear() {
 
 size_t PartitionRouter::Size() const {
     SharedMutexLocker locker(&mutex_, shared_lock);
+    // rank 表模式下度量「有路由的 rank 数」（非 16384 条 slot 表的条数，
+    // §16.20 单主判定 Size()==0 语义不变：全 rank 空表才为 0）。
+    if (!rank_to_primary_.empty()) {
+        size_t routed = 0;
+        for (const auto& p : rank_to_primary_) {
+            if (!p.empty()) {
+                ++routed;
+            }
+        }
+        return routed;
+    }
     return slot_to_submaster_.size();
 }
 

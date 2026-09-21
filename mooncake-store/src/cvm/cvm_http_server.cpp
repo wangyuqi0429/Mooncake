@@ -1,8 +1,10 @@
 #include "cvm/cvm_http_server.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -18,6 +20,41 @@
 
 namespace mooncake {
 namespace cvm {
+
+namespace {
+
+// SlotState 数值 → 稳定字符串（视图 JSON 用，防前端耦合枚举值）。
+const char* SlotStateName(int32_t state) {
+    switch (static_cast<SlotState>(state)) {
+        case SlotState::kStable:
+            return "kStable";
+        case SlotState::kMigrating:
+            return "kMigrating";
+        default:
+            return "unknown";
+    }
+}
+
+// 纯数字解析 string_view → uint32（拒负号/溢出/空），HTTP 查询参数安全。
+bool ParseUintParam(const std::string_view& sv, uint32_t& out) {
+    if (sv.empty() || sv.size() > 10) {
+        return false;
+    }
+    uint64_t value = 0;
+    for (const char c : sv) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+    }
+    if (value > UINT32_MAX) {
+        return false;
+    }
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
+}  // namespace
 
 CvmHttpServer::CvmHttpServer(Config config)
     : config_(std::move(config)),
@@ -48,6 +85,61 @@ void CvmHttpServer::InitRoutes() {
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             (void)req;
             resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    // §16.14.6 观测：槽位组归属视图（G / 每 rank 归属 / 迁移意图）。
+    server_->set_http_handler<GET>(
+        "/ring_slots",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            (void)req;
+            std::string json = GetRingSlotsViewJson();
+            if (json.empty()) {
+                resp.set_status_and_content(
+                    status_type::internal_server_error,
+                    "ring_slots view unavailable (etcd read failed)");
+                return;
+            }
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, json);
+        });
+
+    // §16.16.7 管理员 reshard 入口：
+    //   POST /reshard?rank=<0..G-1>&target=<master_id>
+    // 源自动取当前 owner，后续由目标侧 driver 断点续传；幂等重发安全。
+    server_->set_http_handler<POST>(
+        "/reshard",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            uint32_t rank = 0;
+            const auto rank_sv = req.get_query_value("rank");
+            const auto target_sv = req.get_query_value("target");
+            std::string json;
+            ErrorCode err = ErrorCode::INVALID_PARAMS;
+            if (ParseUintParam(rank_sv, rank)) {
+                err = TriggerReshard(rank, std::string(target_sv), json);
+            } else {
+                json = R"({"status":"error","reason":"invalid or missing rank"})";
+            }
+            resp.add_header("Content-Type", "application/json");
+            switch (err) {
+                case ErrorCode::OK:
+                    resp.set_status_and_content(status_type::ok, json);
+                    break;
+                case ErrorCode::INVALID_PARAMS:
+                    resp.set_status_and_content(status_type::bad_request,
+                                                json);
+                    break;
+                case ErrorCode::ETCD_KEY_NOT_EXIST:
+                    resp.set_status_and_content(status_type::not_found, json);
+                    break;
+                case ErrorCode::ETCD_TRANSACTION_FAIL:
+                case ErrorCode::STALE_ROUTE:
+                    resp.set_status_and_content(status_type::conflict, json);
+                    break;
+                default:
+                    resp.set_status_and_content(
+                        status_type::internal_server_error, json);
+                    break;
+            }
         });
 }
 
@@ -168,5 +260,232 @@ std::string CvmHttpServer::GetSegmentViewJson() const {
     return Json::writeString(builder, root);
 }
 
-}  // namespace cvm
-}  // namespace mooncake
+std::string CvmHttpServer::GetRingSlotsViewJson() const {
+    // §16.14.6 观测视图：G + 存活成员 + 每 rank 归属（primary/standbys/
+    // state/epoch）+ 进行中的迁移意图。全部只读 etcd，可打向任意 master。
+    RingMeta meta;
+    ViewVersionId version = 0;
+    ErrorCode err = EtcdViewStore::LoadClusterMeta(
+        config_.cluster_namespace, meta, version);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "CvmHttpServer load cluster meta failed: " << err;
+        return "";
+    }
+
+    std::vector<RingSlotAssign> assigns;
+    if (EtcdViewStore::LoadAllRingSlotAssigns(config_.cluster_namespace,
+                                              assigns,
+                                              version) != ErrorCode::OK) {
+        LOG(WARNING) << "CvmHttpServer load ring slots failed";
+        return "";
+    }
+
+    std::vector<ReshardIntent> intents;
+    if (EtcdViewStore::LoadAllReshardIntents(config_.cluster_namespace,
+                                              intents,
+                                              version) != ErrorCode::OK) {
+        LOG(WARNING) << "CvmHttpServer load reshard intents failed";
+        return "";
+    }
+
+    std::vector<MasterRegistration> masters;
+    if (EtcdViewStore::LoadAllMasters(config_.cluster_namespace, masters,
+                                      version) != ErrorCode::OK) {
+        LOG(WARNING) << "CvmHttpServer load masters failed";
+        return "";
+    }
+
+    Json::Value root(Json::objectValue);
+    root["slot_group_count"] =
+        static_cast<Json::Value::UInt>(meta.slot_group_count);
+    root["submaster_count"] =
+        static_cast<Json::Value::UInt>(meta.submaster_count);
+    // 与 CvmController::HasCachedRingSlotAssigns 同语义：存在归属记录 =
+    // 模型启用；false = 旧集群灰度回退中（ranks 为空数组）。
+    root["model_active"] = !assigns.empty();
+
+    Json::Value masters_arr(Json::arrayValue);
+    for (const auto& m : masters) {
+        Json::Value entry(Json::objectValue);
+        entry["master_id"] = m.master_id;
+        entry["address"] = m.address;
+        entry["role"] = static_cast<Json::Value::Int>(m.role);
+        masters_arr.append(entry);
+    }
+    root["masters"] = masters_arr;
+
+    Json::Value ranks_arr(Json::arrayValue);
+    for (const auto& a : assigns) {
+        Json::Value entry(Json::objectValue);
+        entry["rank"] = static_cast<Json::Value::UInt>(a.rank);
+        entry["primary"] = a.primary_id;
+        Json::Value standbys(Json::arrayValue);
+        for (const auto& sid : a.standby_ids) {
+            standbys.append(sid);
+        }
+        entry["standbys"] = standbys;
+        entry["state"] = SlotStateName(a.state);
+        entry["migrating_to"] = a.migrating_to_id;
+        entry["epoch"] = static_cast<Json::Value::UInt64>(a.epoch);
+        ranks_arr.append(entry);
+    }
+    root["ranks"] = ranks_arr;
+
+    Json::Value intents_arr(Json::arrayValue);
+    for (const auto& i : intents) {
+        Json::Value entry(Json::objectValue);
+        entry["rank"] = static_cast<Json::Value::UInt>(i.rank);
+        entry["source_primary_id"] = i.source_primary_id;
+        entry["target_primary_id"] = i.target_primary_id;
+        intents_arr.append(entry);
+    }
+    root["reshard_intents"] = intents_arr;
+
+    Json::StreamWriterBuilder builder;
+    builder["indentation"] = "";
+    return Json::writeString(builder, root);
+}
+
+ErrorCode CvmHttpServer::TriggerReshard(uint32_t rank,
+                                       const std::string& target_master_id,
+                                       std::string& out_json) {
+    // §16.16.7 管理员 reshard 入口。只做「写 intent + CAS kMigrating」
+    // 两个动作（源不动、数据不动），后续阶段由目标侧 driver 断点续传——
+    // 管理员入口不感知迁移进度，天然幂等可重发。
+    out_json.clear();
+    if (target_master_id.empty()) {
+        out_json = R"({"status":"error","reason":"missing target"})";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    RingMeta meta;
+    ViewVersionId version = 0;
+    ErrorCode err = EtcdViewStore::LoadClusterMeta(
+        config_.cluster_namespace, meta, version);
+    if (err != ErrorCode::OK) {
+        out_json = R"({"status":"error","reason":"etcd unavailable"})";
+        return err;
+    }
+    if (meta.slot_group_count == 0 || rank >= meta.slot_group_count) {
+        out_json = R"({"status":"error","reason":"rank out of range"})";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    RingSlotAssign assign;
+    err = EtcdViewStore::LoadRingSlotAssign(config_.cluster_namespace, rank,
+                                            assign, version);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        out_json = R"({"status":"error","reason":"rank not assigned"})";
+        return ErrorCode::ETCD_KEY_NOT_EXIST;
+    }
+    if (err != ErrorCode::OK) {
+        out_json = R"({"status":"error","reason":"etcd unavailable"})";
+        return err;
+    }
+
+    if (assign.primary_id == target_master_id) {
+        // 目标已是 owner：幂等完成态（残留 intent 由目标 driver 自愈清理）。
+        out_json =
+            R"({"status":"ok","reason":"target already owns this rank"})";
+        return ErrorCode::OK;
+    }
+    if (static_cast<SlotState>(assign.state) == SlotState::kMigrating) {
+        if (assign.migrating_to_id == target_master_id) {
+            // 同一迁移已在进行：幂等成功。
+            out_json = R"({"status":"ok","reason":"migration in progress"})";
+            return ErrorCode::OK;
+        }
+        out_json = R"({"status":"error","reason":"another migration in)"
+                   R"( progress on this rank"})";
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    }
+
+    // 成员校验：target 与源都必须存活（源死亡属故障恢复路径，不归管理员
+    // reshard 处理，避免与晋升/接管竞争）。
+    std::vector<MasterRegistration> masters;
+    if (EtcdViewStore::LoadAllMasters(config_.cluster_namespace, masters,
+                                      version) != ErrorCode::OK) {
+        out_json = R"({"status":"error","reason":"etcd unavailable"})";
+        return ErrorCode::RPC_FAIL;
+    }
+    const auto is_alive = [&masters](const std::string& id) {
+        return std::any_of(masters.begin(), masters.end(),
+                           [&](const MasterRegistration& m) {
+                               return m.master_id == id;
+                           });
+    };
+    if (!is_alive(target_master_id)) {
+        out_json = R"({"status":"error","reason":"target not a live)"
+                   R"( master"})";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (!is_alive(assign.primary_id)) {
+        out_json = R"({"status":"error","reason":"source primary not)"
+                   R"( alive (handled by recovery paths)"})";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    // 写意图（源取当前 owner）。已存在：同 (rank, source, target) 视为重发
+    // （断点续传），否则拒绝。
+    ReshardIntent intent;
+    intent.rank = rank;
+    intent.source_primary_id = assign.primary_id;
+    intent.target_primary_id = target_master_id;
+    err = EtcdViewStore::CreateReshardIntent(config_.cluster_namespace, intent);
+    if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+        bool confirmed = false;
+        std::vector<ReshardIntent> existing;
+        if (EtcdViewStore::LoadAllReshardIntents(config_.cluster_namespace,
+                                                 existing,
+                                                 version) == ErrorCode::OK) {
+            for (const auto& i : existing) {
+                if (i.rank != rank) {
+                    continue;
+                }
+                if (i.source_primary_id == intent.source_primary_id &&
+                    i.target_primary_id == target_master_id) {
+                    confirmed = true;  // 重发，继续
+                }
+                break;
+            }
+        }
+        if (!confirmed) {
+            // 冲突意图被并发删除（极窄竞态）→ 重写一次；仍失败即真冲突。
+            err = EtcdViewStore::CreateReshardIntent(config_.cluster_namespace,
+                                                     intent);
+            if (err != ErrorCode::OK) {
+                out_json = R"({"status":"error","reason":"conflicting)"
+                           R"( intent exists"})";
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
+            }
+        }
+    } else if (err != ErrorCode::OK) {
+        out_json = R"({"status":"error","reason":"etcd unavailable"})";
+        return err;
+    }
+
+    // CAS kMigrating（源 primary 不动，migrating_to=target）：源 watch 即时
+    // 冻结该段写，读继续由源服务；目标 ComputeDesiredRole 认 migrating_to
+    // 后进入 serve 阶段拉起 driver 续传。
+    RingSlotAssign out_assign;
+    err = EtcdViewStore::AdoptRankViaCAS(
+        config_.cluster_namespace, rank, assign.epoch, assign.primary_id,
+        SlotState::kMigrating, target_master_id, out_assign, nullptr,
+        "admin reshard", assign.primary_id, /*success_as_warning=*/false,
+        /*clear_intent=*/false);
+    if (err != ErrorCode::OK) {
+        // 回滚本机刚写的意图（幂等删除）；并发改判（STALE）返回冲突。
+        (void)EtcdViewStore::DeleteReshardIntent(config_.cluster_namespace,
+                                                  rank);
+        out_json = err == ErrorCode::STALE_ROUTE
+                       ? R"({"status":"error","reason":"concurrent)"
+                         R"( modification, retry"})"
+                       : R"({"status":"error","reason":"etcd unavailable"})";
+        return err == ErrorCode::STALE_ROUTE ? ErrorCode::STALE_ROUTE : err;
+    }
+
+    out_json = R"({"status":"accepted","rank":)" + std::to_string(rank) +
+               R"(,"source":")" + assign.primary_id + R"(","target":")" +
+               target_master_id + R"("})";
+    return ErrorCode::OK;
+}

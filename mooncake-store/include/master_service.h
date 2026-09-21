@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -153,6 +154,10 @@ class MasterService {
     // standby; the supervisor injects the lease id it granted and drives the
     // heartbeat around serve start/stop.
     void SetCvmLeaseId(EtcdLeaseId lease_id);
+    // supervisor 注入其 CvmController（同一进程内），供 slot 归属解析读
+    // ring_slots 缓存（§16.15.5 缓存优先、miss 回退环推导）。与 lease
+    // 注入同生命周期（serve phase 前设置，长期有效，不撤销）。
+    void SetCvmController(cvm::CvmController* controller);
     ErrorCode StartSlotOwnerHeartbeat();
     void StopSlotOwnerHeartbeat();
 
@@ -265,6 +270,36 @@ class MasterService {
     // 缓存）。幂等；返回 true 表示曾有 staged 项。
     tl::expected<bool, ErrorCode> InterMasterAckSlotImported(
         uint16_t slot, const std::string& importer_master_id);
+
+    // ----- 段级批量迁移（§16.19.2，P4 reshard）-----
+
+    // 源侧批量导出：[first_slot, last_slot] 闭区间快照（staged 优先，缺失时
+    // 即时构建——kMigrating 冻结写后快照稳定）。与单 slot 版不同，不做
+    // 「必须已失去归属」门控：reshard 期间源仍持有归属（barrier 冻结写），
+    // 快照由冻结保证稳定；切 owner 后源仍持有未 ack 的本地数据，亦可导出
+    //（幂等，ack 前不删）。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
+    InterMasterExportSlotBatch(uint16_t first_slot, uint16_t last_slot,
+                               const std::string& requester_master_id);
+
+    // 段级 ack：目标安装完成后通知源删除区间内全部本地元数据
+    //（DropSlotMetadataRange）。源未观察到归属已切走时返回
+    // SLOT_MIGRATING（目标稍后重试，重发无损）。
+    tl::expected<bool, ErrorCode> InterMasterAckSlotRangeImported(
+        uint16_t first_slot, uint16_t last_slot,
+        const std::string& importer_master_id);
+
+    // 写路径校验（§16.19.3）：读路径继续走 CheckSlotServiceability（源
+    // kMigrating 期间仍服务读）；写路径统一走本方法——ready/expected 判定
+    // 之上叠加「本段正被迁出（kMigrating 且 migrating_to 非本机）→ 冻结写」
+    // 的 barrier 语义。客户端对 SLOT_MIGRATING 按总时长上界退避 + 重拉路由。
+    ErrorCode CheckSlotWritable(uint16_t slot) const;
+
+    // 幽灵写瞬态节流告警（§16.14.6 验证辅助，30s 一条防刷屏）：ring_slots
+    // 模型已启用（HasSeenRingSlotsModel）但本 slot 的归属缓存未命中 →
+    // 数据面判定正在走旧环回退，可能与 etcd 真实归属不一致（幽灵写）。
+    // where = 调用点定位（如 "CheckSlotWritable"/"ResolveSlotOwner"）。
+    void MaybeWarnGhostFallback(const char* where, uint16_t slot) const;
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
@@ -2316,6 +2351,14 @@ class MasterService {
     // registration lifecycle (auto-removed on lease expiry). 0 until the
     // supervisor injects it via SetCvmLeaseId().
     EtcdLeaseId cvm_lease_id_{0};
+    // supervisor 注入的同进程 CvmController（弱引用，supervisor 拥有）；
+    // ring_slots 缓存读取（§16.15.5）。仅 serve phase 前设置一次。
+    cvm::CvmController* cvm_controller_{nullptr};
+    // 幽灵写告警节流（§16.14.6 验证辅助）：「模型已启用（HasSeenRing
+    // SlotsModel）但当前缓存空 → 写判定走了旧环回退」是危险瞬态，
+    // 数据面 QPS 高，30s 一条防刷屏。mutable：const 判定路径（CheckSlot
+    // Writable / ResolveSlotOwnerMasterId）打点。0 = 未打过。
+    mutable std::atomic<int64_t> last_ghost_fallback_warn_ms_{0};
     // 两级 slot 状态（确定性哈希方案 §15.6）：
     //   expected_owned_ = ring 推导「应拥有」的 slot（by ResolveOwnedSlotsForCvm）
     //   ready_owned_    = 元数据已就绪（import/replay 完成）可服务
@@ -2369,15 +2412,56 @@ class MasterService {
     ErrorCode ImportSlotMetadata(uint16_t slot);
 
     // 收集 `slot` 下所有对象的对象元数据（只读，供 stage / RPC 拉取复用）。
+    // require_not_owned（默认 true，§15 单 slot 交接语义）：要求本机已失去
+    // slot 归属才允许导出；P4 reshard 批量导出传 false——源仍持有归属
+    //（kMigrating 冻结写保证快照稳定；切 owner 后源仍持有未 ack 数据，
+    // 重拉幂等）。
     tl::expected<SlotMetadataExport, ErrorCode> BuildSlotMetadataExport(
-        uint16_t slot) const;
+        uint16_t slot, bool require_not_owned = true) const;
     // ack 后删除本地 `slot` 的元数据（与 Export 侧擦除对称的释放）。
     ErrorCode DropSlotMetadataLocal(uint16_t slot);
+    // 段级批量版 DropSlotMetadataLocal（§16.16.5，P4 reshard ack 后的源侧
+    // 清理）：[first_slot, last_slot] 闭区间单趟扫描清理，避免逐 slot 反复
+    // 全量扫描 metadata 分片（rank 段可达数千 slot）。
+    ErrorCode DropSlotMetadataRange(uint16_t first_slot, uint16_t last_slot);
     // RPC 直传的 staged 导出缓存：旧 owner 在 on_release 时把导出结果放这里，
     // 等新 owner InterMasterExportSlot 拉取；收到 AckSlotImported 后删除缓存
     // 并清理本地元数据。
     std::unordered_map<uint16_t, SlotMetadataExport> pending_slot_exports_;
     mutable std::mutex pending_slot_exports_mutex_;
+
+    // ----- P4 reshard：段级批量迁移 + 目标侧 driver（§16.16 / §16.19）-----
+
+    // reshard driver 线程：扫描 reshard_intent 中 target==本机的意图，
+    // 驱动「CAS kMigrating → CAS kStable 切 owner → 段级拉快照+安装 →
+    // 段级 ack → 删 intent」五阶段（断点续传：意图持久化在 etcd，重启后
+    // 重扫；任意阶段崩溃后按 ring_slots 当前状态重入，全链路幂等）。
+    // 目标驱动（coordinator = target）而非设计稿的源驱动：原生认领
+    //（§16.15.3 步 1，认领者是 standby、无 inter-master RPC 载体）与
+    // 管理员迁移共用同一条目标侧状态机；源只承担「冻结写 + 响应批量
+    // Export/Ack RPC」的被动角色。
+    void ReshardDriverLoop();
+    // 执行单个意图。返回 true = 已完成（含 ack）或意图失效，调用方删 intent。
+    bool DriveReshardIntent(const cvm::ReshardIntent& intent);
+    // 从源拉取 rank 段快照并安装（install 主体复用 ImportSlotMetadata 抽取
+    // 的 InstallSlotMetadataExport）。调用前置：owner CAS 已完成（源 ack 前
+    // 保留全部数据，重拉幂等）；快照稳定由 kMigrating 冻结写 + 切 owner 后
+    // 源停服共同保证。安装前重读 LoadRingSlotAssign 校验 owner 仍是本机。
+    ErrorCode ImportSlotRangeFrom(const std::string& source_master_id,
+                                   uint32_t rank, uint16_t first_slot,
+                                   uint16_t last_slot);
+    // 安装单个 SlotMetadataExport（vsegment 状态 + 对象元数据 + 账务），
+    // 从 ImportSlotMetadata 抽取的复用主体。effective_route 为调用方解析好的
+    // 目标路由（§15 路径传成员环推导路由；rank 路径传 LoadRingSlotAssign 的
+    // 显式路由，owner 必须是本机）。安装后调用 RefreshVSegmentOwnership 激活。
+    ErrorCode InstallSlotMetadataExport(
+        const SlotMetadataExport& export_payload,
+        const partition::PartitionRoute& effective_route);
+    std::thread reshard_driver_thread_;
+    std::atomic<bool> reshard_driver_running_{false};
+    // 防同 rank 并发驱动：进行中的 (rank -> 目标 epoch)。
+    std::mutex reshard_inflight_mutex_;
+    std::map<uint32_t, uint64_t> reshard_inflight_;
     // A1：读路径 slot 所有权校验。UpdateExpectedSlots 由心跳 resolver 与晋升
     // 路径调用，写 expected_owned_ 位图（ring 推导的应拥有集合）；MarkSlotsReady
     // 把已完成元数据导入的 slot 置入 ready_owned_。OwnsSlot 读 ready_owned_。

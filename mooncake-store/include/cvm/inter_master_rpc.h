@@ -162,6 +162,22 @@ class InterMasterRpcClient {
         const std::string& master_id, uint16_t slot,
         const std::string& importer_master_id);
 
+    // ----- 段级批量迁移（§16.19.2，P4 reshard）-----
+
+    // 一次拉取 [first_slot, last_slot] 闭区间内所有 slot 的元数据快照。
+    // 服务端优先返回 staged 缓存，缺失时即时构建（kMigrating 冻结写后
+    // 快照稳定）；重复拉取幂等——ack 前源不清数据。
+    tl::expected<std::vector<SlotMetadataExport>, ErrorCode> ExportSlotBatch(
+        const std::string& master_id, uint16_t first_slot, uint16_t last_slot,
+        const std::string& requester_master_id);
+
+    // 段级 ack：目标安装完成后通知源删除 [first_slot, last_slot] 内全部
+    // 本地元数据（DropSlotMetadataRange）。失败由目标侧重试（源不清数据，
+    // 重发无损）。
+    tl::expected<bool, ErrorCode> AckSlotRangeImported(
+        const std::string& master_id, uint16_t first_slot, uint16_t last_slot,
+        const std::string& importer_master_id);
+
    private:
     // Generic sync RPC invocation against the pool of the target address.
     // Defined in the .cpp (needs the complete WrappedMasterService type).

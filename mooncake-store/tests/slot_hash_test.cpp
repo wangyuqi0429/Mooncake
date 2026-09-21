@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <set>
 #include <string>
 #include <vector>
@@ -139,6 +140,141 @@ TEST(SlotHashTest, ResolveOwnedSlotsOnRingStableOnRemoval) {
     EXPECT_EQ(a2_set.size() + b2_set.size(),
               static_cast<size_t>(cvm::kSlotCount));
     EXPECT_GT(a2_set.size() + b2_set.size(), a_set.size() + b_set.size());
+}
+
+// ---------------------------------------------------------------------------
+// RingSlot 槽位组（§16.5 P1）：SlotToRank / RankOwnedSlots 纯函数
+// ---------------------------------------------------------------------------
+
+TEST(SlotHashTest, SlotToRankSingleGroup) {
+    // G=1 退化：全部 slot 归 rank 0（回滚兼容路径，§16.17.6）。
+    for (uint16_t s : {0, 1, 8191, 8192, 16383}) {
+        EXPECT_EQ(cvm::SlotToRank(s, 1u), 0u);
+    }
+}
+
+TEST(SlotHashTest, SlotToRankTwoGroups) {
+    // G=2 唯一精确对半划分。
+    EXPECT_EQ(cvm::SlotToRank(0, 2u), 0u);
+    EXPECT_EQ(cvm::SlotToRank(8191, 2u), 0u);
+    EXPECT_EQ(cvm::SlotToRank(8192, 2u), 1u);
+    EXPECT_EQ(cvm::SlotToRank(16383, 2u), 1u);
+}
+
+TEST(SlotHashTest, SlotToRankBoundaryEndpoints) {
+    // 不变量①：slot=0 → rank 0；slot=16383 → rank G-1（对所有合法 G）。
+    for (uint32_t g : {1u, 2u, 3u, 5u, 7u, 13u, 16383u, 16384u}) {
+        EXPECT_EQ(cvm::SlotToRank(0, g), 0u) << "G=" << g;
+        EXPECT_EQ(cvm::SlotToRank(cvm::kSlotCount - 1, g), g - 1) << "G=" << g;
+    }
+}
+
+TEST(SlotHashTest, SlotToRankMonotonicNonDecreasing) {
+    // 不变量②：slot 递增 → rank 不减（连续段性质）。
+    for (uint32_t g : {3u, 5u, 100u}) {
+        uint32_t prev = 0;
+        for (uint16_t s = 0; s < cvm::kSlotCount; ++s) {
+            const uint32_t rank = cvm::SlotToRank(s, g);
+            EXPECT_GE(rank, prev) << "G=" << g << " slot=" << s;
+            prev = rank;
+        }
+        EXPECT_EQ(prev, g - 1);
+    }
+}
+
+TEST(SlotHashTest, RankOwnedSlotsIntervalMatchesFormula) {
+    // 不变量③（上取整对偶）：段 == [ceil(r*16384/G), ceil((r+1)*16384/G))。
+    const auto ceil_div = [](uint32_t a, uint32_t b) {
+        return (a + b - 1) / b;
+    };
+    for (uint32_t g : {1u, 2u, 3u, 5u, 16383u}) {
+        for (uint32_t r = 0; r < g; ++r) {
+            const auto slots = cvm::RankOwnedSlots(r, g);
+            ASSERT_FALSE(slots.empty()) << "G=" << g << " rank=" << r;
+            EXPECT_EQ(slots.front(), ceil_div(r * cvm::kSlotCount, g));
+            EXPECT_EQ(slots.back(),
+                      ceil_div((r + 1) * cvm::kSlotCount, g) - 1);
+            EXPECT_EQ(slots.size(),
+                      static_cast<size_t>(ceil_div((r + 1) * cvm::kSlotCount, g)) -
+                          static_cast<size_t>(ceil_div(r * cvm::kSlotCount, g)));
+        }
+    }
+}
+
+TEST(SlotHashTest, RankOwnedSlotsPartitionAllSlots) {
+    // 不变量④：所有 rank 的段并集 == [0,16384) 且互不相交（双射）。
+    // G 不整除 16384 时段长不均（如 G=3 → 5462/5461/5461）。
+    std::vector<uint16_t> expected;
+    for (uint16_t s = 0; s < cvm::kSlotCount; ++s) {
+        expected.push_back(s);
+    }
+    for (uint32_t g : {1u, 2u, 3u, 5u, 7u, 13u}) {
+        std::vector<uint16_t> actual;
+        size_t total = 0;
+        for (uint32_t r = 0; r < g; ++r) {
+            const auto slots = cvm::RankOwnedSlots(r, g);
+            total += slots.size();
+            actual.insert(actual.end(), slots.begin(), slots.end());
+        }
+        EXPECT_EQ(total, static_cast<size_t>(cvm::kSlotCount)) << "G=" << g;
+        EXPECT_EQ(actual, expected) << "G=" << g;
+    }
+}
+
+TEST(SlotHashTest, SlotToRankInverseOfRankOwnedSlots) {
+    // 不变量⑤（双射反向全量）：段内所有 slot 的 rank 均为 r。正向性质
+    // 「s ∈ seg(SlotToRank(s))」由本断言 + 不变量④（每 slot 恰属一段）
+    // 联合推出，无需单独 spot-check。
+    for (uint32_t g : {2u, 3u, 5u, 7u}) {
+        for (uint32_t r = 0; r < g; ++r) {
+            for (uint16_t s : cvm::RankOwnedSlots(r, g)) {
+                EXPECT_EQ(cvm::SlotToRank(s, g), r)
+                    << "G=" << g << " slot=" << s << " rank=" << r;
+            }
+        }
+    }
+}
+
+TEST(SlotHashTest, RankOwnedSlotsDefensiveInputs) {
+    // 防御：G=0、rank 越界 → 空。G=16384 时每 rank 恰 1 slot。
+    EXPECT_TRUE(cvm::RankOwnedSlots(0, 0u).empty());
+    EXPECT_TRUE(cvm::RankOwnedSlots(1, 1u).empty());
+    const auto single = cvm::RankOwnedSlots(16383u, 16384u);
+    EXPECT_EQ(single.size(), static_cast<size_t>(1));
+    EXPECT_EQ(single.front(), 16383u);
+}
+
+TEST(SlotHashTest, SlotToRankArithmeticNoOverflow) {
+    // 溢出边界：16383 * 16384 == 2^28，uint32_t 中间乘积不得截断。
+    EXPECT_EQ(cvm::SlotToRank(16383, 16384u), 16383u);
+    EXPECT_EQ(cvm::SlotToRank(16382, 16384u), 16382u);
+    // G=16385（超域）：纯函数不校验，仅保证不 crash、结果有界可解释。
+    const uint32_t r = cvm::SlotToRank(16383, 16385u);
+    EXPECT_LT(r, 16385u);
+}
+
+TEST(SlotHashTest, SlotToRankNoCrackAtSegmentBoundary) {
+    // 回归：G 不整除 16384 时的段界裂缝（floor/floor 不对偶）。
+    // 旧实现（段首 floor）会让 slot=5461 落在 rank1 段内但
+    // SlotToRank 返回 0——归属裂缝即环错位的另一种形式，必须为零。
+    struct Case {
+        uint32_t g;
+        uint16_t boundary_slot;  // 恰在 rank r 段首的 slot
+    };
+    const std::vector<Case> cases = {
+        {3u, 5462}, {3u, 10923}, {5u, 3277}, {5u, 6554}, {7u, 2341}};
+    for (const auto& c : cases) {
+        const uint32_t rank = cvm::SlotToRank(c.boundary_slot, c.g);
+        const auto slots = cvm::RankOwnedSlots(rank, c.g);
+        EXPECT_NE(std::find(slots.begin(), slots.end(), c.boundary_slot),
+                  slots.end())
+            << "G=" << c.g << " slot=" << c.boundary_slot;
+        // 相邻 slot（段首-1）必须属于前一 rank。
+        EXPECT_EQ(cvm::SlotToRank(static_cast<uint16_t>(c.boundary_slot - 1),
+                                  c.g),
+                  rank - 1)
+            << "G=" << c.g << " slot=" << c.boundary_slot - 1;
+    }
 }
 
 }  // namespace

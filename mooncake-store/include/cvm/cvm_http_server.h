@@ -39,6 +39,21 @@ class CvmHttpServer {
     // JSON，可能为空数组）。
     std::string GetSegmentViewJson() const;
 
+    // 聚合 cluster_meta（G）+ ring_slots/{rank} + reshard_intent/{rank} +
+    // 存活 masters，返回槽位组归属视图 JSON（排查「谁持有哪个 rank /
+    // 迁移卡在哪个阶段」的一站式观测点）。model_active=false 表示
+    // ring_slots 模型未启用（旧集群灰度回退中）。读取失败返回空串。
+    std::string GetRingSlotsViewJson() const;
+
+    // 管理员发起 reshard（§16.16.7）：target 必须是存活成员且非当前
+    // owner；写 reshard_intent（源自动取当前 owner）+ CAS kMigrating
+    // 冻结源写。后续阶段（切 owner / 拉快照 / ack）由目标侧 driver 断点
+    // 续传。幂等：同一 (rank, target) 重复调用返回 OK。成功时 out_json
+    // 为响应体；校验失败 INVALID_PARAMS、rank 未分配 ETCD_KEY_NOT_EXIST、
+    // 并发冲突 ETCD_TRANSACTION_FAIL。
+    ErrorCode TriggerReshard(uint32_t rank, const std::string& target_master_id,
+                             std::string& out_json);
+
    private:
     void InitRoutes();
 

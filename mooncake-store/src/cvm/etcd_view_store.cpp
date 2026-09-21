@@ -23,42 +23,17 @@ namespace cvm {
 namespace {
 
 // Parses the JSON array returned by EtcdHelper::GetRangeAsJson, which has the
-// form [{"key":"...","value":"..."}, ...].
-ErrorCode ParseRangeJson(const std::string& json,
-                         std::vector<std::pair<std::string, std::string>>& kvs) {
-    Json::Value root;
-    Json::CharReaderBuilder reader;
-    std::string errors;
-    std::istringstream stream(json);
-    if (!Json::parseFromStream(reader, stream, &root, &errors) ||
-        !root.isArray()) {
-        LOG(ERROR) << "Failed to parse etcd range JSON: " << errors;
-        return ErrorCode::INTERNAL_ERROR;
-    }
-
-    kvs.clear();
-    kvs.reserve(root.size());
-    for (const auto& item : root) {
-        if (!item.isObject() || !item["key"].isString() ||
-            !item["value"].isString()) {
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        kvs.emplace_back(item["key"].asString(), item["value"].asString());
-    }
-    return ErrorCode::OK;
-}
-
-// key/value 之外额外解析 etcd key create_revision，用于「先到先得」的 primary
-// 排序（MasterRegistrationRankLess）。create_revision 缺失时记为 0，由其
-// 排序比较器回退 master_id 兜底。
+// form [{"key":"...","value":"..."}, ...]. Also parses the optional etcd key
+// create_revision field (defaults to 0), used by「先到先得」ordering
+// (MasterRegistrationRankLess).
 struct RangeKvWithRevision {
     std::string key;
     std::string value;
     int64_t create_revision{0};
 };
 
-ErrorCode ParseRangeJsonWithRevision(
-    const std::string& json, std::vector<RangeKvWithRevision>& kvs) {
+ErrorCode ParseRangeJson(const std::string& json,
+                         std::vector<RangeKvWithRevision>& kvs) {
     Json::Value root;
     Json::CharReaderBuilder reader;
     std::string errors;
@@ -263,7 +238,7 @@ ErrorCode EtcdViewStore::LoadAllSegmentDescriptors(
         return err;
     }
 
-    std::vector<std::pair<std::string, std::string>> kvs;
+    std::vector<RangeKvWithRevision> kvs;
     err = ParseRangeJson(json, kvs);
     if (err != ErrorCode::OK) {
         return err;
@@ -272,7 +247,7 @@ ErrorCode EtcdViewStore::LoadAllSegmentDescriptors(
     out.reserve(kvs.size());
     for (const auto& kv : kvs) {
         SegmentDescriptor desc;
-        err = DeserializeSegmentDescriptor(kv.second, desc);
+        err = DeserializeSegmentDescriptor(kv.value, desc);
         if (err != ErrorCode::OK) {
             return err;
         }
@@ -344,7 +319,7 @@ ErrorCode EtcdViewStore::LoadAllMountEntries(
         return err;
     }
 
-    std::vector<std::pair<std::string, std::string>> kvs;
+    std::vector<RangeKvWithRevision> kvs;
     err = ParseRangeJson(json, kvs);
     if (err != ErrorCode::OK) {
         return err;
@@ -355,17 +330,17 @@ ErrorCode EtcdViewStore::LoadAllMountEntries(
     constexpr char kSegmentsMarker[] = "/segments/";
     out.reserve(kvs.size());
     for (const auto& kv : kvs) {
-        const std::size_t pos = kv.first.rfind(kSegmentsMarker);
+        const std::size_t pos = kv.key.rfind(kSegmentsMarker);
         if (pos == std::string::npos || pos <= prefix.size()) {
             continue;
         }
         MountEntry entry;
-        err = DeserializeMountEntry(kv.second, entry);
+        err = DeserializeMountEntry(kv.value, entry);
         if (err != ErrorCode::OK) {
             return err;
         }
         const std::string master_id =
-            kv.first.substr(prefix.size(), pos - prefix.size());
+            kv.key.substr(prefix.size(), pos - prefix.size());
         out.emplace_back(master_id, std::move(entry));
     }
     return ErrorCode::OK;
@@ -434,7 +409,7 @@ ErrorCode EtcdViewStore::LoadAllMasters(
     }
 
     std::vector<RangeKvWithRevision> kvs;
-    err = ParseRangeJsonWithRevision(json, kvs);
+    err = ParseRangeJson(json, kvs);
     if (err != ErrorCode::OK) {
         return err;
     }
@@ -475,6 +450,224 @@ ErrorCode EtcdViewStore::LoadClusterMeta(const std::string& cluster_namespace,
     return DeserializeRingMeta(value, out);
 }
 
+// ---- RingSlot 槽位组归属（ring_slots/{rank}）----
+
+ErrorCode EtcdViewStore::SerializeRingSlotAssign(const RingSlotAssign& assign,
+                                                  std::string& out) {
+    try {
+        struct_json::to_json(assign, out);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "SerializeRingSlotAssign failed: " << e.what();
+        return ErrorCode::SERIALIZE_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdViewStore::DeserializeRingSlotAssign(const std::string& in,
+                                                   RingSlotAssign& out) {
+    try {
+        struct_json::from_json(out, in);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeRingSlotAssign failed: " << e.what();
+        return ErrorCode::DESERIALIZE_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdViewStore::CreateRingSlotAssign(
+    const std::string& cluster_namespace, const RingSlotAssign& assign) {
+    if (assign.primary_id.empty() || assign.epoch == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::string value;
+    ErrorCode err = SerializeRingSlotAssign(assign, value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    const std::string key = RingSlotAssignKey(cluster_namespace, assign.rank);
+    return EtcdHelper::Create(key.data(), key.size(), value.data(),
+                              value.size());
+}
+
+ErrorCode EtcdViewStore::LoadRingSlotAssign(
+    const std::string& cluster_namespace, uint32_t rank, RingSlotAssign& out,
+    ViewVersionId& version) {
+    const std::string key = RingSlotAssignKey(cluster_namespace, rank);
+    std::string value;
+    ErrorCode err = EtcdHelper::Get(key.data(), key.size(), value, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    err = DeserializeRingSlotAssign(value, out);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (out.rank != rank) {
+        LOG(ERROR) << "ring_slots value rank=" << out.rank
+                   << " mismatches key rank=" << rank << ", etcd corrupted";
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdViewStore::LoadAllRingSlotAssigns(
+    const std::string& cluster_namespace,
+    std::vector<RingSlotAssign>& out, ViewVersionId& version) {
+    out.clear();
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    const std::string end = PrefixEnd(prefix);
+    std::string json;
+    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
+                                               end.data(), end.size(),
+                                               /*limit=*/0, json, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    std::vector<RangeKvWithRevision> kvs;
+    err = ParseRangeJson(json, kvs);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    out.reserve(kvs.size());
+    for (const auto& kv : kvs) {
+        RingSlotAssign assign;
+        err = DeserializeRingSlotAssign(kv.value, assign);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        uint32_t key_rank = 0;
+        if (!ParseRankFromRingSlotKey(kv.key, prefix, key_rank) ||
+            key_rank != assign.rank) {
+            LOG(ERROR) << "ring_slots key '" << kv.key << "' rank mismatch, "
+                       << "etcd corrupted";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        out.push_back(std::move(assign));
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdViewStore::CASSwitchRingSlotOwner(
+    const std::string& cluster_namespace, uint32_t rank,
+    uint64_t expected_epoch, const std::string& new_primary_id,
+    SlotState new_state, const std::string& migrating_to_id,
+    RingSlotAssign& out, const std::vector<std::string>* new_standby_ids) {
+    if (new_primary_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    RingSlotAssign current;
+    ViewVersionId version = 0;
+    ErrorCode err =
+        LoadRingSlotAssign(cluster_namespace, rank, current, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (current.epoch != expected_epoch) {
+        return ErrorCode::STALE_ROUTE;
+    }
+
+    std::string old_value;
+    err = SerializeRingSlotAssign(current, old_value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    out = current;
+    out.primary_id = new_primary_id;
+    out.state = static_cast<int32_t>(new_state);
+    out.migrating_to_id = migrating_to_id;
+    out.epoch = expected_epoch + 1;
+    if (new_standby_ids != nullptr) {
+        out.standby_ids = *new_standby_ids;
+    }
+
+    std::string new_value;
+    err = SerializeRingSlotAssign(out, new_value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    const std::string key = RingSlotAssignKey(cluster_namespace, rank);
+    err = EtcdHelper::TxnCompareAndPut(
+        {{key, EtcdHelper::TxnCompareKind::kValueEquals, old_value}},
+        {{key, new_value}});
+    return err == ErrorCode::ETCD_TRANSACTION_FAIL ? ErrorCode::STALE_ROUTE
+                                                    : err;
+}
+
+ErrorCode EtcdViewStore::AdoptRankViaCAS(
+    const std::string& cluster_namespace, uint32_t rank,
+    uint64_t expected_epoch, const std::string& new_primary_id,
+    SlotState new_state, const std::string& migrating_to_id,
+    RingSlotAssign& out_assign, const std::vector<std::string>* new_standbys,
+    const char* reason, const std::string& old_owner,
+    bool success_as_warning, bool clear_intent) {
+    // 归属推进组合原语（模板方法在调用方，此处是被复用的「过程骨架」）：
+    // CAS 切换 + 可选幂等删 reshard_intent + 统一结构化日志。五处调用点
+    //（晋升/补位接管/兼管自愈/driver 阶段1-2）的共性提取；竞争让位
+    //（STALE）是正常结果打 INFO，防多 standby 并发时刷 WARNING。
+    // clear_intent 见头文件：driver 流程内推进必须传 false（intent 是其
+    // 断点续传依据），接管语义传 true（残留意图与新视图矛盾）。
+    ErrorCode err = CASSwitchRingSlotOwner(
+        cluster_namespace, rank, expected_epoch, new_primary_id, new_state,
+        migrating_to_id, out_assign, new_standbys);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::STALE_ROUTE) {
+            LOG(INFO) << "rank ownership CAS lost (concurrent winner): "
+                         "rank="
+                      << rank << ", reason=" << reason
+                      << ", attempted_owner=" << new_primary_id;
+        } else {
+            LOG(WARNING) << "rank ownership CAS failed: rank=" << rank
+                         << ", reason=" << reason << ", err=" << err;
+        }
+        return err;
+    }
+
+    // 可选 intent 清理（幂等，key 不存在视为 OK）。失败不阻断接管——
+    // intent 随后由驱动路径（driver 重扫 / 晋升方）再次清理，记 WARNING
+    // 供排查。
+    if (clear_intent) {
+        const ErrorCode del = DeleteReshardIntent(cluster_namespace, rank);
+        if (del != ErrorCode::OK) {
+            LOG(WARNING) << "rank ownership advanced but intent cleanup "
+                            "failed: rank="
+                         << rank << ", reason=" << reason << ", err=" << del
+                         << " (will be retried by promotion paths)";
+        }
+    }
+
+    const char* intent_note = clear_intent
+                                  ? ", reshard_intent cleared (if any)"
+                                  : ", reshard_intent kept (driver in progress)";
+    if (success_as_warning) {
+        LOG(WARNING) << "rank ownership advanced (" << reason
+                     << "): rank=" << rank << ", old_owner=" << old_owner
+                     << ", new_owner=" << out_assign.primary_id
+                     << ", state="
+                     << (new_state == SlotState::kMigrating ? "kMigrating"
+                                                            : "kStable")
+                     << (new_state == SlotState::kMigrating
+                             ? ", migrating_to=" + migrating_to_id
+                             : intent_note)
+                     << ", new_epoch=" << out_assign.epoch;
+    } else {
+        LOG(INFO) << "rank ownership advanced (" << reason
+                 << "): rank=" << rank << ", old_owner=" << old_owner
+                 << ", new_owner=" << out_assign.primary_id
+                 << ", state=" << (new_state == SlotState::kMigrating
+                                       ? "kMigrating"
+                                       : "kStable")
+                 << (new_state == SlotState::kMigrating
+                         ? ", migrating_to=" + migrating_to_id
+                         : intent_note)
+                 << ", new_epoch=" << out_assign.epoch;
+    }
+    return ErrorCode::OK;
+}
+
 // ---- Master membership watch ----
 
 ErrorCode EtcdViewStore::WatchMasters(const std::string& cluster_namespace,
@@ -496,6 +689,125 @@ ErrorCode EtcdViewStore::WaitWatchMastersStopped(
     const std::string prefix = MasterRegistrationPrefix(cluster_namespace);
     return EtcdHelper::WaitWatchWithPrefixStopped(prefix.data(), prefix.size(),
                                                   timeout_ms);
+}
+
+// ---- RingSlot ownership watch ----
+
+ErrorCode EtcdViewStore::WatchRingSlots(const std::string& cluster_namespace,
+                                       ViewVersionId start_revision,
+                                       void* ctx, WatchCallback cb) {
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    return EtcdHelper::WatchWithPrefixFromRevision(prefix.data(), prefix.size(),
+                                                   start_revision, ctx, cb);
+}
+
+ErrorCode EtcdViewStore::CancelWatchRingSlots(
+    const std::string& cluster_namespace) {
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    return EtcdHelper::CancelWatchWithPrefix(prefix.data(), prefix.size());
+}
+
+ErrorCode EtcdViewStore::WaitWatchRingSlotsStopped(
+    const std::string& cluster_namespace, int timeout_ms) {
+    const std::string prefix = RingSlotAssignPrefix(cluster_namespace);
+    return EtcdHelper::WaitWatchWithPrefixStopped(prefix.data(), prefix.size(),
+                                                  timeout_ms);
+}
+
+// ---- reshard 意图（reshard_intent/{rank}，§16.19.1）----
+
+namespace {
+
+ErrorCode SerializeReshardIntent(const ReshardIntent& intent,
+                                 std::string& out) {
+    try {
+        struct_json::to_json(intent, out);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "SerializeReshardIntent failed: " << e.what();
+        return ErrorCode::SERIALIZE_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode DeserializeReshardIntent(const std::string& in,
+                                    ReshardIntent& out) {
+    try {
+        struct_json::from_json(out, in);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "DeserializeReshardIntent failed: " << e.what();
+        return ErrorCode::DESERIALIZE_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+}  // namespace
+
+ErrorCode EtcdViewStore::CreateReshardIntent(
+    const std::string& cluster_namespace, const ReshardIntent& intent) {
+    if (intent.source_primary_id.empty() ||
+        intent.target_primary_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::string value;
+    ErrorCode err = SerializeReshardIntent(intent, value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    const std::string key = ReshardIntentKey(cluster_namespace, intent.rank);
+    return EtcdHelper::Create(key.data(), key.size(), value.data(),
+                              value.size());
+}
+
+ErrorCode EtcdViewStore::DeleteReshardIntent(
+    const std::string& cluster_namespace, uint32_t rank) {
+    const std::string key = ReshardIntentKey(cluster_namespace, rank);
+    const std::string end = PrefixEnd(key);
+    // 幂等：key 不存在（已删除 / 从未写入）同样视为成功。
+    const ErrorCode err = EtcdHelper::DeleteRange(
+        key.data(), key.size(), end.data(), end.size());
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return ErrorCode::OK;
+    }
+    return err;
+}
+
+ErrorCode EtcdViewStore::LoadAllReshardIntents(
+    const std::string& cluster_namespace,
+    std::vector<ReshardIntent>& out, ViewVersionId& version) {
+    out.clear();
+    const std::string prefix = ReshardIntentPrefix(cluster_namespace);
+    const std::string end = PrefixEnd(prefix);
+    std::string json;
+    ErrorCode err = EtcdHelper::GetRangeAsJson(prefix.data(), prefix.size(),
+                                               end.data(), end.size(),
+                                               /*limit=*/0, json, version);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    std::vector<RangeKvWithRevision> kvs;
+    err = ParseRangeJson(json, kvs);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+
+    out.reserve(kvs.size());
+    for (const auto& kv : kvs) {
+        ReshardIntent intent;
+        err = DeserializeReshardIntent(kv.value, intent);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        uint32_t key_rank = 0;
+        if (!ParseRankFromRingSlotKey(kv.key, prefix, key_rank) ||
+            key_rank != intent.rank) {
+            LOG(ERROR) << "reshard_intent key '" << kv.key
+                       << "' rank mismatch, etcd corrupted";
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        out.push_back(std::move(intent));
+    }
+    return ErrorCode::OK;
 }
 
 }  // namespace cvm

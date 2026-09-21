@@ -439,6 +439,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             if (cvm_controller) {
                 wrapped_master_service->SetCvmLeaseId(
                     cvm_controller->GetLeaseId());
+                // ring_slots 缓存读取（§16.15.5）：slot 归属解析走缓存优先
+                //（miss 回退环推导），supervisor 与 service 同进程直连。
+                wrapped_master_service->SetCvmController(cvm_controller.get());
             }
 
             // Restore from standby if we have context.
