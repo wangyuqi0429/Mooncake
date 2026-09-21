@@ -460,8 +460,9 @@ void CvmController::RefreshRingSlotsCache() {
         if (now_ms - last < 30000) {
             return;
         }
+        int64_t expected = last;  // compare_exchange 需可变引用
         if (last_stale_cache_warn_ms_.compare_exchange_strong(
-                last, now_ms, std::memory_order_relaxed)) {
+                expected, now_ms, std::memory_order_relaxed)) {
             LOG(WARNING) << "CvmController ring_slots cache stale "
                             "(etcd unreachable), serving with old view: "
                             "master_id="

@@ -565,8 +565,11 @@ ErrorCode CvmHttpServer::TriggerReshard(uint32_t rank,
         return ErrorCode::INVALID_PARAMS;
     }
     if (!is_alive(assign.primary_id)) {
-        out_json = R"({"status":"error","reason":"source primary not)"
-                   R"( alive (handled by recovery paths)"})";
+        // 自定义定界符 R"j(...)j"：reason 文本含 "(...)"，其 `)"` 与默认
+        // raw string 终结符冲突（默认定界符无法表达，GCC 报 missing
+        // terminating " character）。
+        out_json =
+            R"j({"status":"error","reason":"source primary not alive (handled by recovery paths)"})j";
         return ErrorCode::INVALID_PARAMS;
     }
 

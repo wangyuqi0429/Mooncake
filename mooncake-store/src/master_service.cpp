@@ -2733,8 +2733,9 @@ void MasterService::MaybeWarnGhostFallback(const char* where,
     if (now_ms - last < 30000) {
         return;
     }
+    int64_t expected = last;  // compare_exchange 需可变引用
     if (last_ghost_fallback_warn_ms_.compare_exchange_strong(
-            last, now_ms, std::memory_order_relaxed)) {
+            expected, now_ms, std::memory_order_relaxed)) {
         LOG(WARNING) << "GHOST-WRITE-RISK " << where
                      << ": ring_slots model active but slot ownership "
                         "cache missed, legacy-ring fallback in use "
