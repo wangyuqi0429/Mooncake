@@ -22,23 +22,31 @@ class CvmHttpServer;
 
 // ring_slots 快照的只读关系视图（快照模式，Snapshot Pattern）。
 //
-// 一次构造即完成锁内拷贝，之后全部关系查询在锁外进行——把
-// 「加锁→拷贝→锁外判断」的锁粒度约定从各消费点的注释收拢为类的
-// 不变量（快照后与缓存解耦，长期持有安全）。控制面所有归属判定
-// （角色/配对/晋升/补位/自愈/告警门控）统一经由本类查询，避免
+// 一次构造即在锁内完成拷贝（assigns + group_count），之后全部关系查询
+// 在锁外进行——把「加锁→拷贝→锁外判断」的锁粒度约定从各消费点的注释
+// 收拢为类的不变量（快照后与缓存解耦，长期持有安全）。G 折入快照，
+// 消除「读 assigns 与读 G 两次加锁」的错配窗口。控制面所有归属判定
+//（角色/配对/晋升/补位/自愈/告警门控）统一经由本类查询，避免
 // 谓词逻辑散落各处产生行为漂移。
 //
 // 不提供任何写接口：写路径（CAS 状态推进）仍归 CvmController/
 // reshard driver，读写分离保持明确。
 class RingSlotsView {
    public:
-    // 从 CvmController 的缓存构建快照（controller 为友元构造入口）。
-    explicit RingSlotsView(std::vector<RingSlotAssign> assigns)
-        : assigns_(std::move(assigns)) {}
+    // 空快照（模型未启用 / controller 缺失时的占位值）。
+    RingSlotsView() = default;
+    // 由 CvmController 在 ring_slots_mutex_ 锁内构建（BuildRingSlotsView）。
+    explicit RingSlotsView(std::vector<RingSlotAssign> assigns,
+                           uint32_t group_count)
+        : assigns_(std::move(assigns)), group_count_(group_count) {}
 
     // 模型是否启用（存在任一归属记录）。等价于
     // CvmController::HasCachedRingSlotAssigns 的快照时刻取值。
     bool active() const { return !assigns_.empty(); }
+
+    // 快照的槽位组数 G（模型未启用时为 0；启用判定用 active()，见
+    // HasCachedRingSlotAssigns 注释——旧集群 G 也落默认 1）。
+    uint32_t group_count() const { return group_count_; }
 
     // id 是否是某 rank 的 primary（含兼管持有的多个 rank）。
     bool is_primary(const std::string& id) const;
@@ -68,6 +76,7 @@ class RingSlotsView {
 
    private:
     std::vector<RingSlotAssign> assigns_;
+    uint32_t group_count_{0};
 };
 
 // In-process control plane for the CVM (Cache View Master).
@@ -134,7 +143,9 @@ class CvmController {
     // ring_slots 模型是否启用（存在任一归属记录）。注意 group_count 不能
     // 作启用判定：旧集群（§15）的 cluster_meta 反序列化后 G 也落默认 1。
     bool HasCachedRingSlotAssigns();
-    // 锁内快照构建 RingSlotsView（控制面关系查询的统一入口，见类注释）。
+    // 锁内快照构建 RingSlotsView（控制面关系查询的统一入口，见类注释；
+    // 快照含 group_count——G 与 assigns 单锁一致，消费方无需再单独调
+    // GetCachedSlotGroupCount，消除两锁错配窗口）。
     RingSlotsView BuildRingSlotsView();
     // 本进程是否曾观测到 ring_slots 记录（一旦启用永不回落，§16.8 G 恒定
     // 前提）。数据面幽灵写告警的门控：seen + 当前缓存空 = 写判定正在走

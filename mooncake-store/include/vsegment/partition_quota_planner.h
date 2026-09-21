@@ -90,6 +90,11 @@ class PartitionQuotaSnapshotStore {
                            std::string* detail = nullptr) = 0;
 };
 
+// 配额快照 etcd 单值默认上限（32MiB）：16384 partition 快照实测 ~4.6MB
+//（planner CLI 的 1500000 默认值对 KV Partition 集群偏小）。master
+// --vsegment_auto_plan 与 CvmHttpServer /vsegment_quota 端点共用本默认。
+constexpr uint64_t kDefaultQuotaMaxEtcdValueBytes = 33554432;
+
 class EtcdPartitionQuotaSnapshotStore final
     : public PartitionQuotaSnapshotStore {
    public:
@@ -101,10 +106,26 @@ class EtcdPartitionQuotaSnapshotStore final
                      size_t max_serialized_bytes,
                      std::string* detail = nullptr) override;
     ErrorCode Load(PartitionPhysicalQuotaSnapshot* snapshot,
-                   std::string* detail = nullptr) override;
+                  std::string* detail = nullptr) override;
 
    private:
     std::string key_;
 };
+
+// 在线「发现→规划→发布」一步式编排（CvmHttpServer POST /vsegment_quota 与
+// master --vsegment_auto_plan 启动 bootstrap 共用；planner CLI 的
+// RunFromDiscovery + Plan + Create 等价复用）。
+//
+// 前置：EtcdHelper 已连接（调用方负责）。facts 从 etcd 现拉（segments/
+// masters/ mounts），发布走 EtcdPartitionQuotaSnapshotStore::Create——etcd
+// 原子首写（key 已存在返回 ETCD_TRANSACTION_FAIL），多实例并发规划天然
+// first-writer-wins，不会互相覆盖。
+//
+// out_summary_json（可选）：成功时回填一行人类可读摘要（generation/
+// partitions/quotas/profiles），供 HTTP 响应体与启动日志共用。
+ErrorCode PlanAndPublishDiscoveredQuota(
+    const std::string& cluster_namespace, const VSegmentUserPolicy& policy,
+    size_t max_etcd_value_bytes, std::string* detail = nullptr,
+    std::string* out_summary_json = nullptr);
 
 }  // namespace mooncake::vsegment

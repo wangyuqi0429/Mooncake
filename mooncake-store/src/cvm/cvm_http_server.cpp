@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <string_view>
@@ -52,6 +53,72 @@ bool ParseUintParam(const std::string_view& sv, uint32_t& out) {
     }
     out = static_cast<uint32_t>(value);
     return true;
+}
+
+// 同上，uint64 变体（配额参数 stripe_size/member_extent_size 等用）。
+bool ParseUint64Param(const std::string_view& sv, uint64_t& out) {
+    if (sv.empty() || sv.size() > 20) {
+        return false;
+    }
+    uint64_t value = 0;
+    for (const char c : sv) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        value = value * 10 + static_cast<uint64_t>(c - '0');
+    }
+    out = value;
+    return true;
+}
+
+// 小数十进制解析 string_view → double（[0,1) 比率参数用，拒多余字符）。
+bool ParseDoubleParam(const std::string_view& sv, double& out) {
+    if (sv.empty() || sv.size() > 31) {
+        return false;
+    }
+    bool seen_dot = false, seen_digit = false;
+    for (const char c : sv) {
+        if (c >= '0' && c <= '9') {
+            seen_digit = true;
+        } else if (c == '.' && !seen_dot) {
+            seen_dot = true;
+        } else {
+            return false;
+        }
+    }
+    if (!seen_digit) return false;
+    out = std::strtod(std::string(sv).c_str(), nullptr);
+    return true;
+}
+
+// JSON 字符串值最小转义（引号/反斜杠/控制字符），错误 reason 内嵌库
+// detail 时防止破坏响应体。
+std::string JsonEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (const char c : in) {
+        switch (c) {
+            case '"':
+                out += "\\\"";
+                break;
+            case '\\':
+                out += "\\\\";
+                break;
+            case '\n':
+            case '\r':
+            case '\t':
+                out += ' ';
+                break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    out += ' ';
+                } else {
+                    out += c;
+                }
+                break;
+        }
+    }
+    return out;
 }
 
 }  // namespace
@@ -133,6 +200,77 @@ void CvmHttpServer::InitRoutes() {
                     break;
                 case ErrorCode::ETCD_TRANSACTION_FAIL:
                 case ErrorCode::STALE_ROUTE:
+                    resp.set_status_and_content(status_type::conflict, json);
+                    break;
+                default:
+                    resp.set_status_and_content(
+                        status_type::internal_server_error, json);
+                    break;
+            }
+        });
+
+    // 管理员在线规划并发布 vsegment 配额（等价 planner CLI 的自动发现 +
+    // --publish；etcd/namespace 用本 master 配置，无需调用方传）：
+    //   POST /vsegment_quota?member_count=2&stripe_size=65536
+    //                      &member_extent_size=1048576
+    // 可选：reserved_ratio / initial_vsegment_count / required_medium /
+    //       io_alignment / max_etcd_value_bytes（默认 32MiB，16384 partition
+    //       的快照实测 ~4.6MB）。快照已存在 → 409（重复发布属预期）。
+    server_->set_http_handler<POST>(
+        "/vsegment_quota",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            vsegment::VSegmentUserPolicy policy;
+            uint64_t max_bytes = vsegment::kDefaultQuotaMaxEtcdValueBytes;
+            std::string json;
+            ErrorCode err = ErrorCode::INVALID_PARAMS;
+            const auto mc_sv = req.get_query_value("member_count");
+            const auto ss_sv = req.get_query_value("stripe_size");
+            const auto mes_sv = req.get_query_value("member_extent_size");
+            const bool required_ok =
+                ParseUintParam(mc_sv, policy.member_count) &&
+                ParseUint64Param(ss_sv, policy.stripe_size) &&
+                ParseUint64Param(mes_sv, policy.member_extent_size);
+            bool optional_ok = true;
+            const auto rr_sv = req.get_query_value("reserved_ratio");
+            if (!rr_sv.empty() &&
+                !ParseDoubleParam(rr_sv, policy.reserved_ratio)) {
+                optional_ok = false;
+            }
+            const auto ivc_sv = req.get_query_value("initial_vsegment_count");
+            if (!ivc_sv.empty() &&
+                !ParseUintParam(ivc_sv, policy.initial_vsegment_count)) {
+                optional_ok = false;
+            }
+            const auto rm_sv = req.get_query_value("required_medium");
+            if (!rm_sv.empty()) {
+                policy.required_medium = std::string(rm_sv);
+            }
+            const auto ia_sv = req.get_query_value("io_alignment");
+            if (!ia_sv.empty() &&
+                !ParseUint64Param(ia_sv, policy.io_alignment)) {
+                optional_ok = false;
+            }
+            const auto mb_sv = req.get_query_value("max_etcd_value_bytes");
+            if (!mb_sv.empty() && !ParseUint64Param(mb_sv, max_bytes)) {
+                optional_ok = false;
+            }
+            if (required_ok && optional_ok) {
+                err = TriggerVSegmentQuota(policy, max_bytes, json);
+            } else {
+                json = required_ok
+                           ? R"({"status":"error","reason":"invalid optional parameter"})"
+                           : R"({"status":"error","reason":"member_count, stripe_size and member_extent_size are required"})";
+            }
+            resp.add_header("Content-Type", "application/json");
+            switch (err) {
+                case ErrorCode::OK:
+                    resp.set_status_and_content(status_type::ok, json);
+                    break;
+                case ErrorCode::INVALID_PARAMS:
+                    resp.set_status_and_content(status_type::bad_request,
+                                                json);
+                    break;
+                case ErrorCode::ETCD_TRANSACTION_FAIL:
                     resp.set_status_and_content(status_type::conflict, json);
                     break;
                 default:
@@ -495,4 +633,25 @@ ErrorCode CvmHttpServer::TriggerReshard(uint32_t rank,
                R"(,"source":")" + assign.primary_id + R"(","target":")" +
                target_master_id + R"("})";
     return ErrorCode::OK;
+}
+
+ErrorCode CvmHttpServer::TriggerVSegmentQuota(
+    const vsegment::VSegmentUserPolicy& policy,
+    uint64_t max_etcd_value_bytes, std::string& out_json) {
+    out_json.clear();
+    std::string detail;
+    const ErrorCode err = vsegment::PlanAndPublishDiscoveredQuota(
+        config_.cluster_namespace, policy,
+        static_cast<size_t>(max_etcd_value_bytes), &detail, &out_json);
+    if (err == ErrorCode::OK) {
+        return ErrorCode::OK;  // out_json 已是摘要（PlanAndPublish 填好）
+    }
+    // 失败：详细 detail 进服务端日志，响应体给转义后的短语（409 = 快照
+    // 已存在，重复发布同一代属预期，调用方可视为已发布）。
+    LOG(ERROR) << "TriggerVSegmentQuota failed: err=" << toString(err)
+               << ", detail=" << detail;
+    const std::string reason = detail.empty() ? toString(err) : detail;
+    out_json = "{\"status\":\"error\",\"reason\":\"" + JsonEscape(reason) +
+               "\"}";
+    return err;
 }

@@ -27,6 +27,11 @@
 #include "types.h"
 #include "utils.h"
 
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "vsegment/partition_quota_planner.h"
+#endif
+
 #include "master_config.h"
 #include "version.h"
 
@@ -176,6 +181,25 @@ DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
 });
 DEFINE_bool(enable_ha, false,
             "Enable high availability using the configured HA backend");
+
+// vsegment 配额自动规划（启动 bootstrap，etcd HA 模式专属）：quota 快照
+// 不存在时按以下策略自动「发现→规划→发布」（等价 vsegment_quota_planner
+// --publish；高级参数 required_medium/io_alignment 等走 master 的
+// POST /vsegment_quota 端点）。多实例并发安全：etcd 原子首写，
+// first-writer-wins。变更策略需先删除已发布快照再重启（或改用端点重发）。
+DEFINE_bool(vsegment_auto_plan, false,
+            "Auto-plan and publish the vsegment quota snapshot at startup "
+            "when none exists (etcd HA mode only)");
+DEFINE_uint32(vsegment_member_count, 0,
+              "vsegment auto-plan: number of distinct members per vsegment");
+DEFINE_uint64(vsegment_stripe_size, 0,
+              "vsegment auto-plan: stripe size in bytes");
+DEFINE_uint64(vsegment_member_extent_size, 0,
+              "vsegment auto-plan: extent size per member in bytes");
+DEFINE_double(vsegment_reserved_ratio, 0.0,
+              "vsegment auto-plan: fraction reserved outside vsegment "
+              "quotas, in [0, 1). Default 0 means no reservation.");
+
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
@@ -1410,6 +1434,69 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     }
 }
 
+#ifdef STORE_USE_ETCD
+// --vsegment_auto_plan 启动 bootstrap（一次性，etcd HA 模式专属）：quota
+// 快照不存在时按用户策略「发现→规划→发布」。执行于 supervisor 启动前。
+// 多实例并发安全：EtcdHelper::Create 原子首写，first-writer-wins（输家得
+// TRANSACTION_FAIL，视为已完成）。失败仅告警不阻断启动——quota 可随后经
+// planner CLI 或 master POST /vsegment_quota 端点手工发布。
+void TryAutoPlanVSegmentQuota(const mooncake::MasterConfig& config) {
+    if (!FLAGS_vsegment_auto_plan) return;
+    if (config.ha_backend_type != "etcd") {
+        LOG(WARNING) << "--vsegment_auto_plan requires the etcd HA backend; "
+                        "skipping";
+        return;
+    }
+    if (FLAGS_vsegment_member_count == 0 || FLAGS_vsegment_stripe_size == 0 ||
+        FLAGS_vsegment_member_extent_size == 0) {
+        LOG(WARNING)
+            << "--vsegment_auto_plan is enabled but requires "
+               "--vsegment_member_count, --vsegment_stripe_size and "
+               "--vsegment_member_extent_size; skipping";
+        return;
+    }
+    const std::string connstring = ResolveHABackendConnstring(config);
+    if (connstring.empty()) {
+        LOG(WARNING) << "vsegment auto-plan: no etcd endpoints configured; "
+                        "skipping";
+        return;
+    }
+    auto err = mooncake::EtcdHelper::ConnectToEtcdStoreClient(connstring);
+    if (err != mooncake::ErrorCode::OK) {
+        LOG(ERROR) << "vsegment auto-plan: cannot connect to etcd: "
+                   << mooncake::toString(err);
+        return;
+    }
+    mooncake::vsegment::PartitionPhysicalQuotaSnapshot existing;
+    mooncake::vsegment::EtcdPartitionQuotaSnapshotStore store(config.cluster_id);
+    if (store.Load(&existing) == mooncake::ErrorCode::OK) {
+        LOG(INFO) << "vsegment auto-plan: quota generation "
+                  << existing.config_generation
+                  << " already published; skipping";
+        return;
+    }
+    mooncake::vsegment::VSegmentUserPolicy policy;
+    policy.member_count = FLAGS_vsegment_member_count;
+    policy.stripe_size = FLAGS_vsegment_stripe_size;
+    policy.member_extent_size = FLAGS_vsegment_member_extent_size;
+    policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    std::string summary;
+    err = mooncake::vsegment::PlanAndPublishDiscoveredQuota(
+        config.cluster_id, policy,
+        mooncake::vsegment::kDefaultQuotaMaxEtcdValueBytes,
+        /*detail=*/nullptr, &summary);
+    if (err == mooncake::ErrorCode::OK) {
+        LOG(INFO) << "vsegment auto-plan published: " << summary;
+    } else if (err == mooncake::ErrorCode::ETCD_TRANSACTION_FAIL) {
+        LOG(INFO) << "vsegment auto-plan: another instance published "
+                     "concurrently; skipping";
+    } else {
+        LOG(ERROR) << "vsegment auto-plan failed: "
+                   << mooncake::toString(err);
+    }
+}
+#endif  // STORE_USE_ETCD
+
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
@@ -1668,6 +1755,11 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
+#ifdef STORE_USE_ETCD
+        // vsegment 配额自动规划（--vsegment_auto_plan）：supervisor 启动前
+        // 一次性 bootstrap，仅当快照不存在时执行（详见函数注释）。
+        TryAutoPlanVSegmentQuota(master_config);
+#endif
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
@@ -1675,6 +1767,16 @@ int main(int argc, char* argv[]) {
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
         return supervisor.Start();
     } else {
+#ifdef STORE_USE_ETCD
+        // enable_ha=false 时 auto_plan flag 被静默忽略：显式提示，防止
+        // 用户以为已自动发布（quota 可在 HA 启用后随重启生效，或届时
+        // 手工 curl POST /vsegment_quota）。
+        if (FLAGS_vsegment_auto_plan) {
+            LOG(WARNING) << "--vsegment_auto_plan is set but enable_ha is "
+                            "false; the flag is ignored (vsegment quota "
+                            "auto-planning requires the etcd HA mode)";
+        }
+#endif
         // version is not used in non-HA mode, just pass a dummy value
         mooncake::ViewVersionId version = 0;
         coro_rpc::coro_rpc_server server(

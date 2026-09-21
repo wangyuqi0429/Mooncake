@@ -633,7 +633,8 @@ RingSlotsView CvmController::BuildRingSlotsView() {
     for (const auto& [rank, assign] : ring_slots_cache_) {
         snapshot.push_back(assign);  // map 按序遍历 = rank 升序
     }
-    return RingSlotsView(std::move(snapshot));
+    // assigns 与 G 同锁拷入快照，消费方不会观测到两者错配。
+    return RingSlotsView(std::move(snapshot), ring_slot_group_count_);
 }
 
 void CvmController::KeepaliveLoop() {
@@ -1080,9 +1081,9 @@ void CvmController::LogStepOutcome(int phase, int outcome,
 
 bool CvmController::TryAssignRankForSelf(
     const std::vector<MasterRegistration>& members) {
-    // 快照视图（含 G）。缓存空 = ring_slots 模型未启用。
+    // 快照视图（含 G，单锁一致）。缓存空 = ring_slots 模型未启用。
     const RingSlotsView view = BuildRingSlotsView();
-    const uint32_t group_count = GetCachedSlotGroupCount();
+    const uint32_t group_count = view.group_count();
 
     if (!view.active()) {
         const bool sole_member =

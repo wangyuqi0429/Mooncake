@@ -8,6 +8,7 @@
 #include <ylt/coro_http/coro_http_server.hpp>
 
 #include "types.h"
+#include "vsegment/partition_quota_planner.h"
 
 namespace mooncake {
 namespace cvm {
@@ -53,6 +54,17 @@ class CvmHttpServer {
     // 并发冲突 ETCD_TRANSACTION_FAIL。
     ErrorCode TriggerReshard(uint32_t rank, const std::string& target_master_id,
                              std::string& out_json);
+
+    // 管理员在线规划并发布 vsegment 配额快照（等价 vsegment_quota_planner
+    // 的自动发现 + --publish 路径；etcd_endpoints / cluster_namespace 取本
+    // master 配置，无需调用方传入）。策略三核心参数必填（member_count /
+    // stripe_size / member_extent_size），其余字段用 VSegmentUserPolicy 默认
+    // 值。发布走 etcd 原子首写：快照已存在返回 ETCD_TRANSACTION_FAIL（重复
+    // 发布同一代属预期，调用方可视为成功）。成功时 out_json 为摘要 JSON；
+    // 校验失败 INVALID_PARAMS。
+    ErrorCode TriggerVSegmentQuota(
+        const vsegment::VSegmentUserPolicy& policy,
+        uint64_t max_etcd_value_bytes, std::string& out_json);
 
    private:
     void InitRoutes();

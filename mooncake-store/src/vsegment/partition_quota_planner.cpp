@@ -10,6 +10,7 @@
 
 #include "etcd_helper.h"
 #include "crc32c.h"
+#include "cvm/etcd_view_store.h"
 #include "cvm/slot_hash.h"
 
 namespace mooncake::vsegment {
@@ -398,6 +399,62 @@ ErrorCode EtcdPartitionQuotaSnapshotStore::Load(
     } catch (const std::exception& error) {
         if (detail) *detail = std::string("invalid quota snapshot: ") + error.what();
         return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode PlanAndPublishDiscoveredQuota(
+    const std::string& cluster_namespace, const VSegmentUserPolicy& policy,
+    size_t max_etcd_value_bytes, std::string* detail,
+    std::string* out_summary_json) {
+    // ---- 1. 从 etcd 现拉资源事实（segments / masters / mounts）----
+    std::vector<cvm::SegmentDescriptor> descriptors;
+    std::vector<cvm::MasterRegistration> masters;
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts;
+    ViewVersionId revision = 0;
+    auto error = cvm::EtcdViewStore::LoadAllMasters(cluster_namespace, masters,
+                                                    revision);
+    if (error == ErrorCode::OK)
+        error = cvm::EtcdViewStore::LoadAllSegmentDescriptors(
+            cluster_namespace, descriptors, revision);
+    if (error == ErrorCode::OK)
+        error = cvm::EtcdViewStore::LoadAllMountEntries(cluster_namespace,
+                                                        mounts, revision);
+    if (error != ErrorCode::OK) {
+        if (detail) *detail = "CVM discovery failed: " + toString(error);
+        return error;
+    }
+
+    // ---- 2. 构建规划请求 + 计算（三核心参数校验在 Build 内）----
+    PartitionQuotaPlanRequest request;
+    error = BuildDiscoveredQuotaPlan(policy, descriptors, masters, mounts,
+                                     &request, detail);
+    if (error != ErrorCode::OK) return error;
+    auto result = PartitionQuotaPlanner().Plan(request);
+    if (!result) {
+        if (detail) *detail = result.detail;
+        return result.error;
+    }
+
+    // ---- 3. 发布（etcd 原子首写：key 已存在 → ETCD_TRANSACTION_FAIL）----
+    EtcdPartitionQuotaSnapshotStore store(cluster_namespace);
+    error = store.Create(result.snapshot, max_etcd_value_bytes, detail);
+    if (error != ErrorCode::OK) return error;
+
+    LOG(INFO) << "published vsegment quota generation "
+              << result.snapshot.config_generation << " with "
+              << result.snapshot.quotas.size()
+              << " partition/profile quotas (cluster=" << cluster_namespace
+              << ", discovered " << request.segments.size() << " segments)";
+    if (out_summary_json) {
+        std::ostringstream os;
+        os << "{\"status\":\"ok\",\"generation\":"
+           << result.snapshot.config_generation << ",\"partitions\":"
+           << request.partition_ids.size() << ",\"quotas\":"
+           << result.snapshot.quotas.size() << ",\"profiles\":"
+           << result.snapshot.profile_specs.size()
+           << ",\"discovered_segments\":" << request.segments.size() << "}";
+        *out_summary_json = os.str();
     }
     return ErrorCode::OK;
 }

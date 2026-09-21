@@ -4,6 +4,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <charconv>
@@ -598,8 +599,31 @@ tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
     const std::string& tenant_id, const std::string& key, Args... args) {
     auto result = invoke_rpc<ServiceMethod, ReturnType>(args...);
 
-    if (!result && result.error() == ErrorCode::SLOT_NOT_OWNED) {
-        // 环已变化（成员增删）：刷新路由 + 重切到新 owner，重试一次。
+    if (!result && (result.error() == ErrorCode::SLOT_NOT_OWNED ||
+                    result.error() == ErrorCode::STALE_ROUTE)) {
+        // 环已变化（成员增删）或分区路由 epoch 过期（owner 推导两模型
+        // 切换的瞬态 / vsegment manager 尚未随心跳安装）：都是路由态过期，
+        // 刷新路由 + 重切到新 owner，重试一次。
+        // 节流告警（防刷屏）：重试本身高频（启动瞬态/切换窗口），仅首条
+        // 立即打、其后至多 60s 一条并带窗口内累计数，绝不逐次打印。
+        static std::atomic<uint64_t> route_retry_count{0};
+        static std::atomic<int64_t> last_route_retry_warn_ms{0};
+        route_retry_count.fetch_add(1, std::memory_order_relaxed);
+        const int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        int64_t last_ms = last_route_retry_warn_ms.load(
+            std::memory_order_relaxed);
+        if ((last_ms == 0 || now_ms - last_ms >= 60000) &&
+            last_route_retry_warn_ms.compare_exchange_strong(
+                last_ms, now_ms, std::memory_order_relaxed)) {
+            const uint64_t suppressed = route_retry_count.exchange(
+                0, std::memory_order_relaxed);
+            LOG(WARNING) << "routed RPC hit stale routing (SLOT_NOT_OWNED/"
+                         << "STALE_ROUTE), retried after refresh: "
+                         << suppressed << " retries since last notice";
+        }
         if (RefreshSubmasterRouting() == ErrorCode::OK &&
             SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
             return invoke_rpc<ServiceMethod, ReturnType>(args...);

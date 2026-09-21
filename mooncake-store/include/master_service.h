@@ -2377,6 +2377,13 @@ class MasterService {
     // 仅当 owned slot 数量变化时打印 INFO 日志（避免心跳周期刷屏）。
     bool owned_slot_count_logged_{false};
     std::size_t last_logged_owned_count_{0};
+    // vsegment reconcile 周期聚合统计（防刷屏，验证辅助）：每周期累计
+    // scanned/owned/foreign/no_route/load_fail/reconcile_fail/stale_cas 七项，
+    // 仅当与上一周期不同才打一条 INFO（变更触发，稳态静默）；绝不逐
+    // partition 打印。心跳线程与 per-slot acquire（RPC 线程）并发调用下
+    // 最多漏/重一条诊断行，无害（同 last_phase_outcome_ 约定）。
+    static constexpr int kVSegStatCount = 7;
+    std::atomic<uint32_t> vseg_stat_last_[kVSegStatCount]{};
     // Segment view (CVM) 数据源：在 segment 挂载/卸载时把中立描述符
     // segments/<seg_id> + 每 master 挂载记录 snapshot/<master_id>/segments/
     // <seg_id> 同步到 etcd，CvmHttpServer 据此聚合出 segment 视图。仅在 etcd

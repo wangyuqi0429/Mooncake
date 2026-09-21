@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "crc32c.h"
+#include "cvm/cvm_types.h"
 #include "tenant_id.h"
 
 namespace mooncake {
@@ -208,6 +209,52 @@ inline std::vector<uint16_t> RankOwnedSlots(uint32_t rank,
         slots.push_back(static_cast<uint16_t>(s));
     }
     return slots;
+}
+
+// ---------------------------------------------------------------------------
+// 统一 slot→owner 推导（§16.17.2）：新旧模型门控的唯一实现
+//
+// 「ring_slots 显式归属优先、缓存空回退 §15 环推导」这条策略曾有过多处
+// 手写副本（客户端 PartitionRouter / master vsegment 路由 / master 归属
+// 位图），任一处漏改即 manager 与路由大面积错位（STALE_ROUTE 刷屏）。
+// 故收拢至此：新增路由消费点必须复用，禁止手写门控。
+// ---------------------------------------------------------------------------
+
+// ring_slots → rank→primary 查找表（建表形式，客户端 PartitionRouter 持有）：
+// rank >= group_count 或 primary 为空的表项留空（无路由）。assigns 为空或
+// group_count == 0（模型未启用）返回空表，调用方走 §15 回退。
+inline std::vector<std::string> BuildRankToPrimary(
+    const std::vector<RingSlotAssign>& assigns, uint32_t group_count) {
+    if (group_count == 0) {
+        return {};
+    }
+    std::vector<std::string> table(group_count);
+    for (const auto& a : assigns) {
+        if (a.rank < group_count && !a.primary_id.empty()) {
+            table[a.rank] = a.primary_id;
+        }
+    }
+    return table;
+}
+
+// slot → owner master_id（点查形式，master 侧逐 partition 解析）：
+// ring_slots 启用时 SlotToRank 定位 rank、取其 primary（不区分 state：
+// kMigrating 期间 primary_id 仍指迁移源，§16.16 阶段 1）；rank 缺失或
+// primary 为空返回空串（无路由——客户端退避 / master 报 INVALID_VERSION，
+// 空值语义由调用方各自处理）。模型未启用回退 §15 环推导。
+inline std::string ResolveSlotOwnerUnified(
+    const std::vector<RingSlotAssign>& assigns, uint32_t group_count,
+    const std::vector<std::string>& legacy_primary_ids, uint16_t slot) {
+    if (!assigns.empty() && group_count > 0) {
+        const uint32_t rank = SlotToRank(slot, group_count);
+        for (const auto& a : assigns) {
+            if (a.rank == rank) {
+                return a.primary_id;
+            }
+        }
+        return {};
+    }
+    return ResolveSlotOwnerOnRing(legacy_primary_ids, slot);
 }
 
 }  // namespace cvm

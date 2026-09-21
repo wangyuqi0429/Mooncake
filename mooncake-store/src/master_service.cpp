@@ -683,9 +683,12 @@ namespace {
 ErrorCode LoadEffectivePartitionRoute(
     const std::string& cluster_id, const std::string& partition_id,
     partition::PartitionRoute& route, ViewVersionId& version,
-    const std::vector<std::string>& primary_ids, ViewVersionId ring_revision) {
-    // Numeric KV Partitions use the same membership-derived ring as KV PT.
-    // There are no per-slot ownership keys in the current CVM protocol.
+    const std::vector<std::string>& primary_ids, ViewVersionId ring_revision,
+    const cvm::RingSlotsView& ring_slots) {
+    // Numeric KV Partitions use the same ownership model as KV slots:
+    // slot→owner 统一经 ResolveSlotOwnerUnified（§16.17.2 的唯一实现，
+    // 含 G 的 ring_slots 快照优先 + §15 回退），与客户端 PartitionRouter
+    // 同源；kMigrating 期间空 owner 的语义见该函数注释。
     size_t parsed = 0;
     unsigned long numeric = 0;
     try {
@@ -699,8 +702,9 @@ ErrorCode LoadEffectivePartitionRoute(
         return cvm::EtcdViewStore::LoadPartitionRoute(
             cluster_id, partition_id, route, version);
     }
-    const auto owner = cvm::ResolveSlotOwnerOnRing(
-        primary_ids, static_cast<uint16_t>(numeric));
+    const auto slot = static_cast<uint16_t>(numeric);
+    const std::string owner = cvm::ResolveSlotOwnerUnified(
+        ring_slots.assigns(), ring_slots.group_count(), primary_ids, slot);
     if (owner.empty() || ring_revision <= 0)
         return ErrorCode::INVALID_VERSION;
     version = ring_revision;
@@ -830,19 +834,36 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
         primary_ids = cvm_last_primary_ids_;
         ring_revision = cvm_ring_revision_;
     }
+    // ring_slots 归属快照（含 G，单锁一致，§16.17.2；循环外一次构建，
+    // 整个 reconcile 用同一视图）：owner 推导经 ResolveSlotOwnerUnified
+    // 与客户端 PartitionRouter 同源，避免 manager 装错节点。
+    cvm::RingSlotsView ring_slots;
+    if (cvm_controller_ != nullptr) {
+        ring_slots = cvm_controller_->BuildRingSlotsView();
+    }
+    // 周期聚合统计（防刷屏：绝不逐 partition 打印，仅周期末变更触发一条
+    // INFO；reconcile 失败的逐条 ERROR 收拢为每周期一条 + 首个样本）。
+    static const char* const kVSegStatNames[kVSegStatCount] = {
+        "scanned", "owned_by_me", "foreign", "no_route",
+        "load_fail", "reconcile_fail", "stale_cas"};
+    uint32_t vseg_stats[kVSegStatCount] = {0, 0, 0, 0, 0, 0, 0};
+    std::string reconcile_fail_first;
     bool complete = true;
     for (const auto& partition_id : partition_ids) {
+        ++vseg_stats[0];
         if (!acquiring.empty() && partition_id != acquiring) continue;
         partition::PartitionRoute route;
         ViewVersionId version = 0;
         auto error = LoadEffectivePartitionRoute(cluster_id_, partition_id,
                                                  route, version, primary_ids,
-                                                 ring_revision);
+                                                 ring_revision, ring_slots);
         if (error == ErrorCode::ETCD_KEY_NOT_EXIST) {
+            ++vseg_stats[3];
             if (recovered.count(partition_id)) complete = false;
             continue;
         }
         if (error != ErrorCode::OK) {
+            ++vseg_stats[4];
             complete = false;
             continue;
         }
@@ -855,10 +876,15 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
         if (numeric_slot) {
             // The release hook stages state and ACK detaches it. Removing here
             // would lose the manager before the release hook can export it.
-            if (route.owner_submaster_id != master_id_) continue;
-            if (acquiring != partition_id &&
-                !OwnsSlot(static_cast<uint16_t>(std::stoul(partition_id))))
+            if (route.owner_submaster_id != master_id_) {
+                ++vseg_stats[2];
                 continue;
+            }
+            if (acquiring != partition_id &&
+                !OwnsSlot(static_cast<uint16_t>(std::stoul(partition_id)))) {
+                ++vseg_stats[2];
+                continue;
+            }
             vsegment::PartitionVSegmentSnapshot current;
             if (vsegment_service_->SnapshotPartition(partition_id, &current) ==
                 ErrorCode::OK) {
@@ -874,12 +900,26 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
         error = vsegment_service_->ReconcilePartitionRoute(
             route, master_id_, std::move(committer), state);
         if (error != ErrorCode::OK && error != ErrorCode::STALE_ROUTE) {
-            LOG(ERROR) << "Failed to reconcile Partition " << partition_id
-                       << ": " << toString(error);
+            // 逐 partition ERROR 收拢：每周期一条（首个失败样本），计数进
+            // 周期摘要——故障风暴（如 STALE_ROUTE 修复前的路由错位）不再
+            // 16384 条/周期刷屏。
+            if (reconcile_fail_first.empty()) {
+                reconcile_fail_first =
+                    partition_id + ": " + toString(error);
+            }
+            ++vseg_stats[5];
             complete = false;
-        } else if (state && route.owner_submaster_id == master_id_) {
-            recovered_owned_partitions.insert(partition_id);
+        } else {
+            if (error == ErrorCode::STALE_ROUTE) ++vseg_stats[6];
+            ++vseg_stats[1];
+            if (state && route.owner_submaster_id == master_id_) {
+                recovered_owned_partitions.insert(partition_id);
+            }
         }
+    }
+    if (!reconcile_fail_first.empty()) {
+        LOG(ERROR) << "vsegment reconcile failures: count="
+                   << vseg_stats[5] << ", first=" << reconcile_fail_first;
     }
     if (complete && !recovered_owned_partitions.empty()) {
         std::unordered_map<std::string,
@@ -931,6 +971,30 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
                                    state.partition_id) != 0;
                            }),
             recovered_vsegment_snapshots_.end());
+    }
+    // 周期摘要（变更触发，防刷屏）：任一统计与上一周期不同才打 INFO，稳态
+    // 静默；绝不逐 partition 打印。验证 STALE_ROUTE 修复时关注 owned_by_me
+    // 应 ≈ 本机 rank 段 partition 数、foreign 由对端持有、stale_cas 稳态为 0。
+    if (vseg_stats[0] > 0) {
+        bool changed = false;
+        for (int i = 0; i < kVSegStatCount; ++i) {
+            if (vseg_stats[i] !=
+                vseg_stat_last_[i].load(std::memory_order_relaxed)) {
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            std::string detail;
+            for (int i = 0; i < kVSegStatCount; ++i) {
+                if (i != 0) detail += ", ";
+                detail += std::string(kVSegStatNames[i]) + "=" +
+                          std::to_string(vseg_stats[i]);
+                vseg_stat_last_[i].store(vseg_stats[i],
+                                         std::memory_order_relaxed);
+            }
+            LOG(INFO) << "vsegment reconcile stats (changed): " << detail;
+        }
     }
     return complete ? ErrorCode::OK : ErrorCode::PERSISTENT_FAIL;
 }
@@ -1551,14 +1615,19 @@ ErrorCode MasterService::ImportSlotMetadata(uint16_t slot) {
     }
     const SlotMetadataExport& export_payload = pull_result.value();
 
-    // §15 路径路由：成员环推导（owner 必须是本机——本机因环变化 gained
-    // 该 slot 才会进入此处）。安装主体已抽取到 InstallSlotMetadataExport，
-    // 供单 slot 交接与 P4 段级批量导入复用。
+    // 路径路由（§16.17.2 后与客户端同模型）：ring_slots 优先、缓存空回退
+    // 成员环推导；owner 必须是本机——本机因归属变化 gained 该 slot 才会
+    // 进入此处。安装主体已抽取到 InstallSlotMetadataExport，供单 slot
+    // 交接与 P4 段级批量导入复用。
     partition::PartitionRoute route;
     ViewVersionId route_version = 0;
+    cvm::RingSlotsView ring_slots;
+    if (cvm_controller_ != nullptr) {
+        ring_slots = cvm_controller_->BuildRingSlotsView();
+    }
     auto route_error = LoadEffectivePartitionRoute(
         cluster_id_, std::to_string(slot), route, route_version, primary_ids,
-        ring_revision);
+        ring_revision, ring_slots);
     if (route_error != ErrorCode::OK) {
         return route_error;
     }
@@ -2344,14 +2413,16 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
     //（0 slot）。
     if (cvm_controller_ != nullptr &&
         cvm_controller_->HasCachedRingSlotAssigns()) {
-        const uint32_t group_count =
-            cvm_controller_->GetCachedSlotGroupCount();
+        // 单锁快照（含 G）：与 vsegment 路由 / 客户端 router 的归属判定
+        // 同源，并消除原「逐 rank 单点查询」的多次加锁开销。语义与原
+        // 实现等价（rank 越界记录由 RankOwnedSlots 防御性返回空剔除，
+        // 不影响本机 owned 集合）。
+        const cvm::RingSlotsView view = cvm_controller_->BuildRingSlotsView();
+        const uint32_t group_count = view.group_count();
         std::vector<cvm::RingSlotAssign> mine;
-        for (uint32_t rank = 0; rank < group_count; ++rank) {
-            cvm::RingSlotAssign a;
-            if (cvm_controller_->GetCachedRingSlotAssign(rank, a) &&
-                a.primary_id == master_id_) {
-                mine.push_back(std::move(a));
+        for (const auto& a : view.assigns()) {
+            if (a.rank < group_count && a.primary_id == master_id_) {
+                mine.push_back(a);
             }
         }
         if (!mine.empty()) {

@@ -61,14 +61,16 @@ ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
     err = cvm::EtcdViewStore::LoadAllRingSlotAssigns(
         cluster_namespace, assigns, assigns_revision);
     if (err == ErrorCode::OK && !assigns.empty()) {
-        // rank → primary（不区分 state：kMigrating 期间 primary_id 仍指
-        // 源 A，读路由仍走源，§16.16 阶段 1）。缺失/空 primary 的 rank
-        // 无路由（ResolveSubmaster → nullopt → 客户端退避）。
-        std::vector<std::string> rank_to_primary(group_count);
+        // rank → primary 查找表：统一推导建表（§16.17.2
+        // BuildRankToPrimary，与 master 侧 ResolveSlotOwnerUnified 同源，
+        // 不区分 state：kMigrating 期间 primary_id 仍指源 A，读路由仍走
+        // 源，§16.16 阶段 1）。缺失/空 primary 的 rank 无路由
+        //（ResolveSubmaster → nullopt → 客户端退避）。
+        std::vector<std::string> rank_to_primary =
+            cvm::BuildRankToPrimary(assigns, group_count);
         size_t filled = 0;
-        for (auto& a : assigns) {
-            if (a.rank < group_count && !a.primary_id.empty()) {
-                rank_to_primary[a.rank] = std::move(a.primary_id);
+        for (const auto& p : rank_to_primary) {
+            if (!p.empty()) {
                 ++filled;
             }
         }
