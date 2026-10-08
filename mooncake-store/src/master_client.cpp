@@ -28,6 +28,10 @@
 #include "master_metric_manager.h"
 #include "version.h"
 
+#define SPDIAG_PERF_DEF_FILE "mooncake_perf_points.def"
+#define SPDIAG_PROGRAM_NAME "mooncake_store"
+#include "spdiag/auto_perf.h"
+
 namespace mooncake {
 
 namespace {
@@ -629,22 +633,39 @@ tl::expected<ReturnType, ErrorCode> MasterClient::InvokeRoutedWithSlotRetry(
                          << "STALE_ROUTE), retried after refresh: "
                          << suppressed << " retries since last notice";
         }
+        // 重试整窗（含 RefreshSubmasterRouting 同步 etcd 全表重载 +
+        // SwitchToSubmaster 建连 + 二次 RPC）。正常≈0，飙升即迁移动荡。
+        // 与上面 60s 节流 WARNING 互补：日志看拐点，本点看分布。
+        SpDiag::PerfPoint pt_retry(PerfKey::CVM_ROUTE_STALE_RETRY,
+                                   SpDiag::PerfLevel::KEY_MODULE);
+        pt_retry.Start();
         if (RefreshSubmasterRouting() == ErrorCode::OK &&
             SwitchToSubmaster(tenant_id, key) == ErrorCode::OK) {
-            return invoke_rpc<ServiceMethod, ReturnType>(args...);
+            auto retry_result =
+                invoke_rpc<ServiceMethod, ReturnType>(args...);
+            pt_retry.End(retry_result ? 0 : -1);
+            return retry_result;
         }
+        pt_retry.End(-1);
     } else if (!result && result.error() == ErrorCode::SLOT_MIGRATING) {
         // owner 已 expected 但元数据尚未 import/replay 完成：环不变，退避
         // （有界）后原地重试，等待元数据就绪。
+        // 迁移窗口期退避总时长（含 sleep + 重试 RPC），DEBUG 级：
+        // 仅迁移窗口可见，平时零流量。
+        SpDiag::PerfPoint pt_backoff(PerfKey::CVM_ROUTE_BACKOFF,
+                                     SpDiag::PerfLevel::DEBUG);
+        pt_backoff.Start();
         constexpr int kMaxRetries = 3;
         for (int i = 0; i < kMaxRetries; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20 << i));
             auto attempt = invoke_rpc<ServiceMethod, ReturnType>(args...);
             if (!attempt || attempt.error() != ErrorCode::SLOT_MIGRATING) {
+                pt_backoff.End(attempt ? 0 : -1);
                 return attempt;
             }
             result = std::move(attempt);
         }
+        pt_backoff.End(-1);  // 耗尽重试仍 MIGRATING
     }
 
     return result;
@@ -798,12 +819,19 @@ void MasterClient::SwitchToSubmasterByAddress(const std::string& address) {
 
 ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
                                           const std::string& key) {
+    // 路由打点（读写共键）：status 0=hit 切换(含建连) / 2=miss 失败。
+    // 单 master 表空路径不激活（未 Start 的点析构干净），避免零流量稀释；
+    // miss 率 = badCount/tickCount，延迟分布即多 submaster 路由开销
+    // （含 GetOrCreateClientPool 新 submaster 首次建连成本）。
+    SpDiag::PerfPoint pt_switch(PerfKey::CVM_ROUTE_SWITCH,
+                                SpDiag::PerfLevel::KEY_MODULE);
     // Routing not loaded (single-master mode): keep the current connection so
     // existing behavior is preserved. Check Size() before ResolveSubmaster to
     // avoid its per-miss WARNING log firing on every single-key request.
     if (partition_router_.Size() == 0) {
         return ErrorCode::OK;
     }
+    pt_switch.Start();
 
     const TenantId tenant(tenant_id);
     const uint16_t slot = partition::KvHashMap::Compute(tenant, key);
@@ -812,12 +840,14 @@ ErrorCode MasterClient::SwitchToSubmaster(const std::string& tenant_id,
         LOG(WARNING) << "SwitchToSubmaster miss: tenant=" << tenant_id
                      << " key=" << key << " slot=" << slot
                      << " (slot has no owner in routing table)";
+        pt_switch.End(2);
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     SwitchToSubmasterByAddress(*submaster);
     LOG(INFO) << "SwitchToSubmaster: tenant=" << tenant_id << " key=" << key
               << " slot=" << slot << " -> submaster=" << *submaster;
+    pt_switch.End(0);
     return ErrorCode::OK;
 }
 

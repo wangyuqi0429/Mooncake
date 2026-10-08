@@ -5782,7 +5782,14 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
+        // 读命中仅 LOCAL_DISK 副本 → 异步入队 promotion（DRAM 晋升）。
+        // 纯计数 + enqueue 开销；promotion 生效性观测：
+        // 本点次数上升时 GET_SSD_LEASE_EXPIRED 应同步下降。
+        SpDiag::PerfPoint pt_promo(PerfKey::GET_PROMOTION_ENQUEUE,
+                                   SpDiag::PerfLevel::KEY_MODULE);
+        pt_promo.Start();
         TryPushPromotionQueue(object_id);
+        pt_promo.End(0);
     }
     return resp;
 }
@@ -6023,7 +6030,12 @@ MasterService::BatchGetReplicaListLocal(const std::vector<std::string>& keys,
         }
 
         for (const auto& object_id : promotion_candidates) {
+            // 同单笔语义：promotion 入队纯计数 + enqueue 开销
+            SpDiag::PerfPoint pt_promo(PerfKey::GET_PROMOTION_ENQUEUE,
+                                       SpDiag::PerfLevel::KEY_MODULE);
+            pt_promo.Start();
             TryPushPromotionQueue(object_id);
+            pt_promo.End(0);
         }
     }
 

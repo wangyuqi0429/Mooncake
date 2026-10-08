@@ -1629,20 +1629,38 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    // 编排层整窗：GET_INTERNAL_* 六段之和与本窗的差值即编排层占比
+    SpDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     // Find the first complete replica
     Replica::Descriptor replica;
-    ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
-    if (err != ErrorCode::OK) {
-        if (err == ErrorCode::INVALID_REPLICA) {
-            LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+    ErrorCode err = ErrorCode::OK;
+    {
+        SpDiag::PerfPoint pt_find(PerfKey::GET_SINGLE_FIND_REPLICA,
+                                  SpDiag::PerfLevel::MODULE);
+        pt_find.Start();
+        err = FindFirstCompleteReplica(query_result.replicas, replica);
+        pt_find.End(err == ErrorCode::OK ? 0 : -1);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << object_key;
+            }
+            pt_full.End(-1);
+            return tl::unexpected(err);
         }
-        return tl::unexpected(err);
     }
 
     // Check local hot cache and update replica descriptor if cache hit
     bool cache_used = false;
     if (hot_cache_ && replica.is_memory_replica()) {
+        // status: 0=hit（改写 replica 指向本地 cache，走本地 memcpy）/
+        // -1=miss（走 TE 远读）——miss 率 = badCount/tickCount
+        SpDiag::PerfPoint pt_cache(PerfKey::GET_SINGLE_HOT_CACHE,
+                                   SpDiag::PerfLevel::KEY_MODULE);
+        pt_cache.Start();
         cache_used = RedirectToHotCache(object_key, replica);
+        pt_cache.End(cache_used ? 0 : -1);
     }
 
     auto t0_get = std::chrono::steady_clock::now();
@@ -1650,7 +1668,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Release the cache block after transfer completes (memcpy is done)
     if (hot_cache_ && cache_used) {
+        SpDiag::PerfPoint pt_release(PerfKey::GET_SINGLE_RELEASE_CACHE,
+                                     SpDiag::PerfLevel::MODULE);
+        pt_release.Start();
         hot_cache_->ReleaseHotKey(object_key);
+        pt_release.End(0);
     }
 
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1662,6 +1684,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
+        pt_full.End(-1);
         return tl::unexpected(err);
     }
 
@@ -1669,6 +1692,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
                              query_result.object_checksum);
     if (!checksum_result) {
+        pt_full.End(-1);
         return tl::unexpected(checksum_result.error());
     }
 
@@ -1676,12 +1700,19 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     // Skip when cache_used — data was already served from local cache, no need
     // to re-promote or increment the CMS counter.
     if (ShouldAdmitToHotCache(object_key, cache_used)) {
+        // 仅观测 enqueue 开销与 promote 触发频率；真正的异步拷贝在
+        // hot_cache_handler_ 线程池内执行，不在本窗内。
+        SpDiag::PerfPoint pt_async(PerfKey::GET_SINGLE_ASYNC_CACHE,
+                                   SpDiag::PerfLevel::MODULE);
+        pt_async.Start();
         ProcessSlicesAsync(object_key, slices, replica);
+        pt_async.End(0);
     }
 
     if (query_result.IsLeaseExpired()) {
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
+        pt_full.End(-1);
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     // Log cache hit statistics
@@ -1690,6 +1721,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                 << " cache_hit=" << (cache_used ? 1 : 0);
     }
 
+    pt_full.End(0);
     return {};
 }
 
@@ -1873,6 +1905,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool prefer_alloc_in_same_node) {
+    // 批量编排层整窗（含 SUBMIT/WAIT 两阶段）；status 0=全部成功 /
+    // -1=至少一个 key 失败
+    SpDiag::PerfPoint pt_full(PerfKey::GET_BATCH_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    pt_full.Start();
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1880,6 +1917,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
+        pt_full.End(-1);
         return results;
     }
 
@@ -1893,6 +1931,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         for (size_t i = 0; i < object_keys.size(); ++i) {
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
+        pt_full.End(-1);
         return results;
     }
     if (prefer_alloc_in_same_node) {
@@ -1910,7 +1949,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
     }
     if (prefer_alloc_in_same_node) {
-        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        // prefer_same_node 委托路径：FULL 窗覆盖委托调用本身；子路径内部
+        // （submit_batch / futures[0].get）暂无独立打点。
+        auto pref_results =
+            BatchGetWhenPreferSameNode(object_keys, query_results, slices);
+        pt_full.End(std::any_of(pref_results.begin(), pref_results.end(),
+                                [](const auto& r) { return !r; })
+                        ? -1
+                        : 0);
+        return pref_results;
     }
 
     // Collect all transfer operations for parallel execution
@@ -1926,6 +1973,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     size_t total_cache_hits = 0;
 
     // Submit all transfers in parallel
+    SpDiag::PerfPoint pt_submit(PerfKey::GET_BATCH_SUBMIT,
+                                SpDiag::PerfLevel::MODULE);
+    pt_submit.Start();
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
@@ -1939,19 +1989,30 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Find the first complete replica for this key
         Replica::Descriptor replica;
-        ErrorCode err =
-            FindFirstCompleteReplica(query_result.replicas, replica);
-        if (err != ErrorCode::OK) {
-            if (err == ErrorCode::INVALID_REPLICA) {
-                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+        {
+            SpDiag::PerfPoint pt_find(PerfKey::GET_BATCH_FIND_REPLICA,
+                                      SpDiag::PerfLevel::MODULE);
+            pt_find.Start();
+            ErrorCode err =
+                FindFirstCompleteReplica(query_result.replicas, replica);
+            pt_find.End(err == ErrorCode::OK ? 0 : -1);
+            if (err != ErrorCode::OK) {
+                if (err == ErrorCode::INVALID_REPLICA) {
+                    LOG(ERROR) << "no_complete_replicas_found key=" << key;
+                }
+                results[i] = tl::unexpected(err);
+                continue;
             }
-            results[i] = tl::unexpected(err);
-            continue;
         }
 
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
+            // status: 0=hit / -1=miss（同 GET_SINGLE_HOT_CACHE 编码）
+            SpDiag::PerfPoint pt_cache(PerfKey::GET_BATCH_HOT_CACHE,
+                                       SpDiag::PerfLevel::KEY_MODULE);
+            pt_cache.Start();
             cache_used = RedirectToHotCache(key, replica);
+            pt_cache.End(cache_used ? 0 : -1);
             if (cache_used) {
                 total_cache_hits++;
             }
@@ -1995,7 +2056,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         if (!future) {
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
+                SpDiag::PerfPoint pt_release(PerfKey::GET_BATCH_RELEASE_CACHE,
+                                             SpDiag::PerfLevel::MODULE);
+                pt_release.Start();
                 hot_cache_->ReleaseHotKey(key);
+                pt_release.End(0);
             }
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
@@ -2009,15 +2074,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
     }
+    pt_submit.End(0);
 
     // Wait for all transfers to complete
+    SpDiag::PerfPoint pt_wait(PerfKey::GET_BATCH_WAIT,
+                              SpDiag::PerfLevel::MODULE);
+    pt_wait.Start();
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
         ErrorCode result = future.get();
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
+            SpDiag::PerfPoint pt_release(PerfKey::GET_BATCH_RELEASE_CACHE,
+                                         SpDiag::PerfLevel::MODULE);
+            pt_release.Start();
             hot_cache_->ReleaseHotKey(key);
+            pt_release.End(0);
         }
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
@@ -2046,11 +2119,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 auto slices_it = slices.find(key);
                 if (slices_it != slices.end() &&
                     ShouldAdmitToHotCache(key, cache_used)) {
+                    // 仅观测 enqueue 开销与 promote 触发频率（同单笔语义）
+                    SpDiag::PerfPoint pt_async(PerfKey::GET_BATCH_ASYNC_CACHE,
+                                               SpDiag::PerfLevel::MODULE);
+                    pt_async.Start();
                     ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                    pt_async.End(0);
                 }
             }
         }
     }
+    pt_wait.End(0);
 
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
@@ -2078,6 +2157,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     } else {
         VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
     }
+    pt_full.End(std::any_of(results.begin(), results.end(),
+                            [](const auto& r) { return !r; })
+                    ? -1
+                    : 0);
     return results;
 }
 
@@ -4733,8 +4816,21 @@ void Client::PutToLocalFile(const std::string& key,
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
                                TransferRequest::OpCode op_code) {
+    // TransferData 读写共函数：仅读路径（op_code==READ）计入 GET_SINGLE_
+    // TRANSFER_* 键，写路径 PUT_* 键待后续批次，避免读写流量互相污染。
+    // SUBMIT/WAIT 拆分用于区分 RDMA 提交阻塞与传输等待。
+    const bool is_read = (op_code == TransferRequest::READ);
+    SpDiag::PerfPoint pt_full(PerfKey::GET_SINGLE_TRANSFER_FULL,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    SpDiag::PerfPoint pt_submit(PerfKey::GET_SINGLE_TRANSFER_SUBMIT,
+                                SpDiag::PerfLevel::MODULE);
+    SpDiag::PerfPoint pt_wait(PerfKey::GET_SINGLE_TRANSFER_WAIT,
+                              SpDiag::PerfLevel::MODULE);
+    if (is_read) pt_full.Start();
+
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
+        if (is_read) pt_full.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -4742,6 +4838,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     if (replica_descriptor.is_vsegment_replica()) {
         if (!vsegment_transfer_planner_) {
             LOG(ERROR) << "VSegmentTransferPlanner not initialized";
+            if (is_read) pt_full.End(-1);
             return ErrorCode::INVALID_PARAMS;
         }
         std::vector<vsegment::ClientSlice> client_slices;
@@ -4754,30 +4851,46 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
             replica_descriptor.get_vsegment_descriptor(), client_slices);
         if (!plan) {
             LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
+            if (is_read) pt_full.End(-1);
             return plan.error;
         }
+        if (is_read) pt_submit.Start();
         future = transfer_submitter_->submitVSegment(plan, op_code);
+        if (is_read) pt_submit.End(future ? 0 : -1);
     } else if (replica_descriptor.is_nof_replica()) {
         auto contiguous_range = GetContiguousSliceRange(slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
+            if (is_read) pt_full.End(-1);
             return ErrorCode::INVALID_PARAMS;
         }
+        if (is_read) pt_submit.Start();
         future = transfer_submitter_->submit(replica_descriptor, slices,
                                              op_code, contiguous_range->ptr,
                                              contiguous_range->size);
+        if (is_read) pt_submit.End(future ? 0 : -1);
     } else {
+        if (is_read) pt_submit.Start();
         future =
             transfer_submitter_->submit(replica_descriptor, slices, op_code);
+        if (is_read) pt_submit.End(future ? 0 : -1);
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
+        if (is_read) pt_full.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
 
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
-    return future->get();
+    if (is_read) pt_wait.Start();
+    const ErrorCode transfer_result = future->get();
+    if (is_read) {
+        const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
+        pt_wait.End(pt_status);
+        pt_full.End(pt_status);
+    }
+    return transfer_result;
 }
 
 ErrorCode Client::TransferReadInternal(
@@ -4834,6 +4947,11 @@ ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices) {
+    // 读传输整窗（size 校验 + TransferData 读分支）；内部 GET_SINGLE_
+    // TRANSFER_FULL 为其子窗，差值即校验开销
+    SpDiag::PerfPoint pt_read(PerfKey::GET_SINGLE_TRANSFER_READ,
+                              SpDiag::PerfLevel::KEY_MODULE);
+    pt_read.Start();
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
@@ -4855,10 +4973,14 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     if (slices_size < total_size) {
         LOG(ERROR) << "Slice size " << slices_size << " is smaller than total "
                    << "size " << total_size;
+        pt_read.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    const ErrorCode read_result =
+        TransferData(replica_descriptor, slices, TransferRequest::READ);
+    pt_read.End(read_result == ErrorCode::OK ? 0 : -1);
+    return read_result;
 }
 
 ErrorCode Client::TransferReadRange(

@@ -214,3 +214,18 @@ PERF_KEY_DEF(RC_BATCH_GET_REPLICA_DESC,         "real_client.cpp::batch_get_repl
 
 // === Client 服务层（vllm 路径下沉，部分已有打点）===
 PERF_KEY_DEF(CLIENT_BATCH_QUERY,                "client_service.cpp::BatchQuery",            "BatchQuery")
+
+// === CVM 路由（多 submaster，读写共键）===
+// RouteSwitch status: 0=hit 切换 / 2=miss 失败；表空(单master)不激活
+PERF_KEY_DEF(CVM_ROUTE_SWITCH,        "master_client.cpp::SwitchToSubmaster",         "RouteSwitch")
+// StaleRouteRetry: SLOT_NOT_OWNED/STALE_ROUTE 重试分支整窗（含同步 etcd 全表重载）
+PERF_KEY_DEF(CVM_ROUTE_STALE_RETRY,   "master_client.cpp::InvokeRoutedWithSlotRetry", "StaleRouteRetry")
+// Backoff: SLOT_MIGRATING 退避重试总时长（最多 3 次 20/40/80ms，DEBUG 级）
+PERF_KEY_DEF(CVM_ROUTE_BACKOFF,       "master_client.cpp::InvokeRoutedWithSlotRetry", "RouteBackoff")
+
+// === Get 读特有异步尾部 ===
+// SsdLeaseExpired: owner 端 pinned buffer 租约超时（OBJECT_HAS_LEASE）计数信号，
+// 发生率 = badCount / GET_SSD_OFFLOAD_RPC tickCount
+PERF_KEY_DEF(GET_SSD_LEASE_EXPIRED,   "real_client.cpp::batch_get_into_offload_object_internal", "SsdLeaseExpired")
+// PromotionEnqueue: 读命中仅 LOCAL_DISK 副本时的 promotion 异步入队（master 侧）
+PERF_KEY_DEF(GET_PROMOTION_ENQUEUE,   "master_service.cpp::TryPushPromotionQueue", "PromotionEnqueue")
