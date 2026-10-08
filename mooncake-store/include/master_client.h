@@ -152,6 +152,15 @@ class MasterClient {
         const std::string& key) const;
 
     /**
+     * @brief 按指定 tenant 解析 key 的 owner submaster 地址（供 offload
+     * 控制面按 task 分组定向，task 携带自身 tenant 而非 client 默认
+     * tenant）。路由表未加载（单 master 模式）返回 nullopt，调用方据此
+     * 回退非定向路径。miss 不打日志——批量分组场景由调用方聚合计数。
+     */
+    [[nodiscard]] std::optional<std::string> ResolveSubmasterFor(
+        const std::string& tenant_id, const std::string& key) const;
+
+    /**
      * @brief Checks if an object exists
      * @param object_key Key to query
      * @return tl::expected<bool, ErrorCode> indicating exist or not
@@ -504,6 +513,14 @@ class MasterClient {
     std::string GetCurrentAddress() const;
 
     /**
+     * @brief 枚举路由表中所有 primary submaster 地址（去重）。来源为
+     * partition_router_（master_id 的值即 RPC 端点 address）。单 master
+     * 模式下路由表为空，返回空 vector——offload 控制面调用方据此回退
+     * 非定向（invoke_rpc）路径，与内存段全量 mount 的回退语义一致。
+     */
+    [[nodiscard]] std::vector<std::string> GetSubmasterAddresses() const;
+
+    /**
      * @brief 定向 Ping：向指定 submaster 发送 Ping（不切换当前连接）。
      * 用于 client 侧多 submaster 心跳，防止各 submaster 因收不到 ping 而
      * 误判 client 过期并卸载其 segment。返回 NEED_REMOUNT 时调用方应对该
@@ -544,6 +561,26 @@ class MasterClient {
         const UUID& client_id, bool enable_offloading);
 
     /**
+     * @brief 定向 MountLocalDiskSegment：向指定 submaster 注册 LOCAL_DISK 段
+     * （不切换当前连接）。多 submaster 模式下 LOCAL_DISK 段与内存段对称，
+     * 需挂载到所有 primary submaster，使任何 slot owner 都能本地执行
+     * offload 决策；单 master 模式调用方走非定向变体。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegmentTo(
+        const std::string& address, const UUID& client_id,
+        bool enable_offloading);
+
+    /**
+     * @brief 定向卸载 worker 的 LOCAL_DISK 段：向指定 submaster 清理该
+     * client 的 LocalDiskSegment（ssd 容量记账、offloading 队列），与
+     * MountLocalDiskSegmentTo 对称。用于 submaster 退出集群时（worker 侧
+     * RefreshSubmasterAddresses removed 分支）保证容量记账对称闭合。
+     * 幂等。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountLocalDiskSegmentTo(
+        const std::string& address, const UUID& client_id);
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-persisted objects.
      * @param enable_offloading Indicates whether persistence is enabled for
@@ -553,13 +590,39 @@ class MasterClient {
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
     /**
+     * @brief 定向 OffloadObjectHeartbeat：向指定 submaster 拉取该 master
+     * slot 的卸载任务（不切换当前连接）。多 submaster 下各 master 的
+     * offloading_objects 队列只含自己 slot 的任务，worker 心跳需逐
+     * master fan-out 拉取后合并执行。
+     */
+    [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
+    OffloadObjectHeartbeatTo(const std::string& address, const UUID& client_id,
+                             bool enable_offloading);
+
+    /**
      * @brief Poll whether master has requested a full SSD clear.
      * @return true if client should clear all SSD files
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAll();
 
+    /**
+     * @brief 定向 PollRemoveAll：向指定 submaster 查询是否要求全量清空
+     * SSD（不切换当前连接）。与 LOCAL_DISK 段全量挂载对称。
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAllTo(
+        const std::string& address, const UUID& client_id);
+
     [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
+
+    /**
+     * @brief 定向 ReportSsdCapacity：向指定 submaster 上报 SSD 容量（不切换
+     * 当前连接）。多 submaster 下每个 master 各自维护 LocalDiskSegment
+     * 记账，容量需广播到所有已挂载的 submaster。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacityTo(
+        const std::string& address, const UUID& client_id,
+        int64_t ssd_total_capacity_bytes);
 
     /**
      * @brief Adds multiple new objects to a specified client in batch.
@@ -575,6 +638,17 @@ class MasterClient {
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    /**
+     * @brief 定向 NotifyOffloadSuccess：向指定 submaster 上报卸载结果（不
+     * 切换当前连接）。多 submaster 下 worker 完成落盘后须按 task 的 slot
+     * 归属定向发给 owner master，避免通知因业务地址切换落到非 owner 上
+     * （master 侧已加 slot 归属校验拒绝错投）。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccessTo(
+        const std::string& address, const UUID& client_id,
+        const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
     [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
     GetOffloadEndpoints();
 
@@ -587,11 +661,30 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
     PromotionObjectHeartbeat(const UUID& client_id);
 
+    /**
+     * @brief 定向 PromotionObjectHeartbeat：向指定 submaster 拉取该 master
+     * slot 的晋升任务（不切换当前连接）。与 OffloadObjectHeartbeatTo 对称。
+     */
+    [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+    PromotionObjectHeartbeatTo(const std::string& address,
+                               const UUID& client_id);
+
     /** Fetch pending remove tasks without removing them from the queue. */
     [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
     RemoveObjectHeartbeat(const UUID& client_id);
     tl::expected<void, ErrorCode> AckRemoveObjectHeartbeat(
         const UUID& client_id, const std::vector<RemoveTaskItem>& tasks);
+
+    /**
+     * @brief 定向 RemoveObjectHeartbeat / AckRemoveObjectHeartbeat：向指定
+     * submaster 拉取/确认 SSD tombstone 任务（不切换当前连接）。多
+     * submaster 下 removed_keys 队列按 owner 分布，需逐 master 拉取。
+     */
+    [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeatTo(const std::string& address, const UUID& client_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> AckRemoveObjectHeartbeatTo(
+        const std::string& address, const UUID& client_id,
+        const std::vector<RemoveTaskItem>& tasks);
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
@@ -608,6 +701,19 @@ class MasterClient {
                         const std::vector<std::string>& preferred_segments);
 
     /**
+     * @brief 定向 PromotionAllocStart：向指定 submaster 申请晋升 staging
+     * 副本（不切换当前连接）。promotion 任务状态（promotion_tasks 条目 +
+     * staged 副本）只存在于派发该任务的 source master 内存中，执行链
+     *（AllocStart→TE write→Success/Failure）必须回到 source master 闭环，
+     * 故按任务来源定向而非按 slot 现算 owner。
+     */
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStartTo(const std::string& address, const UUID& client_id,
+                          const std::string& key, const std::string& tenant_id,
+                          uint64_t size,
+                          const std::vector<std::string>& preferred_segments);
+
+    /**
      * @brief Release master-side promotion task state after a client-side
      * failure that prevents the holder from calling NotifyPromotionSuccess.
      * Idempotent; returns OK if the task was already swept by the reaper.
@@ -618,6 +724,11 @@ class MasterClient {
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
 
+    /** 定向 NotifyPromotionFailure：向任务来源 master 释放任务状态。 */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailureTo(
+        const std::string& address, const UUID& client_id,
+        const std::string& key, const std::string& tenant_id);
+
     /**
      * @brief Commit a staged MEMORY replica to COMPLETE; called after the
      * client has written the bytes via Transfer Engine.
@@ -627,6 +738,11 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const UUID& client_id, const std::string& key,
         const std::string& tenant_id);
+
+    /** 定向 NotifyPromotionSuccess：向任务来源 master 提交晋升结果。 */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccessTo(
+        const std::string& address, const UUID& client_id,
+        const std::string& key, const std::string& tenant_id);
 
     /**
      * @brief Start a copy operation

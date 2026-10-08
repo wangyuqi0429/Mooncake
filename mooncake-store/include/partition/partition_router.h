@@ -34,9 +34,20 @@ class PartitionRouter {
     // slot → submaster_id（primary_master_id）；未命中返回 nullopt。
     std::optional<std::string> ResolveSubmaster(uint16_t slot) const;
 
+    // 与 ResolveSubmaster 语义相同，但 miss 不打日志。供批量分组路径
+    // （如 offload 完成通知按 slot owner 分组定向）使用，由调用方聚合
+    // 计数后打一条汇总，避免逐 key 刷屏。
+    std::optional<std::string> ResolveSubmasterQuiet(uint16_t slot) const;
+
     // key → submaster_id（先哈希再路由）；未命中返回 nullopt。
     std::optional<std::string> Route(const TenantId& tenant,
                                      const std::string& key) const;
+
+    // 枚举路由表中所有 primary submaster 地址（去重、保持首次出现顺序）。
+    // master_id 的值即 RPC 端点 address，故 rank_to_primary_ / 兼容表的值
+    // 可直接作为定向 RPC 目标。空表（单 master 模式）返回空 vector，
+    // 调用方据此回退非定向路径。
+    std::vector<std::string> GetAllPrimaryAddresses() const;
 
     void Clear();
     size_t Size() const;

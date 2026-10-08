@@ -1,6 +1,7 @@
 #include "file_storage.h"
 
 #include <cmath>
+#include <iterator>
 #include <locale>
 #include <memory>
 #include <numeric>
@@ -349,23 +350,62 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
-        auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
-        if (!mount_file_storage_result) {
-            LOG(ERROR) << "Failed to mount file storage: "
-                       << mount_file_storage_result.error();
-            return mount_file_storage_result;
+        // 多 submaster：LOCAL_DISK 段与内存段对称，全量挂载到所有
+        // primary submaster（任一成功即可，单点失败告警不阻断），
+        // 使任何 slot owner 都能本地执行 offload 决策。单 master 模式
+        //（地址列表为空）走原有单点挂载。
+        const auto submaster_addresses = client_->GetSubmasterAddresses();
+        if (!submaster_addresses.empty()) {
+            bool any_mounted = false;
+            for (const auto& addr : submaster_addresses) {
+                auto mount_result =
+                    client_->MountLocalDiskSegmentTo(addr, enable_offloading_);
+                if (mount_result) {
+                    any_mounted = true;
+                } else {
+                    LOG(WARNING)
+                        << "MountLocalDiskSegmentTo failed (continuing): addr="
+                        << addr << " error=" << mount_result.error();
+                }
+            }
+            if (!any_mounted) {
+                LOG(ERROR) << "Failed to mount file storage to any submaster";
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+        } else {
+            auto mount_file_storage_result =
+                client_->MountLocalDiskSegment(enable_offloading_);
+            if (!mount_file_storage_result) {
+                LOG(ERROR) << "Failed to mount file storage: "
+                           << mount_file_storage_result.error();
+                return mount_file_storage_result;
+            }
         }
     }
     // Report configured SSD capacity to Master so it can populate
     // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
     // Called once at init; old Masters that lack this RPC will log an error
-    // but FileStorage continues normally.
+    // but FileStorage continues normally. 多 submaster 下每个 master 各自
+    // 维护 LocalDiskSegment 记账，容量广播到所有 submaster。
     if (config_.total_size_limit > 0) {
-        auto cap_result = client_->ReportSsdCapacity(config_.total_size_limit);
-        if (!cap_result) {
-            LOG(WARNING) << "ReportSsdCapacity failed (old Master?): "
-                         << cap_result.error();
+        const auto submaster_addresses = client_->GetSubmasterAddresses();
+        if (!submaster_addresses.empty()) {
+            for (const auto& addr : submaster_addresses) {
+                auto cap_result = client_->ReportSsdCapacityTo(
+                    addr, config_.total_size_limit);
+                if (!cap_result) {
+                    LOG(WARNING) << "ReportSsdCapacityTo failed (old Master?): "
+                                 << "addr=" << addr << " "
+                                 << cap_result.error();
+                }
+            }
+        } else {
+            auto cap_result =
+                client_->ReportSsdCapacity(config_.total_size_limit);
+            if (!cap_result) {
+                LOG(WARNING) << "ReportSsdCapacity failed (old Master?): "
+                             << cap_result.error();
+            }
         }
     }
 
@@ -377,7 +417,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             }
             auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
             auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
+                client_->NotifyOffloadSuccessRouted(tasks, metadatas);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -510,19 +550,21 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
-    const std::vector<OffloadTaskItem>& offloading_objects) {
+    const std::vector<Client::SourcedOffloadTask>& offloading_objects) {
     if (offloading_objects.empty()) {
         return {};
     }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
-    std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
+    std::unordered_map<std::string, Client::SourcedOffloadTask>
+        task_by_storage_key;
     storage_object_sizes.reserve(offloading_objects.size());
     task_by_storage_key.reserve(offloading_objects.size());
-    for (const auto& task : offloading_objects) {
+    for (const auto& sourced_task : offloading_objects) {
+        const auto& task = sourced_task.task;
         const auto storage_key =
             TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
-        task_by_storage_key.emplace(storage_key, task);
+        task_by_storage_key.emplace(storage_key, sourced_task);
     }
 
     std::vector<std::vector<std::string>> buckets_keys;
@@ -551,7 +593,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         for (auto& metadata : metadatas) {
             metadata.transport_endpoint = local_rpc_addr_;
         }
-        std::vector<OffloadTaskItem> tasks;
+        std::vector<Client::SourcedOffloadTask> tasks;
         tasks.reserve(keys.size());
         for (const auto& key : keys) {
             auto it = task_by_storage_key.find(key);
@@ -561,9 +603,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             tasks.push_back(it->second);
         }
-        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+        auto result = client_->NotifyOffloadSuccessRouted(tasks, metadatas);
         if (!result) {
-            LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess failed with error: "
+            LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccessRouted failed with "
+                          "error: "
                        << result.error() << " keys count: " << keys.size();
             return result.error();
         }
@@ -573,7 +616,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // Collect keys drained from master queue but not actually offloaded.
     // Report them back with data_size=-1 sentinel so the master can clean up
     // orphaned offloading_tasks and release source replica refcounts.
-    std::vector<OffloadTaskItem> failed_tasks;
+    // NACK 哨兵由 Routed 投回 source master（任务状态只在 source 上）。
+    std::vector<Client::SourcedOffloadTask> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
 
     for (const auto& keys : buckets_keys) {
@@ -584,7 +628,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         for (const auto& storage_key : keys) {
             const auto it = task_by_storage_key.find(storage_key);
             if (it != task_by_storage_key.end()) {
-                storage_keys_by_tenant[it->second.tenant_id].push_back(
+                storage_keys_by_tenant[it->second.task.tenant_id].push_back(
                     storage_key);
             }
         }
@@ -592,7 +636,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             std::vector<std::string> user_keys;
             user_keys.reserve(storage_keys.size());
             for (const auto& storage_key : storage_keys) {
-                user_keys.push_back(task_by_storage_key.at(storage_key).key);
+                user_keys.push_back(task_by_storage_key.at(storage_key).task.key);
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
@@ -602,12 +646,12 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             // OK. Keys present in user_batch_object go to batch_object; the
             // rest are reported as failed.
             for (const auto& storage_key : storage_keys) {
-                const auto& task = task_by_storage_key.at(storage_key);
-                auto it = user_batch_object.find(task.key);
+                const auto& sourced_task = task_by_storage_key.at(storage_key);
+                auto it = user_batch_object.find(sourced_task.task.key);
                 if (it != user_batch_object.end()) {
                     batch_object.emplace(storage_key, std::move(it->second));
                 } else {
-                    failed_tasks.push_back(task);
+                    failed_tasks.push_back(sourced_task);
                 }
             }
         }
@@ -721,10 +765,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
         }
         auto result =
-            client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
+            client_->NotifyOffloadSuccessRouted(failed_tasks, failed_metadatas);
         if (!result) {
-            LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed tasks "
-                            "returned error: "
+            LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccessRouted for failed "
+                            "tasks returned error: "
                          << result.error() << " count: " << failed_tasks.size();
         }
     }
@@ -851,116 +895,248 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         });
     }
 
-    // === STEP 0: Drain removed keys from master ===
+    // === STEP 0: Drain removed keys from master(s) ===
     // Master pushes {tenant_id, key} pairs to this client's removed_keys
     // queue when a Remove/BatchRemove deletes a key that had a LOCAL_DISK
     // replica here. We mark each as a tombstone so GC can reclaim SSD space.
+    // 多 submaster：removed_keys 队列按 slot owner 分布在各 master，逐
+    // master 拉取 + 确认（addr 为空表示单 master 模式的非定向调用）。
     {
-        auto remove_result =
-            client_->RemoveObjectHeartbeat(client_->getClientId());
-        if (remove_result) {
-            bool all_marked = true;
-            for (const auto& item : remove_result.value()) {
-                auto storage_key =
-                    TenantId(item.tenant_id).MakeScopedKey(item.key);
-                auto mark_result = storage_backend_->MarkRemoved(storage_key);
-                if (!mark_result) {
-                    all_marked = false;
-                    LOG(ERROR) << "Failed to persist remove tombstone: "
-                               << mark_result.error();
-                    break;
+        const auto drain_removed_keys = [this](const std::string& addr) {
+            auto remove_result =
+                addr.empty()
+                    ? client_->RemoveObjectHeartbeat(client_->getClientId())
+                    : client_->RemoveObjectHeartbeatTo(addr);
+            if (remove_result) {
+                bool all_marked = true;
+                for (const auto& item : remove_result.value()) {
+                    auto storage_key =
+                        TenantId(item.tenant_id).MakeScopedKey(item.key);
+                    auto mark_result =
+                        storage_backend_->MarkRemoved(storage_key);
+                    if (!mark_result) {
+                        all_marked = false;
+                        LOG(ERROR) << "Failed to persist remove tombstone: "
+                                   << mark_result.error();
+                        break;
+                    }
+                }
+                if (all_marked && !remove_result.value().empty()) {
+                    auto ack_result =
+                        addr.empty()
+                            ? client_->AckRemoveObjectHeartbeat(
+                                  client_->getClientId(),
+                                  remove_result.value())
+                            : client_->AckRemoveObjectHeartbeatTo(
+                                  addr, remove_result.value());
+                    if (!ack_result) {
+                        LOG(ERROR) << "Failed to ACK remove tasks: "
+                                   << ack_result.error();
+                    }
+                    VLOG(1) << "RemoveObjectHeartbeat processed "
+                            << remove_result.value().size()
+                            << " removed key(s), addr=" << addr;
                 }
             }
-            if (all_marked && !remove_result.value().empty()) {
-                auto ack_result = client_->AckRemoveObjectHeartbeat(
-                    client_->getClientId(), remove_result.value());
-                if (!ack_result) {
-                    LOG(ERROR) << "Failed to ACK remove tasks: "
-                               << ack_result.error();
-                }
-                VLOG(1) << "RemoveObjectHeartbeat processed "
-                        << remove_result.value().size()
-                        << " removed key(s) from master";
+            // Errors are non-fatal: removed keys will be retried next
+            // heartbeat.
+        };
+        const auto submaster_addresses = client_->GetSubmasterAddresses();
+        if (submaster_addresses.empty()) {
+            drain_removed_keys(std::string());
+        } else {
+            for (const auto& addr : submaster_addresses) {
+                drain_removed_keys(addr);
             }
         }
-        // Errors are non-fatal: removed keys will be retried next heartbeat.
     }
 
-    std::vector<OffloadTaskItem>
-        offloading_objects;  // Objects selected for offloading
+    std::vector<Client::SourcedOffloadTask>
+        offloading_objects;  // Objects selected for offloading (source-tagged)
 
     // === STEP 1: Send heartbeat and get offloading decisions ===
+    // 多 submaster：各 master 的 offloading_objects 队列只含自己 slot 的
+    // 任务，逐 master 定向拉取后合并；单 master 模式保留原有单点路径。
     {
         MutexLocker locker(&offloading_mutex_);
-        auto heartbeat_result = client_->OffloadObjectHeartbeat(
-            enable_offloading_, offloading_objects);
-        if (!heartbeat_result) {
-            ErrorCode err = heartbeat_result.error();
-            if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-                // Master lost our LOCAL_DISK segment (likely restarted).
-                // Re-register the segment, retry the heartbeat, and
-                // trigger async ScanMeta to re-register object metadata.
-                LOG(WARNING) << "OffloadObjectHeartbeat returned "
-                             << "SEGMENT_NOT_FOUND, attempting to "
-                             << "re-register local disk segment and "
-                             << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
-                if (remount_result) {
-                    // Report configured SSD capacity so the Master can
-                    // restore file_total_capacity_ (the denominator in
-                    // "SSD Storage: X / Y").  This was lost on restart;
-                    // re-reporting it here avoids the 0 B display.
-                    if (config_.total_size_limit > 0) {
-                        auto cap_result = client_->ReportSsdCapacity(
-                            config_.total_size_limit);
-                        if (!cap_result) {
-                            LOG(WARNING)
-                                << "ReportSsdCapacity failed during "
-                                << "heartbeat recovery: " << cap_result.error();
+        const auto submaster_addresses = client_->GetSubmasterAddresses();
+        if (submaster_addresses.empty()) {
+            std::vector<OffloadTaskItem> plain_tasks;
+            auto heartbeat_result = client_->OffloadObjectHeartbeat(
+                enable_offloading_, plain_tasks);
+            if (!heartbeat_result) {
+                ErrorCode err = heartbeat_result.error();
+                if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+                    // Master lost our LOCAL_DISK segment (likely restarted).
+                    // Re-register the segment, retry the heartbeat, and
+                    // trigger async ScanMeta to re-register object metadata.
+                    LOG(WARNING) << "OffloadObjectHeartbeat returned "
+                                 << "SEGMENT_NOT_FOUND, attempting to "
+                                 << "re-register local disk segment and "
+                                 << "re-register object metadata";
+                    auto remount_result =
+                        client_->MountLocalDiskSegment(enable_offloading_);
+                    if (remount_result) {
+                        // Report configured SSD capacity so the Master can
+                        // restore file_total_capacity_ (the denominator in
+                        // "SSD Storage: X / Y").  This was lost on restart;
+                        // re-reporting it here avoids the 0 B display.
+                        if (config_.total_size_limit > 0) {
+                            auto cap_result = client_->ReportSsdCapacity(
+                                config_.total_size_limit);
+                            if (!cap_result) {
+                                LOG(WARNING)
+                                    << "ReportSsdCapacity failed during "
+                                    << "heartbeat recovery: "
+                                    << cap_result.error();
+                            }
                         }
-                    }
-                    heartbeat_result = client_->OffloadObjectHeartbeat(
-                        enable_offloading_, offloading_objects);
-                    if (!heartbeat_result) {
-                        LOG(ERROR) << "Heartbeat failed after re-registration: "
-                                   << heartbeat_result.error();
-                        return heartbeat_result;
-                    }
-                    // Master lost all object metadata on restart.
-                    // Trigger async ScanMeta to re-register them,
-                    // same as what Init() does on startup.
-                    if (!rescan_future_.valid()) {
-                        LOG(INFO) << "Triggering background metadata rescan "
-                                  << "after LOCAL_DISK segment re-registration";
-                        metadata_resync_pending_.store(true);
-                        rescan_future_ =
-                            std::async(std::launch::async, [this]() {
-                                auto result = ReRegisterOffloadedObjects();
-                                if (!result) {
-                                    LOG(ERROR) << "Background metadata rescan "
+                        heartbeat_result = client_->OffloadObjectHeartbeat(
+                            enable_offloading_, plain_tasks);
+                        if (!heartbeat_result) {
+                            LOG(ERROR)
+                                << "Heartbeat failed after re-registration: "
+                                << heartbeat_result.error();
+                            return heartbeat_result;
+                        }
+                        // Master lost all object metadata on restart.
+                        // Trigger async ScanMeta to re-register them,
+                        // same as what Init() does on startup.
+                        if (!rescan_future_.valid()) {
+                            LOG(INFO) << "Triggering background metadata "
+                                         "rescan after LOCAL_DISK segment "
+                                         "re-registration";
+                            metadata_resync_pending_.store(true);
+                            rescan_future_ =
+                                std::async(std::launch::async, [this]() {
+                                    auto result = ReRegisterOffloadedObjects();
+                                    if (!result) {
+                                        LOG(ERROR)
+                                            << "Background metadata rescan "
                                                << "failed: " << result.error();
-                                } else {
-                                    metadata_resync_pending_.store(false);
-                                }
-                            });
+                                    } else {
+                                        metadata_resync_pending_.store(false);
+                                    }
+                                });
+                        }
+                    } else {
+                        LOG(ERROR) << "Failed to re-register local disk "
+                                      "segment: "
+                                   << remount_result.error();
+                        return tl::make_unexpected(remount_result.error());
                     }
                 } else {
-                    LOG(ERROR) << "Failed to re-register local disk segment: "
-                               << remount_result.error();
-                    return tl::make_unexpected(remount_result.error());
+                    LOG(ERROR) << "Failed to send heartbeat with error: " << err;
+                    return heartbeat_result;
                 }
-            } else {
-                LOG(ERROR) << "Failed to send heartbeat with error: " << err;
-                return heartbeat_result;
+            }
+            // 单 master：source 置空（Routed 的单 master 分支等价于非定向
+            // NotifyOffloadSuccess）。
+            offloading_objects.reserve(plain_tasks.size());
+            for (auto& task : plain_tasks) {
+                offloading_objects.push_back(
+                    Client::SourcedOffloadTask{std::move(task), std::string()});
+            }
+        } else {
+            for (const auto& addr : submaster_addresses) {
+                std::vector<OffloadTaskItem> per_master_tasks;
+                auto heartbeat_result = client_->OffloadObjectHeartbeatTo(
+                    addr, enable_offloading_, per_master_tasks);
+                if (!heartbeat_result) {
+                    if (heartbeat_result.error() ==
+                        ErrorCode::SEGMENT_NOT_FOUND) {
+                        // 该 submaster 丢失本 client 的 LOCAL_DISK 段
+                        //（如重启）：定向重挂该 submaster + 容量重报 + 重试
+                        // 一次拉取。单个 submaster 的失败不阻断其他
+                        // submaster 的任务拉取。
+                        LOG(WARNING)
+                            << "OffloadObjectHeartbeatTo returned "
+                            << "SEGMENT_NOT_FOUND from addr=" << addr
+                            << ", re-registering local disk segment there";
+                        auto remount_result = client_->MountLocalDiskSegmentTo(
+                            addr, enable_offloading_);
+                        if (remount_result) {
+                            if (config_.total_size_limit > 0) {
+                                (void)client_->ReportSsdCapacityTo(
+                                    addr, config_.total_size_limit);
+                            }
+                            auto retry_result = client_->OffloadObjectHeartbeatTo(
+                                addr, enable_offloading_, per_master_tasks);
+                            if (!retry_result) {
+                                LOG(WARNING)
+                                    << "Heartbeat to " << addr
+                                    << " failed after re-registration: "
+                                    << retry_result.error();
+                                continue;
+                            }
+                            // 重挂的 submaster 丢失了全部对象元数据，
+                            // 触发一次后台 ScanMeta 重注册（Routed 通知
+                            // 会按各自 slot owner 定向投递）。
+                            if (!rescan_future_.valid()) {
+                                LOG(INFO) << "Triggering background metadata "
+                                             "rescan after LOCAL_DISK segment "
+                                             "re-registration on " << addr;
+                                metadata_resync_pending_.store(true);
+                                rescan_future_ =
+                                    std::async(std::launch::async, [this]() {
+                                        auto result =
+                                            ReRegisterOffloadedObjects();
+                                        if (!result) {
+                                            LOG(ERROR)
+                                                << "Background metadata rescan "
+                                                   << "failed: "
+                                                   << result.error();
+                                        } else {
+                                            metadata_resync_pending_.store(
+                                                false);
+                                        }
+                                    });
+                            }
+                        } else {
+                            LOG(WARNING)
+                                << "Failed to re-register local disk segment "
+                                   "on addr="
+                                << addr << ": " << remount_result.error();
+                            continue;
+                        }
+                    } else {
+                        // 其他错误：告警后继续拉取其他 submaster。
+                        LOG(WARNING) << "OffloadObjectHeartbeatTo failed, addr="
+                                     << addr << " error="
+                                     << heartbeat_result.error();
+                        continue;
+                    }
+                }
+                // 记录任务来源：完成通知按 slot owner 定向投递；slot 已
+                // 迁离 source 时双投 source 一份用于清理任务状态（源副本
+                // refcnt pin + offloading_tasks 条目）。
+                for (auto& task : per_master_tasks) {
+                    offloading_objects.push_back(
+                        Client::SourcedOffloadTask{std::move(task), addr});
+                }
             }
         }
     }
 
     // === STEP 2: Poll whether master requested a full SSD clear ===
-    auto remove_all_result = client_->PollRemoveAll();
-    if (remove_all_result && remove_all_result.value()) {
-        RemoveAll();
+    // 多 submaster：任一 master 要求即执行本地全量清空（物理 SSD 只有一
+    // 份，RemoveAll 幂等，无需重复执行）。
+    {
+        const auto submaster_addresses = client_->GetSubmasterAddresses();
+        if (submaster_addresses.empty()) {
+            auto remove_all_result = client_->PollRemoveAll();
+            if (remove_all_result && remove_all_result.value()) {
+                RemoveAll();
+            }
+        } else {
+            for (const auto& addr : submaster_addresses) {
+                auto remove_all_result = client_->PollRemoveAllTo(addr);
+                if (remove_all_result && remove_all_result.value()) {
+                    RemoveAll();
+                    break;
+                }
+            }
+        }
     }
 
     // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
@@ -1012,145 +1188,256 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<PromotionTaskItem> promotion_objects;
-    auto heartbeat_result =
-        client_->PromotionObjectHeartbeat(promotion_objects);
-    if (!heartbeat_result) {
-        // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and the
-        // first heartbeat tick if the master forgets us (e.g. across a master
-        // restart): benign no-op until next ReMount.
-        if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
-            return {};
-        }
-        LOG(WARNING) << "PromotionObjectHeartbeat failed: "
-                     << heartbeat_result.error();
-        return tl::make_unexpected(heartbeat_result.error());
-    }
-    if (promotion_objects.empty()) {
-        return {};
-    }
+    // 任务执行体：addr 为空 = 单 master 非定向调用；否则定向回 source
+    // master 闭环——promotion 任务状态（promotion_tasks 条目 + staged
+    // PROCESSING 副本）只存在于派发该任务的 master 内存中，执行链
+    // AllocStart→TE write→Success/Failure 必须回到同一个 master。
+    const auto process_tasks_from =
+        [this](const std::string& addr,
+               std::vector<PromotionTaskItem>& promotion_objects) {
+            // No segment preference from the client: let master pick from
+            // any DRAM segment.
+            const std::vector<std::string> preferred_segments;
 
-    VLOG(1) << "ProcessPromotionTasks pulled " << promotion_objects.size()
-            << " promotion candidate(s) from master";
+            // The master caps per-heartbeat work via PromotionObjectHeartbeat,
+            // returning at most one task per call so the heartbeat thread stays
+            // within the client-liveness window even for large objects.
+            // Leftover work stays queued in the master's promotion_objects
+            // map and is returned on subsequent heartbeats; we process
+            // whatever we received here without a second client-side cap.
+            for (const auto& task : promotion_objects) {
+                const auto& key = task.key;
+                const auto& tenant_id = task.tenant_id;
+                const int64_t size = task.size;
+                const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
+                if (size <= 0) {
+                    LOG(WARNING) << "Skipping promotion for key=" << key
+                                 << " with non-positive size=" << size;
+                    continue;
+                }
 
-    // No segment preference from the client: let master pick from any
-    // DRAM segment.
-    const std::vector<std::string> preferred_segments;
+                auto alloc_result =
+                    addr.empty()
+                        ? client_->PromotionAllocStart(
+                              key, tenant_id, static_cast<uint64_t>(size),
+                              preferred_segments)
+                        : client_->PromotionAllocStartTo(
+                              addr, key, tenant_id,
+                              static_cast<uint64_t>(size),
+                              preferred_segments);
+                if (!alloc_result) {
+                    // AllocStart failed (typically NO_AVAILABLE_HANDLE under
+                    // DRAM pressure). No staged buffer to release, but the
+                    // task entry already claimed a promotion_in_flight_ slot
+                    // at admission. Notify the master to release it
+                    // immediately; otherwise the slot stays pinned for the
+                    // reaper TTL (~10 min default), turning transient DRAM
+                    // pressure into a sustained outage of
+                    // promotion_queue_limit_. Notify is idempotent and
+                    // handles alloc_id == 0 correctly.
+                    VLOG(1) << "PromotionAllocStart failed for key=" << key
+                            << ", error=" << alloc_result.error()
+                            << " (likely no free DRAM); releasing master slot";
+                    auto release =
+                        addr.empty()
+                            ? client_->NotifyPromotionFailure(key, tenant_id)
+                            : client_->NotifyPromotionFailureTo(addr, key,
+                                                               tenant_id);
+                    if (!release) {
+                        VLOG(1)
+                            << "Promotion: NotifyPromotionFailure failed for "
+                               "key="
+                            << key << ", error=" << release.error()
+                            << "; master reaper will reclaim on TTL expiry";
+                    }
+                    continue;
+                }
 
-    // The master caps per-heartbeat work via PromotionObjectHeartbeat,
-    // returning at most one task per call so the heartbeat thread stays
-    // within the client-liveness window even for large objects. Leftover
-    // work stays queued in the master's promotion_objects map and is
-    // returned on subsequent heartbeats; we process whatever we received
-    // here without a second client-side cap.
-    for (const auto& task : promotion_objects) {
-        const auto& key = task.key;
-        const auto& tenant_id = task.tenant_id;
-        const int64_t size = task.size;
-        const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
-        if (size <= 0) {
-            LOG(WARNING) << "Skipping promotion for key=" << key
-                         << " with non-positive size=" << size;
-            continue;
-        }
+                // Every failure path past this point has a master-side
+                // staged PROCESSING MEMORY buffer and an incremented
+                // in-flight slot. Eagerly notify the master on failure so
+                // the buffer is reclaimed and the slot is freed; otherwise
+                // transient SSD throttling or RDMA flakes saturate
+                // promotion_queue_limit_ for the full reaper TTL.
+                // NotifyPromotionFailure is idempotent and best-effort —
+                // the reaper is the long-stop.
+                auto release_master_state =
+                    [this, &addr, &key, &tenant_id]() {
+                        auto release =
+                            addr.empty()
+                                ? client_->NotifyPromotionFailure(key,
+                                                                  tenant_id)
+                                : client_->NotifyPromotionFailureTo(
+                                      addr, key, tenant_id);
+                        if (!release) {
+                            VLOG(1)
+                                << "Promotion: NotifyPromotionFailure failed "
+                                   "for key="
+                                << key << ", error=" << release.error()
+                                << "; master reaper will reclaim on TTL "
+                                   "expiry";
+                        }
+                    };
 
-        auto alloc_result = client_->PromotionAllocStart(
-            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
-        if (!alloc_result) {
-            // AllocStart failed (typically NO_AVAILABLE_HANDLE under
-            // DRAM pressure). No staged buffer to release, but the
-            // task entry already claimed a promotion_in_flight_ slot
-            // at admission. Notify the master to release it
-            // immediately; otherwise the slot stays pinned for the
-            // reaper TTL (~10 min default), turning transient DRAM
-            // pressure into a sustained outage of promotion_queue_limit_.
-            // Notify is idempotent and handles alloc_id == 0 correctly.
-            VLOG(1) << "PromotionAllocStart failed for key=" << key
-                    << ", error=" << alloc_result.error()
-                    << " (likely no free DRAM); releasing master slot";
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
-            if (!release) {
-                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                        << key << ", error=" << release.error()
-                        << "; master reaper will reclaim on TTL expiry";
-            }
-            continue;
-        }
+                // (a) Allocate an O_DIRECT-aligned staging buffer and read
+                // the bytes from the local SSD backend into it.
+                // AllocateBatch returns a shared_ptr<AllocatedBatch> whose
+                // BufferHandles RAII-release the staging space when the
+                // local goes out of scope.
+                std::vector<std::string> single_key{storage_key};
+                std::vector<int64_t> single_size{size};
+                auto allocate_res = AllocateBatch(single_key, single_size);
+                if (!allocate_res) {
+                    LOG(WARNING) << "Promotion: AllocateBatch failed for key="
+                                << key << ", error=" << allocate_res.error();
+                    release_master_state();
+                    continue;
+                }
+                auto staging = allocate_res.value();
+                auto load_res = BatchLoad(staging->slices);
+                if (!load_res) {
+                    LOG(WARNING) << "Promotion: BatchLoad failed for key="
+                                << key << ", error=" << load_res.error();
+                    release_master_state();
+                    continue;
+                }
 
-        // Every failure path past this point has a master-side staged
-        // PROCESSING MEMORY buffer and an incremented in-flight slot.
-        // Eagerly notify the master on failure so the buffer is
-        // reclaimed and the slot is freed; otherwise transient SSD
-        // throttling or RDMA flakes saturate promotion_queue_limit_
-        // for the full reaper TTL. NotifyPromotionFailure is
-        // idempotent and best-effort — the reaper is the long-stop.
-        auto release_master_state = [this, &key, &tenant_id]() {
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
-            if (!release) {
-                VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
-                        << key << ", error=" << release.error()
-                        << "; master reaper will reclaim on TTL expiry";
+                // (b) TE-write from the staging slice into the
+                // freshly-allocated MEMORY replica. Slice ptr may have
+                // been bumped by O_DIRECT offset correction in BatchLoad,
+                // so re-read it from the slice map.
+                auto slice_it = staging->slices.find(storage_key);
+                if (slice_it == staging->slices.end()) {
+                    LOG(WARNING) << "Promotion: staging slice missing for key="
+                                << key;
+                    release_master_state();
+                    continue;
+                }
+                std::vector<Slice> tx_slices{slice_it->second};
+                ErrorCode write_err = client_->PromotionWrite(
+                    alloc_result.value().memory_descriptor, tx_slices);
+                if (write_err != ErrorCode::OK) {
+                    LOG(WARNING) << "Promotion: TransferWrite failed for key="
+                                 << key << ", error=" << write_err;
+                    release_master_state();
+                    continue;
+                }
+
+                // (c) Commit. Master flips the PROCESSING replica to
+                // COMPLETE and it becomes visible to readers.
+                auto notify_res =
+                    addr.empty()
+                        ? client_->NotifyPromotionSuccess(key, tenant_id)
+                        : client_->NotifyPromotionSuccessTo(addr, key,
+                                                            tenant_id);
+                if (!notify_res) {
+                    // The write landed but the commit failed. We can't
+                    // retry the commit (the success path is one-shot via
+                    // alloc_id), and we don't know whether the failure was
+                    // transient or structural. Release the master-side
+                    // state so the slot is reusable; the bytes we wrote
+                    // become stranded under a soon-to-be-erased PROCESSING
+                    // replica, which is harmless.
+                    LOG(WARNING)
+                        << "Promotion: NotifyPromotionSuccess failed for key="
+                        << key << ", error=" << notify_res.error();
+                    release_master_state();
+                    continue;
+                }
+
+                VLOG(1) << "Promotion completed for key=" << key
+                        << ", size=" << size << ", addr=" << addr;
             }
         };
 
-        // (a) Allocate an O_DIRECT-aligned staging buffer and read the bytes
-        // from the local SSD backend into it. AllocateBatch returns a
-        // shared_ptr<AllocatedBatch> whose BufferHandles RAII-release the
-        // staging space when the local goes out of scope.
-        std::vector<std::string> single_key{storage_key};
-        std::vector<int64_t> single_size{size};
-        auto allocate_res = AllocateBatch(single_key, single_size);
-        if (!allocate_res) {
-            LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
-                         << ", error=" << allocate_res.error();
-            release_master_state();
-            continue;
+    const auto submaster_addresses = client_->GetSubmasterAddresses();
+    if (submaster_addresses.empty()) {
+        // 单 master 模式：原有非定向路径。
+        std::vector<PromotionTaskItem> promotion_objects;
+        auto heartbeat_result =
+            client_->PromotionObjectHeartbeat(promotion_objects);
+        if (!heartbeat_result) {
+            // SEGMENT_NOT_FOUND happens between MountLocalDiskSegment and
+            // the first heartbeat tick if the master forgets us (e.g.
+            // across a master restart): benign no-op until next ReMount.
+            if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+                return {};
+            }
+            LOG(WARNING) << "PromotionObjectHeartbeat failed: "
+                         << heartbeat_result.error();
+            return tl::make_unexpected(heartbeat_result.error());
         }
-        auto staging = allocate_res.value();
-        auto load_res = BatchLoad(staging->slices);
-        if (!load_res) {
-            LOG(WARNING) << "Promotion: BatchLoad failed for key=" << key
-                         << ", error=" << load_res.error();
-            release_master_state();
-            continue;
-        }
-
-        // (b) TE-write from the staging slice into the freshly-allocated
-        // MEMORY replica. Slice ptr may have been bumped by O_DIRECT offset
-        // correction in BatchLoad, so re-read it from the slice map.
-        auto slice_it = staging->slices.find(storage_key);
-        if (slice_it == staging->slices.end()) {
-            LOG(WARNING) << "Promotion: staging slice missing for key=" << key;
-            release_master_state();
-            continue;
-        }
-        std::vector<Slice> tx_slices{slice_it->second};
-        ErrorCode write_err = client_->PromotionWrite(
-            alloc_result.value().memory_descriptor, tx_slices);
-        if (write_err != ErrorCode::OK) {
-            LOG(WARNING) << "Promotion: TransferWrite failed for key=" << key
-                         << ", error=" << write_err;
-            release_master_state();
-            continue;
+        if (promotion_objects.empty()) {
+            return {};
         }
 
-        // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
-        // becomes visible to readers.
-        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
-        if (!notify_res) {
-            // The write landed but the commit failed. We can't retry the
-            // commit (the success path is one-shot via alloc_id), and we
-            // don't know whether the failure was transient or structural.
-            // Release the master-side state so the slot is reusable; the
-            // bytes we wrote become stranded under a soon-to-be-erased
-            // PROCESSING replica, which is harmless.
-            LOG(WARNING) << "Promotion: NotifyPromotionSuccess failed for key="
-                         << key << ", error=" << notify_res.error();
-            release_master_state();
+        VLOG(1) << "ProcessPromotionTasks pulled "
+                << promotion_objects.size()
+                << " promotion candidate(s) from master";
+        process_tasks_from(std::string(), promotion_objects);
+        return {};
+    }
+
+    // 多 submaster：各 master 的 promotion_objects 队列只含自己 slot 的
+    // 任务，逐 master 定向拉取后就地对该 master 执行完整链路（拉取→
+    // AllocStart→write→commit 全部回到 source master，天然闭环，无需
+    // 跨 master 分组）。单个 master 的拉取/执行失败不阻断其他 master。
+    for (const auto& addr : submaster_addresses) {
+        std::vector<PromotionTaskItem> promotion_objects;
+        auto heartbeat_result =
+            client_->PromotionObjectHeartbeatTo(addr, promotion_objects);
+        if (!heartbeat_result) {
+            if (heartbeat_result.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+                // 该 submaster 丢失本 client 的 LOCAL_DISK 段（如重启）：
+                // 定向重挂 + 容量重报 + 重试一次拉取，与 Heartbeat STEP 1
+                // 的恢复模式对称。
+                LOG(WARNING)
+                    << "PromotionObjectHeartbeatTo returned "
+                       "SEGMENT_NOT_FOUND from addr="
+                    << addr << ", re-registering local disk segment there";
+                // 快照 enable_offloading_（其他线程的 PutEnd 失败路径会在
+                // offloading_mutex_ 下写它），避免持锁发 RPC。
+                bool enable_offloading_snapshot;
+                {
+                    MutexLocker locker(&offloading_mutex_);
+                    enable_offloading_snapshot = enable_offloading_;
+                }
+                auto remount_result = client_->MountLocalDiskSegmentTo(
+                    addr, enable_offloading_snapshot);
+                if (remount_result) {
+                    if (config_.total_size_limit > 0) {
+                        (void)client_->ReportSsdCapacityTo(
+                            addr, config_.total_size_limit);
+                    }
+                    auto retry_result = client_->PromotionObjectHeartbeatTo(
+                        addr, promotion_objects);
+                    if (!retry_result) {
+                        LOG(WARNING)
+                            << "Promotion heartbeat to " << addr
+                            << " failed after re-registration: "
+                            << retry_result.error();
+                        continue;
+                    }
+                } else {
+                    LOG(WARNING)
+                        << "Failed to re-register local disk segment on addr="
+                        << addr << ": " << remount_result.error();
+                    continue;
+                }
+            } else {
+                LOG(WARNING) << "PromotionObjectHeartbeatTo failed, addr="
+                             << addr
+                             << " error=" << heartbeat_result.error();
+                continue;
+            }
+        }
+        if (promotion_objects.empty()) {
             continue;
         }
-
-        VLOG(1) << "Promotion completed for key=" << key << ", size=" << size;
+        VLOG(1) << "ProcessPromotionTasks pulled "
+                << promotion_objects.size()
+                << " promotion candidate(s) from addr=" << addr;
+        process_tasks_from(addr, promotion_objects);
     }
 
     return {};
@@ -1384,17 +1671,19 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 }
                 auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
                 auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
+                    client_->NotifyOffloadSuccessRouted(tasks, metadatas);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)
-                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                        << "ReRegisterOffloadedObjects: "
+                           "NotifyOffloadSuccessRouted "
                         << "failed for batch " << total_batches << " with "
                         << keys.size()
                         << " keys, error: " << add_object_result.error();
                     return add_object_result.error();
                 }
-                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
+                LOG(INFO) << "ReRegisterOffloadedObjects: "
+                             "NotifyOffloadSuccessRouted "
                           << "succeeded for batch " << total_batches << " with "
                           << keys.size() << " keys";
                 return ErrorCode::OK;

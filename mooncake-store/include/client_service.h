@@ -563,6 +563,97 @@ class Client {
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    // === 多 submaster 定向 offload 控制面（FileStorage 专用） ===
+    // 以下方法与上面的非定向版本对称：多 submaster 下 LOCAL_DISK 段与
+    // offload 任务队列按 slot 分散在各 submaster，需逐 master 定向操作
+    //（不切换业务"当前地址"）。单 master 模式（路由表为空）调用方回退
+    // 非定向版本，GetSubmasterAddresses 返回空 vector 作为回退判定。
+
+    /** 枚举所有 primary submaster 地址；空 = 单 master 模式。 */
+    [[nodiscard]] std::vector<std::string> GetSubmasterAddresses() const;
+
+    /** 定向 MountLocalDiskSegment：向指定 submaster 注册 LOCAL_DISK 段。 */
+   virtual tl::expected<void, ErrorCode> MountLocalDiskSegmentTo(
+        const std::string& address, bool enable_offloading);
+
+    /**
+     * @brief 定向卸载本 worker 的 LOCAL_DISK 段：向指定 submaster 清理
+     * LocalDiskSegment（容量记账、offloading 队列），与 MountLocalDiskSegmentTo
+     * 对称。submaster 移除时由 RefreshSubmasterAddresses removed 分支调用。
+     */
+    virtual tl::expected<void, ErrorCode> UnmountLocalDiskSegmentTo(
+        const std::string& address);
+
+    /** 定向 OffloadObjectHeartbeat：拉取指定 submaster 的卸载任务。 */
+    tl::expected<void, ErrorCode> OffloadObjectHeartbeatTo(
+        const std::string& address, bool enable_offloading,
+        std::vector<OffloadTaskItem>& offloading_objects);
+
+    /** 定向 ReportSsdCapacity：向指定 submaster 上报 SSD 容量。 */
+    tl::expected<void, ErrorCode> ReportSsdCapacityTo(
+        const std::string& address, int64_t ssd_total_capacity_bytes);
+
+    /** 定向 PollRemoveAll：查询指定 submaster 是否要求全量清空 SSD。 */
+    tl::expected<bool, ErrorCode> PollRemoveAllTo(const std::string& address);
+
+    /** 定向拉取/确认指定 submaster 的 SSD tombstone 任务。 */
+    [[nodiscard]] tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+    RemoveObjectHeartbeatTo(const std::string& address);
+    tl::expected<void, ErrorCode> AckRemoveObjectHeartbeatTo(
+        const std::string& address, const std::vector<RemoveTaskItem>& tasks);
+
+    /**
+     * @brief 定向 promotion 执行链（任务状态在 source master 内存中，
+     * AllocStart/Success/Failure 必须回到派发任务的 master 闭环）。
+     * addr 为空时回退非定向调用（单 master 模式）。
+     */
+    virtual tl::expected<void, ErrorCode> PromotionObjectHeartbeatTo(
+        const std::string& address,
+        std::vector<PromotionTaskItem>& promotion_objects);
+    virtual tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStartTo(const std::string& address, const std::string& key,
+                          const std::string& tenant_id, uint64_t size,
+                          const std::vector<std::string>& preferred_segments);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionSuccessTo(
+        const std::string& address, const std::string& key,
+        const std::string& tenant_id);
+    virtual tl::expected<void, ErrorCode> NotifyPromotionFailureTo(
+        const std::string& address, const std::string& key,
+        const std::string& tenant_id);
+
+    /**
+     * @brief 带来源（source master）的 offload 任务。source_address 为
+     * 派发该任务的 submaster 地址（Heartbeat 拉取时记录）；空表示来源
+     * 未知（本地 ScanMeta 重注册）或单 master 模式。双投清理协议依赖
+     * 该信息：offload 完成时若 slot 已迁移到新 owner，任务状态（源副本
+     * refcnt pin + offloading_tasks 条目）仍留在 source master，需要
+     * 额外向 source 发一次"仅清理"通知。
+     */
+    struct SourcedOffloadTask {
+        OffloadTaskItem task;
+        std::string source_address;
+    };
+
+    /**
+     * @brief 按 task 的 slot owner 分组定向上报卸载结果（双投清理协议）。
+     * 多 submaster 模式下逐 task 解析 owner（task 自带 tenant）后分组：
+     * - 成功通知投 owner（建副本）；若 source 非空且 != owner，双投
+     *   source 一份（master 侧发现非本机 slot 但任务在本机时仅清理
+     *   任务状态，不触碰元数据）。
+     * - NACK（data_size<0）只投 source（清理语义）；source 空则回退
+     *   当前连接。
+     * - owner 未解析时投 source（source 侧 slot 校验决定建副本或清理）。
+     * 单 master 模式等价于 NotifyOffloadSuccess。
+     */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccessRouted(
+        const std::vector<SourcedOffloadTask>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
+    /** 旧签名重载：无来源信息的通知（ScanMeta 重注册等），source 为空。 */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccessRouted(
+        const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
     /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch
@@ -942,6 +1033,13 @@ class Client {
     // 由 ConnectToCvmSubmasters 填充。
     std::mutex cvm_submaster_addresses_mutex_;
     std::vector<std::string> cvm_submaster_addresses_;
+    // LOCAL_DISK 段对称生命周期状态（RefreshSubmasterAddresses 增量接线
+    // 用）：mount 成功后置位；新 submaster 上线时据此补挂 LOCAL_DISK 段
+    // 并重报容量，移除时定向卸载，保证各 master 容量记账对称闭合。
+    std::atomic<bool> local_disk_mounted_{false};
+    std::atomic<bool> local_disk_offload_enabled_{false};
+    // 最近一次成功上报的 SSD 总容量（<=0 表示未上报过），补挂时重报。
+    std::atomic<int64_t> ssd_total_capacity_bytes_{0};
     // 串行化 TryLoadRoutingOnce（及其内部对 cluster_id_ 的读写），
     // 用于 routing-refresh 线程与 SLOT_NOT_OWNED 触发的按需刷新之间。
     std::mutex routing_load_mutex_;

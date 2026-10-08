@@ -276,6 +276,11 @@ struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
+    static constexpr const char* value = "UnmountLocalDiskSegment";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
     static constexpr const char* value = "OffloadObjectHeartbeat";
 };
@@ -773,6 +778,18 @@ std::optional<std::string> MasterClient::ResolveSubmaster(
                      << " (routing not loaded or slot has no owner)";
     }
     return submaster;
+}
+
+std::optional<std::string> MasterClient::ResolveSubmasterFor(
+    const std::string& tenant_id, const std::string& key) const {
+    // 路由表未加载（单 master 模式）：直接 nullopt，调用方回退非定向。
+    // miss 不打日志——批量分组场景由调用方聚合计数，避免逐 key 刷屏。
+    if (partition_router_.Size() == 0) {
+        return std::nullopt;
+    }
+    const TenantId tenant(tenant_id);
+    return partition_router_.ResolveSubmasterQuiet(
+        partition::KvHashMap::Compute(tenant, key));
 }
 
 void MasterClient::SwitchToSubmasterByAddress(const std::string& address) {
@@ -1853,6 +1870,10 @@ std::string MasterClient::GetCurrentAddress() const {
     return client_accessor_.GetAddress();
 }
 
+std::vector<std::string> MasterClient::GetSubmasterAddresses() const {
+    return partition_router_.GetAllPrimaryAddresses();
+}
+
 tl::expected<PingResponse, ErrorCode> MasterClient::PingTo(
     const std::string& address) {
     ScopedVLogTimer timer(1, "MasterClient::PingTo");
@@ -1920,6 +1941,32 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegmentTo(
+    const std::string& address, const UUID& client_id,
+    bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegmentTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::MountLocalDiskSegment, void>(
+            address, client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UnmountLocalDiskSegmentTo(
+    const std::string& address, const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountLocalDiskSegmentTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::UnmountLocalDiskSegment, void>(
+            address, client_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return CreateCopyTask(key, tenant_id_.value(), targets);
@@ -1970,12 +2017,40 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
+MasterClient::OffloadObjectHeartbeatTo(const std::string& address,
+                                       const UUID& client_id,
+                                       bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::OffloadObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::OffloadObjectHeartbeat,
+                      std::vector<OffloadTaskItem>>(address, client_id,
+                                                    enable_offloading);
+    return result;
+}
+
 tl::expected<bool, ErrorCode> MasterClient::PollRemoveAll() {
     ScopedVLogTimer timer(1, "MasterClient::PollRemoveAll");
     timer.LogRequest("client_id=", client_id_);
 
     auto result =
         invoke_rpc<&WrappedMasterService::PollRemoveAll, bool>(client_id_);
+    timer.LogResponse("should_remove_all=",
+                      result.has_value() ? result.value() : false);
+    return result;
+}
+
+tl::expected<bool, ErrorCode> MasterClient::PollRemoveAllTo(
+    const std::string& address, const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::PollRemoveAllTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id);
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::PollRemoveAll, bool>(address,
+                                                                   client_id);
     timer.LogResponse("should_remove_all=",
                       result.has_value() ? result.value() : false);
     return result;
@@ -1988,6 +2063,16 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
     return invoke_rpc<&WrappedMasterService::ReportSsdCapacity, void>(
         client_id, ssd_total_capacity_bytes);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacityTo(
+    const std::string& address, const UUID& client_id,
+    int64_t ssd_total_capacity_bytes) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportSsdCapacityTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
+    return invoke_rpc_to<&WrappedMasterService::ReportSsdCapacity, void>(
+        address, client_id, ssd_total_capacity_bytes);
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
@@ -2015,6 +2100,22 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccessTo(
+    const std::string& address, const UUID& client_id,
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccessTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", tasks_count=", tasks.size(),
+                     ", metadatas_count=", metadatas.size());
+
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::NotifyOffloadSuccess, void>(
+            address, client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<std::string>, ErrorCode>
 MasterClient::GetOffloadEndpoints() {
     ScopedVLogTimer timer(1, "MasterClient::GetOffloadEndpoints");
@@ -2034,12 +2135,31 @@ MasterClient::PromotionObjectHeartbeat(const UUID& client_id) {
                       std::vector<PromotionTaskItem>>(client_id);
 }
 
+tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+MasterClient::PromotionObjectHeartbeatTo(const std::string& address,
+                                         const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::PromotionObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id);
+    return invoke_rpc_to<&WrappedMasterService::PromotionObjectHeartbeat,
+                        std::vector<PromotionTaskItem>>(address, client_id);
+}
+
 tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
 MasterClient::RemoveObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveObjectHeartbeat");
     timer.LogRequest("client_id=", client_id.first, ":", client_id.second);
     return invoke_rpc<&WrappedMasterService::RemoveObjectHeartbeat,
                       std::vector<RemoveTaskItem>>(client_id);
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+MasterClient::RemoveObjectHeartbeatTo(const std::string& address,
+                                      const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::RemoveObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id.first,
+                     ":", client_id.second);
+    return invoke_rpc_to<&WrappedMasterService::RemoveObjectHeartbeat,
+                         std::vector<RemoveTaskItem>>(address, client_id);
 }
 
 tl::expected<void, ErrorCode> MasterClient::AckRemoveObjectHeartbeat(
@@ -2049,6 +2169,16 @@ tl::expected<void, ErrorCode> MasterClient::AckRemoveObjectHeartbeat(
                      " tasks=", tasks.size());
     return invoke_rpc<&WrappedMasterService::AckRemoveObjectHeartbeat, void>(
         client_id, tasks);
+}
+
+tl::expected<void, ErrorCode> MasterClient::AckRemoveObjectHeartbeatTo(
+    const std::string& address, const UUID& client_id,
+    const std::vector<RemoveTaskItem>& tasks) {
+    ScopedVLogTimer timer(1, "MasterClient::AckRemoveObjectHeartbeatTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id.first,
+                     ":", client_id.second, " tasks=", tasks.size());
+    return invoke_rpc_to<&WrappedMasterService::AckRemoveObjectHeartbeat,
+                         void>(address, client_id, tasks);
 }
 
 tl::expected<PromotionAllocStartResponse, ErrorCode>
@@ -2106,6 +2236,51 @@ tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailure(
     auto result =
         invoke_rpc<&WrappedMasterService::NotifyPromotionFailure, void>(
             client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+MasterClient::PromotionAllocStartTo(
+    const std::string& address, const UUID& client_id, const std::string& key,
+    const std::string& tenant_id, uint64_t size,
+    const std::vector<std::string>& preferred_segments) {
+    ScopedVLogTimer timer(1, "MasterClient::PromotionAllocStartTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", key=", key, ", tenant_id=", tenant_id,
+                     ", size=", size,
+                     ", preferred_count=", preferred_segments.size());
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::PromotionAllocStart,
+                     PromotionAllocStartResponse>(address, client_id, key,
+                                                  tenant_id, size,
+                                                  preferred_segments);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionSuccessTo(
+    const std::string& address, const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionSuccessTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", key=", key, ", tenant_id=", tenant_id);
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::NotifyPromotionSuccess, void>(
+            address, client_id, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyPromotionFailureTo(
+    const std::string& address, const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyPromotionFailureTo");
+    timer.LogRequest("address=", address, ", client_id=", client_id,
+                     ", key=", key, ", tenant_id=", tenant_id);
+    auto result =
+        invoke_rpc_to<&WrappedMasterService::NotifyPromotionFailure, void>(
+            address, client_id, key, tenant_id);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -81,10 +81,12 @@ class FileStorage {
 
     /**
      * @brief Offload object data and metadata.
+     * @param offloading_objects 待卸载任务，携带派发它的 source master
+     * 地址（单 master/来源未知时为空），供完成后的双投清理协议使用。
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> OffloadObjects(
-        const std::vector<OffloadTaskItem>& offloading_objects);
+        const std::vector<Client::SourcedOffloadTask>& offloading_objects);
 
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.

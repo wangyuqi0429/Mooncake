@@ -6849,6 +6849,24 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
+
+    // 纵深防御：AddReplica 是幽灵 LOCAL_DISK 元数据的唯一创建点。下方
+    // auto-Create 服务于 master 重启后 worker ScanMeta/ReRegister 的恢复
+    // 路径（SSD 为事实源），不能删除；因此以 slot 归属作为创建门禁。
+    // 调用方 NotifyOffloadSuccess 已做同样校验，此处拦截未来绕过它的
+    // 新调用路径。单 master 模式放行，行为不变。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc != ErrorCode::OK) {
+            LOG(WARNING) << "AddReplica: rejected non-owned slot key=" << key
+                         << " slot=" << (int)slot << " error=" << svc
+                         << " client=" << client_id;
+            return tl::make_unexpected(svc);
+        }
+    }
+
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         accessor.Create(
@@ -9105,6 +9123,22 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     return {};
 }
 
+auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    // 与 MountLocalDiskSegment 对称的卸载：清理该 client 的
+    // LocalDiskSegment（ssd 容量记账、offloading 队列）。幂等——
+    // client 无段时 UnmountLocalDiskSegment 内部为 no-op。
+    // 与 TTL reaper（ClientMonitorFunc）复用同一条 ScopedSegmentAccess
+    // 清理路径；worker 侧 submaster 移除时定向调用，保证多 submaster
+    // 下各 master 的容量记账对称闭合。
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    segment_access.UnmountLocalDiskSegment(client_id);
+    LOG(INFO) << "client_id=" << client_id
+              << ", action=unmount_local_disk_segment_by_rpc";
+    return {};
+}
+
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
@@ -9318,6 +9352,70 @@ auto MasterService::NotifyOffloadSuccess(
                                          : TenantId::Default();
         const auto request_object_id =
             MakeObjectIdentityForRequest(task.key, task_tenant);
+
+        // Slot 归属校验：多 submaster 下，offload 完成通知可能因路由切换
+        // 被发到非 owner 的 master。本机不拥有该 slot 时拒绝处理（不建
+        // LOCAL_DISK 副本、不动 offloading_task），由 worker 按最新路由
+        // 重发到 owner。单 master 模式 owned_slots_ready_==false 直接
+        // 放行，行为不变。校验同时覆盖成功与 NACK（data_size<0）两条路径。
+        const uint16_t slot = cvm::KeySlot(
+            request_object_id.tenant_id, request_object_id.user_key);
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc != ErrorCode::OK) {
+            // 双投清理：slot 已不归本机，但若该 task 由本机派发（存在于
+            // 本机 offloading_tasks），worker 会把通知额外投回本机——此时
+            // 只清理任务状态（dec 源副本 refcnt + erase 任务条目），跳过
+            // 全部元数据操作与 ssd_used_bytes 记账（副本注册由新 owner 的
+            // 那条通知路径完成，本机从未累加过该对象的用量）。找不到任务
+            // 说明是纯错投或迁移清空后的迟到通知，WARNING 即可。
+            bool cleaned = false;
+            {
+                std::shared_lock<std::shared_mutex> shared_lock(
+                    snapshot_mutex_);
+                MetadataAccessorRW accessor(this, request_object_id);
+                if (accessor.Exists()) {
+                    auto& tenant_state = accessor.GetTenantState();
+                    auto task_it = tenant_state.offloading_tasks.find(
+                        request_object_id.user_key);
+                    if (task_it != tenant_state.offloading_tasks.end()) {
+                        auto& tasks = task_it->second;
+                        auto offload_it =
+                            std::find_if(tasks.begin(), tasks.end(),
+                                         [&client_id](const OffloadingTask& t) {
+                                             return t.source_client_id ==
+                                                    client_id;
+                                         });
+                        if (offload_it != tasks.end()) {
+                            auto source =
+                                accessor.Get().GetReplicaByID(
+                                    offload_it->source_id);
+                            if (source != nullptr) {
+                                source->dec_refcnt();
+                            }
+                            tasks.erase(offload_it);
+                            if (tasks.empty()) {
+                                tenant_state.offloading_tasks.erase(task_it);
+                            }
+                            cleaned = true;
+                        }
+                    }
+                }
+            }
+            if (cleaned) {
+                LOG(INFO) << "NotifyOffloadSuccess: cleaned offloading task"
+                          << " for migrated slot"
+                          << " key=" << task.key << " slot=" << (int)slot
+                          << " error=" << svc
+                          << " client=" << client_id;
+            } else {
+                LOG(WARNING)
+                    << "NotifyOffloadSuccess: rejected non-owned slot"
+                    << " key=" << task.key << " slot=" << (int)slot
+                    << " error=" << svc
+                    << " client=" << client_id;
+            }
+            continue;
+        }
 
         // NACK sentinel: offload failed on worker. Clean up the
         // offloading_task + dec_refcnt but skip AddReplica.
@@ -10028,6 +10126,24 @@ auto MasterService::PromotionAllocStart(
     }
     const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
                                    key};
+
+    // Slot 归属校验：promotion 任务状态（promotion_tasks + staged 副本）
+    // 全部在 owner master 内存中，非 owner 既无任务条目也不应建副本。
+    // 拒绝错投的 AllocStart（如路由切换窗口期），由 worker 按 source
+    // master 定向重试。单 master 模式放行，行为不变。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc != ErrorCode::OK) {
+            LOG(WARNING) << "PromotionAllocStart: rejected non-owned slot"
+                         << " key=" << key << " slot=" << (int)slot
+                         << " error=" << svc
+                         << " client=" << client_id;
+            return tl::make_unexpected(svc);
+        }
+    }
+
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
@@ -10143,6 +10259,23 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+
+    // Slot 归属校验（与 PromotionAllocStart 对称）：staged 副本与
+    // promotion_tasks 条目只存在于 owner master，非 owner 收到 Success
+    // 通知时不应触碰任何状态。单 master 模式放行，行为不变。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc != ErrorCode::OK) {
+            LOG(WARNING) << "NotifyPromotionSuccess: rejected non-owned slot"
+                         << " key=" << key << " slot=" << (int)slot
+                         << " error=" << svc
+                         << " client=" << client_id;
+            return tl::make_unexpected(svc);
+        }
+    }
+
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -10278,6 +10411,24 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
+
+    // Slot 归属校验（与 PromotionAllocStart 对称）。注意 Failure 通知的
+    // 语义是幂等释放：非 owner 上本就没有任务条目，直接拒绝（而非 OK）
+    // 以暴露路由错投；worker 按 source master 定向重试。
+    // 单 master 模式放行，行为不变。
+    {
+        const uint16_t slot =
+            cvm::KeySlot(object_id.tenant_id, object_id.user_key);
+        const ErrorCode svc = CheckSlotServiceability(slot);
+        if (svc != ErrorCode::OK) {
+            LOG(WARNING) << "NotifyPromotionFailure: rejected non-owned slot"
+                         << " key=" << key << " slot=" << (int)slot
+                         << " error=" << svc
+                         << " client=" << client_id;
+            return tl::make_unexpected(svc);
+        }
+    }
+
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);

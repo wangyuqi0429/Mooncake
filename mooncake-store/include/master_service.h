@@ -842,6 +842,18 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Unmounts a worker's LOCAL_DISK segment from this master.
+     *
+     * 清理该 client 的 LocalDiskSegment（ssd 容量记账、offloading 队列），
+     * 与 MountLocalDiskSegment 对称。多 submaster 下由 worker 在 submaster
+     * 退出集群时定向调用（RefreshSubmasterAddresses removed 分支），保证
+     * 容量记账对称闭合；不清理对象元数据（LOCAL_DISK 副本由 TTL reaper
+     * 与 ScanMeta 恢复路径管理）。幂等：client 无段时返回 OK。
+     */
+    auto UnmountLocalDiskSegment(const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this

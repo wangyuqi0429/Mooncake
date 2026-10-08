@@ -21,6 +21,7 @@
 #endif
 #include <optional>
 #include <ranges>
+#include <map>
 #include <span>
 #include <sched.h>
 #include <thread>
@@ -4028,6 +4029,8 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
         return response;
     }
 
+    local_disk_mounted_.store(true);
+    local_disk_offload_enabled_.store(enable_offloading);
     EnsureStorageControlPlaneStarted();
     return response;
 }
@@ -4058,6 +4061,7 @@ tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
                    << response.error();
         return tl::make_unexpected(response.error());
     }
+    ssd_total_capacity_bytes_.store(ssd_total_capacity_bytes);
     return {};
 }
 
@@ -4095,9 +4099,202 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
 }
 
+std::vector<std::string> Client::GetSubmasterAddresses() const {
+    return master_client_.GetSubmasterAddresses();
+}
+
+tl::expected<void, ErrorCode> Client::MountLocalDiskSegmentTo(
+    const std::string& address, bool enable_offloading) {
+    auto response = master_client_.MountLocalDiskSegmentTo(address, client_id_,
+                                                           enable_offloading);
+    if (!response) {
+        LOG(ERROR) << "MountLocalDiskSegmentTo failed, addr=" << address
+                   << " error=" << response.error();
+        return response;
+    }
+    local_disk_mounted_.store(true);
+    local_disk_offload_enabled_.store(enable_offloading);
+    EnsureStorageControlPlaneStarted();
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::UnmountLocalDiskSegmentTo(
+    const std::string& address) {
+    return master_client_.UnmountLocalDiskSegmentTo(address, client_id_);
+}
+
+tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeatTo(
+    const std::string& address, bool enable_offloading,
+    std::vector<OffloadTaskItem>& offloading_objects) {
+    auto response = master_client_.OffloadObjectHeartbeatTo(
+        address, client_id_, enable_offloading);
+    if (!response) {
+        return tl::make_unexpected(response.error());
+    }
+    offloading_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::ReportSsdCapacityTo(
+    const std::string& address, int64_t ssd_total_capacity_bytes) {
+    auto response = master_client_.ReportSsdCapacityTo(
+        address, client_id_, ssd_total_capacity_bytes);
+    if (!response) {
+        LOG(WARNING) << "ReportSsdCapacityTo failed, addr=" << address
+                     << " error=" << response.error();
+    }
+    return response;
+}
+
+tl::expected<bool, ErrorCode> Client::PollRemoveAllTo(
+    const std::string& address) {
+    return master_client_.PollRemoveAllTo(address, client_id_);
+}
+
+tl::expected<std::vector<RemoveTaskItem>, ErrorCode>
+Client::RemoveObjectHeartbeatTo(const std::string& address) {
+    return master_client_.RemoveObjectHeartbeatTo(address, client_id_);
+}
+
+tl::expected<void, ErrorCode> Client::AckRemoveObjectHeartbeatTo(
+    const std::string& address, const std::vector<RemoveTaskItem>& tasks) {
+    return master_client_.AckRemoveObjectHeartbeatTo(address, client_id_,
+                                                      tasks);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccessRouted(
+    const std::vector<OffloadTaskItem>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    // 旧签名重载：无来源信息（source 为空），转发到双投实现。
+    std::vector<SourcedOffloadTask> sourced_tasks;
+    sourced_tasks.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        sourced_tasks.push_back(SourcedOffloadTask{task, std::string()});
+    }
+    return NotifyOffloadSuccessRouted(sourced_tasks, metadatas);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccessRouted(
+    const std::vector<SourcedOffloadTask>& tasks,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    const auto addresses = master_client_.GetSubmasterAddresses();
+    if (addresses.empty()) {
+        // 单 master 模式（路由表未加载）：走当前连接，与非定向等价。
+        std::vector<OffloadTaskItem> plain_tasks;
+        plain_tasks.reserve(tasks.size());
+        for (const auto& st : tasks) {
+            plain_tasks.push_back(st.task);
+        }
+        return master_client_.NotifyOffloadSuccess(client_id_, plain_tasks,
+                                                   metadatas);
+    }
+
+    // 多 submaster：双投清理协议。按目标地址分组：
+    // - 成功通知投 owner（建副本）；source 非空且 != owner 时双投
+    //   source（master 侧"仅清理"语义）。
+    // - NACK（data_size<0）只投 source（任务状态只在 source 上）。
+    // - owner 未解析投 source；source 也空才回退当前连接。
+    if (tasks.size() != metadatas.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::map<std::string,
+             std::pair<std::vector<OffloadTaskItem>,
+                       std::vector<StorageObjectMetadata>>>
+        grouped;
+    std::vector<OffloadTaskItem> fallback_tasks;
+    std::vector<StorageObjectMetadata> fallback_metadatas;
+    size_t dual_delivery_count = 0;
+    size_t unresolved_count = 0;
+    const auto add_to_group =
+        [&grouped](const std::string& addr, const OffloadTaskItem& task,
+                   const StorageObjectMetadata& metadata) {
+            auto& [g_tasks, g_metas] = grouped[addr];
+            g_tasks.push_back(task);
+            g_metas.push_back(metadata);
+        };
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        const auto& st = tasks[i];
+        const bool is_nack = metadatas[i].data_size < 0;
+        auto owner =
+            master_client_.ResolveSubmasterFor(st.task.tenant_id, st.task.key);
+        const auto& source = st.source_address;
+        if (is_nack) {
+            // NACK：清理语义，任务状态只在 source 上。
+            if (!source.empty()) {
+                add_to_group(source, st.task, metadatas[i]);
+            } else {
+                fallback_tasks.push_back(st.task);
+                fallback_metadatas.push_back(metadatas[i]);
+            }
+            continue;
+        }
+        if (owner) {
+            add_to_group(*owner, st.task, metadatas[i]);
+            if (!source.empty() && source != *owner) {
+                // 双投：slot 已从 source 迁往 owner，source 上的任务
+                // 状态（源副本 refcnt pin）需要"仅清理"通知闭环。
+                add_to_group(source, st.task, metadatas[i]);
+                ++dual_delivery_count;
+            }
+        } else if (!source.empty()) {
+            // owner 未解析：投 source。source 侧 slot 校验决定建副本
+            // （路由表滞后，slot 实际还在 source）或清理（已迁移）。
+            add_to_group(source, st.task, metadatas[i]);
+            ++unresolved_count;
+        } else {
+            fallback_tasks.push_back(st.task);
+            fallback_metadatas.push_back(metadatas[i]);
+            ++unresolved_count;
+        }
+    }
+    if (dual_delivery_count > 0 || unresolved_count > 0) {
+        VLOG(1) << "NotifyOffloadSuccessRouted: tasks=" << tasks.size()
+                << " dual_delivery=" << dual_delivery_count
+                << " unresolved=" << unresolved_count;
+    }
+
+    std::optional<ErrorCode> first_error;
+    for (const auto& [address, group] : grouped) {
+        const auto& [g_tasks, g_metas] = group;
+        auto result = master_client_.NotifyOffloadSuccessTo(
+            address, client_id_, g_tasks, g_metas);
+        if (!result) {
+            LOG(WARNING) << "NotifyOffloadSuccessTo failed, addr=" << address
+                         << " error=" << result.error()
+                         << " tasks=" << g_tasks.size();
+            if (!first_error) {
+                first_error = result.error();
+            }
+        }
+    }
+    if (!fallback_tasks.empty()) {
+        auto result = master_client_.NotifyOffloadSuccess(client_id_,
+                                                          fallback_tasks,
+                                                          fallback_metadatas);
+        if (!result && !first_error) {
+            first_error = result.error();
+        }
+    }
+    if (first_error) {
+        return tl::make_unexpected(*first_error);
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);
+    if (!response) {
+        return tl::make_unexpected(response.error());
+    }
+    promotion_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeatTo(
+    const std::string& address,
+    std::vector<PromotionTaskItem>& promotion_objects) {
+    auto response = master_client_.PromotionObjectHeartbeatTo(address, client_id_);
     if (!response) {
         return tl::make_unexpected(response.error());
     }
@@ -4149,6 +4346,29 @@ tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
 tl::expected<void, ErrorCode> Client::NotifyPromotionFailure(
     const std::string& key, const std::string& tenant_id) {
     return master_client_.NotifyPromotionFailure(client_id_, key, tenant_id);
+}
+
+tl::expected<PromotionAllocStartResponse, ErrorCode>
+Client::PromotionAllocStartTo(const std::string& address, const std::string& key,
+                              const std::string& tenant_id, uint64_t size,
+                              const std::vector<std::string>& preferred_segments) {
+    return master_client_.PromotionAllocStartTo(address, client_id_, key,
+                                                tenant_id, size,
+                                                preferred_segments);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionSuccessTo(
+    const std::string& address, const std::string& key,
+    const std::string& tenant_id) {
+    return master_client_.NotifyPromotionSuccessTo(address, client_id_, key,
+                                                   tenant_id);
+}
+
+tl::expected<void, ErrorCode> Client::NotifyPromotionFailureTo(
+    const std::string& address, const std::string& key,
+    const std::string& tenant_id) {
+    return master_client_.NotifyPromotionFailureTo(address, client_id_, key,
+                                                   tenant_id);
 }
 
 ErrorCode Client::PromotionWrite(const Replica::Descriptor& memory_descriptor,
@@ -4918,6 +5138,28 @@ void Client::RefreshSubmasterAddresses() {
                                  << " error=" << r.error();
                 }
             }
+            // LOCAL_DISK 段对称补挂：新 submaster 上线后其 slot 的 offload
+            // 决策需要本 client 的 LocalDiskSegment；不补挂则首个心跳周期
+            // 内该 master 的任务拉取会 SEGMENT_NOT_FOUND（靠定向恢复兜底，
+            // 延迟一个心跳周期）。补挂后重报容量，恢复其 SSD 记账分母。
+            if (local_disk_mounted_.load()) {
+                const bool enable_offloading =
+                    local_disk_offload_enabled_.load();
+                auto r = master_client_.MountLocalDiskSegmentTo(
+                    addr, client_id_, enable_offloading);
+                if (!r) {
+                    LOG(WARNING)
+                        << "mount_local_disk_segment_to_new_submaster_failed"
+                        << " addr=" << addr << " error=" << r.error();
+                } else {
+                    const int64_t capacity = ssd_total_capacity_bytes_.load();
+                    if (capacity > 0) {
+                        (void)master_client_.ReportSsdCapacityTo(addr,
+                                                                 client_id_,
+                                                                 capacity);
+                    }
+                }
+            }
         }
     }
 
@@ -4934,6 +5176,18 @@ void Client::RefreshSubmasterAddresses() {
                     LOG(WARNING)
                         << "unmount_segment_from_removed_submaster_failed addr="
                         << addr << " id=" << seg_id << " error=" << r.error();
+                }
+            }
+            // LOCAL_DISK 段对称卸载：被移除的 submaster 不再是任何 slot 的
+            // owner，其容量记账若不清理将永久泄漏（重复计数会污染
+            // SSD_FREE_RATIO_FIRST 分配策略）。
+            if (local_disk_mounted_.load()) {
+                auto r = master_client_.UnmountLocalDiskSegmentTo(addr,
+                                                                  client_id_);
+                if (!r) {
+                    LOG(WARNING)
+                        << "unmount_local_disk_segment_from_removed_submaster"
+                        << "_failed addr=" << addr << " error=" << r.error();
                 }
             }
         }

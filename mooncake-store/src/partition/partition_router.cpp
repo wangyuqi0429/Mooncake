@@ -1,6 +1,7 @@
 #include "partition/partition_router.h"
 
 #include <algorithm>
+#include <set>
 #include <utility>
 
 #include <glog/logging.h>
@@ -163,9 +164,48 @@ std::optional<std::string> PartitionRouter::ResolveSubmaster(
     return it->second;
 }
 
+std::optional<std::string> PartitionRouter::ResolveSubmasterQuiet(
+    uint16_t slot) const {
+    SharedMutexLocker locker(&mutex_, shared_lock);
+    if (!rank_to_primary_.empty()) {
+        const uint32_t rank = cvm::SlotToRank(slot, group_count_);
+        if (rank >= rank_to_primary_.size() ||
+            rank_to_primary_[rank].empty()) {
+            return std::nullopt;
+        }
+        return rank_to_primary_[rank];
+    }
+    auto it = slot_to_submaster_.find(slot);
+    if (it == slot_to_submaster_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
 std::optional<std::string> PartitionRouter::Route(
     const TenantId& tenant, const std::string& key) const {
     return ResolveSubmaster(KvHashMap::Compute(tenant, key));
+}
+
+std::vector<std::string> PartitionRouter::GetAllPrimaryAddresses() const {
+    SharedMutexLocker locker(&mutex_, shared_lock);
+    std::vector<std::string> addresses;
+    std::set<std::string> seen;
+    const auto collect = [&](const std::string& address) {
+        if (!address.empty() && seen.insert(address).second) {
+            addresses.push_back(address);
+        }
+    };
+    if (!rank_to_primary_.empty()) {
+        for (const auto& primary : rank_to_primary_) {
+            collect(primary);
+        }
+    } else {
+        for (const auto& [slot, submaster] : slot_to_submaster_) {
+            collect(submaster);
+        }
+    }
+    return addresses;
 }
 
 void PartitionRouter::Clear() {
