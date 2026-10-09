@@ -1389,13 +1389,16 @@ int CvmController::ClaimCaretakerRank(
         }
         // 阶段 1（§16.8.2）：CAS kMigrating，primary 暂仍 = 兼管者（读不受
         // 影响，源写由 kMigrating 冻结）。standby 列表保留（nullptr）。
-        // kMigrating 语义下 AdoptRankViaCAS 不删 intent（intent 正是本
-        // 路径的配套状态）。
+        // kMigrating 语义下不删 intent：intent 是 ReshardDriverLoop 的断点
+        // 续传依据。AdoptRankViaCAS 的 clear_intent 默认值是 true（晋升/
+        // 接管语义），不显式传 false 会把刚写的 intent 立即删掉——迁移
+        // 永远无人驱动，target 0 slot 卡死。
         RingSlotAssign out;
         const ErrorCode err = EtcdViewStore::AdoptRankViaCAS(
             config_.cluster_namespace, a.rank, a.epoch, a.primary_id,
             SlotState::kMigrating, config_.master_id, out, nullptr,
-            "claimed", a.primary_id);
+            "claimed", a.primary_id, /*success_as_warning=*/false,
+            /*clear_intent=*/false);
         if (err == ErrorCode::OK) {
             LogStepOutcome(kPhaseClaimCaretaker, kStepDone,
                            "rank=" + std::to_string(a.rank) +
