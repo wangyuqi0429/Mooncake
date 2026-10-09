@@ -9289,7 +9289,7 @@ auto MasterService::ReportInvalidReplicaEndpoints(
         names.reserve(endpoints.size());
         for (const auto& [segment, client_id] : all_segments) {
             if (std::find(endpoints.begin(), endpoints.end(),
-                          segment.transport_endpoint) != endpoints.end()) {
+                          segment.te_endpoint) != endpoints.end()) {
                 names.push_back(segment.name);
             }
         }

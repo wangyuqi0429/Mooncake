@@ -2498,6 +2498,10 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     return {};
 }
 
+// 定义于 PutOperation 类之后（见下），此处仅声明供 BatchUpsert 调用。
+void AggregateBatchFailedEndpoints(const std::vector<PutOperation>& ops,
+                                   std::set<std::string>& out);
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
@@ -2530,12 +2534,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     auto results = CollectResults(ops);
 
     // 方案二被动层：聚合本批次全部操作的失败端点，批次末尾统一上报
-    // （不阻塞批次内各 key 的传输/收尾关键路径）。
+    // （不阻塞批次内各 key 的传输/收尾关键路径）。PutOperation 类定义在
+    // 本函数之后，须经 AggregateBatchFailedEndpoints 间接访问成员。
     std::set<std::string> batch_failed_endpoints;
-    for (const auto& op : ops) {
-        batch_failed_endpoints.insert(op.failed_endpoints.begin(),
-                                      op.failed_endpoints.end());
-    }
+    AggregateBatchFailedEndpoints(ops, batch_failed_endpoints);
     ReportFailedEndpointsToMasters(batch_failed_endpoints);
 
     return results;
@@ -2664,6 +2666,16 @@ class PutOperation {
         return state == PutOperationState::SUCCESS && result.has_value();
     }
 };
+
+// 聚合一批操作的失败端点（方案二被动层）。独立于类外的自由函数：
+// Client::BatchUpsert 定义在 PutOperation 类之前，无法直接解引用
+// op.failed_endpoints（不完整类型），经由此前向声明的 helper 间接访问。
+void AggregateBatchFailedEndpoints(const std::vector<PutOperation>& ops,
+                                   std::set<std::string>& out) {
+    for (const auto& op : ops) {
+        out.insert(op.failed_endpoints.begin(), op.failed_endpoints.end());
+    }
+}
 
 std::vector<PutOperation> Client::CreatePutOperations(
     const std::vector<ObjectKey>& keys,
