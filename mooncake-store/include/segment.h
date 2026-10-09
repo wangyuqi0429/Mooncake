@@ -206,6 +206,21 @@ class ScopedSegmentAccess {
     ErrorCode GetAllSegments(
         std::vector<std::pair<Segment, UUID>>& all_segments);
 
+    /**
+     * @brief Get all segments with their exact owner client ids.
+     *
+     * Unlike the pair-version GetAllSegments() above, which resolves the
+     * owner via client_by_name_ (name-granular and therefore ambiguous when
+     * an old and a new generation of the same-named worker coexist during a
+     * restart window), this variant builds the reverse map from
+     * client_segments_ so each segment is attributed to its true mounting
+     * client. Required by generation-replacement eviction
+     * (MasterService::EvictStaleGenerationForHost) to unmount stale segments
+     * without leaving dead ids in client_segments_.
+     */
+    ErrorCode GetAllSegmentsWithOwner(
+        std::vector<std::pair<Segment, UUID>>& all_segments);
+
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
 

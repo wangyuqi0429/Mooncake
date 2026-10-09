@@ -242,6 +242,14 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> UnmountLocalDiskSegment(const UUID& client_id);
 
+    /**
+     * @brief 被动坏端点上报（方案二被动层）：client 传输失败后上报目标
+     * transport_endpoint 列表，master 标记进 invalid_replica_endpoints_
+     * 供分配过滤与读路径跳过（worker 重挂载时自愈）。
+     */
+    tl::expected<void, ErrorCode> ReportInvalidReplicaEndpoints(
+        const std::vector<std::string>& endpoints);
+
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 

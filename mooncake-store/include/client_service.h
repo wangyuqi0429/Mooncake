@@ -12,6 +12,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>
+#include <set>
 #include <unordered_set>
 
 #include "client_metric.h"
@@ -949,6 +950,14 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
     ReplicateConfig AttachHostId(const ReplicateConfig& config) const;
+
+    /**
+     * @brief 方案二被动层：向 master 上报传输失败副本的坏端点。
+     * 多 submaster 下广播；上报失败仅告警，不阻塞主流程。
+     * 需在延迟指标采集之后调用，避免 RPC 耗时污染延迟统计。
+     */
+    void ReportFailedEndpointsToMasters(
+        const std::set<std::string>& failed_endpoints);
 
     // Client identification
     const UUID client_id_;

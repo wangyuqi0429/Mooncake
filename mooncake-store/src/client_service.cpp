@@ -2189,6 +2189,44 @@ bool Client::RedirectToHotCache(const std::string& key,
     return true;
 }
 
+// 方案二被动层：向 master 上报传输失败副本的坏端点（多 submaster 下内存段
+// 全量挂载于所有 submaster，坏端点影响所有 master 的分配，需广播）。
+// best-effort：上报失败仅告警不阻塞主流程，误报由 worker 重挂载时
+// MountSegment 的 erase 自愈兜底。调用方需在延迟指标采集之后调用，
+// 避免上报 RPC 耗时污染延迟统计。
+void Client::ReportFailedEndpointsToMasters(
+    const std::set<std::string>& failed_endpoints) {
+    if (failed_endpoints.empty()) {
+        return;
+    }
+    const std::vector<std::string> invalid_endpoints(
+        failed_endpoints.begin(), failed_endpoints.end());
+    std::vector<std::string> report_targets;
+    {
+        std::lock_guard<std::mutex> addr_lock(cvm_submaster_addresses_mutex_);
+        report_targets = cvm_submaster_addresses_;
+    }
+    if (!report_targets.empty()) {
+        for (const auto& addr : report_targets) {
+            auto r = master_client_.ReportInvalidReplicaEndpointsTo(
+                addr, invalid_endpoints);
+            if (!r) {
+                LOG(WARNING)
+                    << "report_invalid_endpoints_failed addr=" << addr
+                    << " count=" << invalid_endpoints.size()
+                    << " error=" << r.error();
+            }
+        }
+    } else {
+        auto r = master_client_.ReportInvalidReplicaEndpoints(invalid_endpoints);
+        if (!r) {
+            LOG(WARNING) << "report_invalid_endpoints_failed count="
+                         << invalid_endpoints.size()
+                         << " error=" << r.error();
+        }
+    }
+}
+
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
@@ -2265,6 +2303,12 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
+    // 方案二被动层：收集传输失败副本的目标端点，循环后上报 master。
+    // best-effort 归因：TransferWrite 失败也可能源于本地原因（staging 等），
+    // 误报由 worker 重挂载时 MountSegment 的 erase 自愈兜底。
+    // vsegment 副本 Descriptor 仅含逻辑位置（物理端点传输时经
+    // SegmentRegistry 解析），无法归因，跳过。
+    std::set<std::string> failed_endpoints;
     for (const auto& replica : put_start.replicas) {
         if (replica.is_memory_replica() || replica.is_nof_replica() ||
             replica.is_vsegment_replica()) {
@@ -2277,6 +2321,15 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
+                if (replica.is_memory_replica()) {
+                    failed_endpoints.insert(replica.get_memory_descriptor()
+                                                .buffer_descriptor
+                                                .transport_endpoint_);
+                } else if (replica.is_nof_replica()) {
+                    failed_endpoints.insert(replica.get_nof_descriptor()
+                                                .buffer_descriptor
+                                                .transport_endpoint_);
+                }
                 continue;
             }
             transfer_summary.RecordSuccess(replica_type);
@@ -2289,6 +2342,10 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
+
+    // 方案二被动层：上报坏端点（不改变写语义——FLEXIBLE 部分成功仍成功）。
+    // 放在 put_latency 指标采集之后，避免上报 RPC 耗时污染写延迟统计。
+    ReportFailedEndpointsToMasters(failed_endpoints);
 
     const auto finalize_decision =
         DetermineFinalizeDecision(config, transfer_summary);
@@ -2388,17 +2445,26 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
 
+    // 方案二被动层：收集传输失败副本的目标端点（vsegment 无物理端点，
+    // Descriptor 仅含逻辑位置，跳过归因）。
+    std::set<std::string> failed_endpoints;
     // Transfer to memory-class replicas (direct memory or vsegment).
     for (const auto& replica : upsert_start.replicas) {
         if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
+                if (replica.is_memory_replica()) {
+                    failed_endpoints.insert(replica.get_memory_descriptor()
+                                                .buffer_descriptor.transport_endpoint_);
+                }
                 auto revoke_result = master_client_.UpsertRevoke(
                     key, ReplicaType::MEMORY, upsert_start.operation_id);
                 if (!revoke_result) {
                     LOG(ERROR) << "Failed to revoke upsert operation";
+                    ReportFailedEndpointsToMasters(failed_endpoints);
                     return tl::unexpected(revoke_result.error());
                 }
+                ReportFailedEndpointsToMasters(failed_endpoints);
                 return tl::unexpected(transfer_err);
             }
         }
@@ -2461,7 +2527,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     FinalizeBatchUpsert(ops);
-    return CollectResults(ops);
+    auto results = CollectResults(ops);
+
+    // 方案二被动层：聚合本批次全部操作的失败端点，批次末尾统一上报
+    // （不阻塞批次内各 key 的传输/收尾关键路径）。
+    std::set<std::string> batch_failed_endpoints;
+    for (const auto& op : ops) {
+        batch_failed_endpoints.insert(op.failed_endpoints.begin(),
+                                      op.failed_endpoints.end());
+    }
+    ReportFailedEndpointsToMasters(batch_failed_endpoints);
+
+    return results;
 }
 
 // TODO: `client.cpp` is too long, consider split it into multiple files
@@ -2478,10 +2555,16 @@ class PutOperation {
     struct PendingTransferRecord {
         ReplicaType replica_type;
         TransferFuture future;
+        // 方案二被动层：传输失败归因用，目标 worker 的 transport endpoint。
+        // vsegment 副本 Descriptor 仅含逻辑位置（分区/偏移），物理端点在
+        // 传输时经 SegmentRegistry 解析，此处留空表示不可归因。
+        std::string transport_endpoint;
 
-        PendingTransferRecord(ReplicaType type,
-                              TransferFuture&& transfer_future)
-            : replica_type(type), future(std::move(transfer_future)) {}
+        PendingTransferRecord(
+            ReplicaType type, TransferFuture&& transfer_future,
+            std::string endpoint = std::string())
+            : replica_type(type), future(std::move(transfer_future)),
+              transport_endpoint(std::move(endpoint)) {}
     };
 
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -2504,6 +2587,10 @@ class PutOperation {
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
     ReplicaTransferSummary transfer_summary;
+
+    // 方案二被动层：本操作传输失败副本的目标端点集合（memory/nof；
+    // vsegment 无物理端点不归因），批次结束后由调用方聚合上报 master。
+    std::set<std::string> failed_endpoints;
 
     // Error context for debugging
     std::optional<std::string> failure_context;
@@ -2826,6 +2913,15 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                                           : replica.is_vsegment_replica()
                                               ? ReplicaType::MEMORY
                                               : ReplicaType::NOF_SSD;
+                // 方案二被动层：提交时记录目标端点，供失败归因使用
+                std::string transport_endpoint;
+                if (replica.is_memory_replica()) {
+                    transport_endpoint = replica.get_memory_descriptor()
+                                              .buffer_descriptor.transport_endpoint_;
+                } else if (replica.is_nof_replica()) {
+                    transport_endpoint = replica.get_nof_descriptor()
+                                              .buffer_descriptor.transport_endpoint_;
+                }
                 std::optional<TransferFuture> submit_result;
                 if (replica.is_vsegment_replica()) {
                     if (!vsegment_transfer_planner_) {
@@ -2879,11 +2975,15 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     op.transfer_summary.RecordFailure(replica_type,
                                                       ErrorCode::TRANSFER_FAIL);
                     op.AppendFailureContext(failure_context);
+                    if (!transport_endpoint.empty()) {
+                        op.failed_endpoints.insert(transport_endpoint);
+                    }
                     continue;
                 }
 
                 op.pending_transfers.emplace_back(
-                    replica_type, std::move(submit_result.value()));
+                    replica_type, std::move(submit_result.value()),
+                    std::move(transport_endpoint));
             }
         }
 
@@ -2905,6 +3005,11 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
             if (transfer_result != ErrorCode::OK) {
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
+                // 方案二被动层：异步传输失败时按提交时记录的端点归因
+                // （vsegment 无物理端点，transport_endpoint 为空则跳过）
+                if (!pending_transfer.transport_endpoint.empty()) {
+                    op.failed_endpoints.insert(pending_transfer.transport_endpoint);
+                }
                 std::string error_context =
                     "Transfer " + std::to_string(i) + " failed";
                 op.AppendFailureContext(error_context);
@@ -3322,6 +3427,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     merged_ops.reserve(seg_to_ops.size());
     for (auto& seg_to_op : seg_to_ops) {
         auto& op = seg_to_op.second;
+        // 本合并组对应的目标端点（seg_to_ops 的 key 即 transport endpoint）
+        const std::string& seg = seg_to_op.first;
         bool all_transfers_submitted = true;
         std::string failure_context;
         merged_ops.emplace_back(op.key, op.slices);
@@ -3333,9 +3440,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         if (!submit_result) {
             failure_context = "Failed to submit batch transfer";
             all_transfers_submitted = false;
+            // 方案二被动层：submit 失败按目标端点归因
+            merged_op.failed_endpoints.insert(seg);
         } else {
             merged_op.pending_transfers.emplace_back(
-                ReplicaType::MEMORY, std::move(submit_result.value()));
+                ReplicaType::MEMORY, std::move(submit_result.value()), seg);
         }
         if (!all_transfers_submitted) {
             LOG(ERROR) << "Transfer submission failed for key " << op.key
@@ -3383,7 +3492,18 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    auto results = CollectResults(ops);
+
+    // 方案二被动层：聚合合并操作的失败端点，批次末尾统一上报
+    // （WaitForTransfers 已按 record 中的端点归因到 merged_op）。
+    std::set<std::string> batch_failed_endpoints;
+    for (const auto& merged : merged_ops) {
+        batch_failed_endpoints.insert(merged.failed_endpoints.begin(),
+                                       merged.failed_endpoints.end());
+    }
+    ReportFailedEndpointsToMasters(batch_failed_endpoints);
+
+    return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
@@ -3432,6 +3552,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 results.begin(), results.end(),
                 [](const auto& result) { return result.has_value(); });
             pt_full.End(any_succeeded ? 0 : -1);
+            // 方案二被动层：批次末尾统一上报失败端点（置于 pt_full.End 之后，
+            // 避免上报 RPC 耗时污染 PUT_BATCH_FULL 指标）
+            std::set<std::string> batch_failed_endpoints;
+            for (const auto& op : ops) {
+                batch_failed_endpoints.insert(op.failed_endpoints.begin(),
+                                              op.failed_endpoints.end());
+            }
+            ReportFailedEndpointsToMasters(batch_failed_endpoints);
             return results;
         }
         auto results = BatchPutWhenPreferSameNode(ops);
@@ -3459,6 +3587,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         std::any_of(results.begin(), results.end(),
                     [](const auto& result) { return result.has_value(); });
     pt_full.End(any_succeeded ? 0 : -1);
+    // 方案二被动层：批次末尾统一上报失败端点（置于 pt_full.End 之后，
+    // 避免上报 RPC 耗时污染 PUT_BATCH_FULL 指标）
+    std::set<std::string> batch_failed_endpoints;
+    for (const auto& op : ops) {
+        batch_failed_endpoints.insert(op.failed_endpoints.begin(),
+                                      op.failed_endpoints.end());
+    }
+    ReportFailedEndpointsToMasters(batch_failed_endpoints);
     return results;
 }
 

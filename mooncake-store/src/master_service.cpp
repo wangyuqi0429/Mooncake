@@ -2405,6 +2405,108 @@ void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
               << id << " master=" << master_id_;
 }
 
+void MasterService::EvictStaleGenerationForHost(const Segment& incoming) {
+    // 无法归因（缺 name/host/endpoint 任一标识）则不动，交由 TTL reaper 与
+    // 方案一 B（etcd lease 兜底）处理，宁可漏清理也不误杀。
+    if (incoming.name.empty() || incoming.te_endpoint.empty() ||
+        incoming.host_id.empty()) {
+        return;
+    }
+
+    struct StaleSegInfo {
+        UUID id;
+        UUID client_id;
+        std::string name;
+        std::string endpoint;
+        size_t dec_capacity = 0;
+    };
+
+    // 阶段 1（段锁内）：检测旧代段并 Prepare（删 allocator）。
+    // Prepare 失败 = 段已被并发卸载（reaper / 主动 unmount / 重复触发），
+    // 幂等跳过。新挂段本身 endpoint 相同，不满足「不同 endpoint」条件，
+    // 不会被误判。
+    // owner 解析必须用 GetAllSegmentsWithOwner（client_segments_ 反查）：
+    // 新旧代段同名，pair 版 GetAllSegments 经 client_by_name_ 会把旧段归因
+    // 到新 client，commit 时在 client_segments_ 留下死 id 并误报 ERROR。
+    std::vector<StaleSegInfo> stale;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        std::vector<std::pair<Segment, UUID>> all_segments;
+        if (segment_access.GetAllSegmentsWithOwner(all_segments) !=
+            ErrorCode::OK) {
+            return;
+        }
+        for (auto& [seg, cid] : all_segments) {
+            if (seg.name != incoming.name || seg.host_id != incoming.host_id ||
+                seg.te_endpoint.empty() ||
+                seg.te_endpoint == incoming.te_endpoint) {
+                continue;
+            }
+            StaleSegInfo info;
+            info.id = seg.id;
+            info.client_id = cid;
+            info.name = seg.name;
+            info.endpoint = seg.te_endpoint;
+            if (segment_access.PrepareUnmountSegment(seg.id,
+                                                     info.dec_capacity) ==
+                ErrorCode::OK) {
+                stale.push_back(std::move(info));
+            } else {
+                VLOG(1) << "stale_generation_prepare_skip segment_id="
+                        << UuidToString(seg.id)
+                        << " reason=concurrent_unmount";
+            }
+        }
+    }
+    if (stale.empty()) {
+        return;
+    }
+
+    LOG(WARNING) << "stale_generation_evict host_id=" << incoming.host_id
+                 << ", segment_name=" << incoming.name
+                 << ", new_endpoint=" << incoming.te_endpoint
+                 << ", stale_count=" << stale.size();
+
+    // 阶段 2（段锁释放后）：清理对象元数据。与 TTL reaper 的锁序一致
+    //（snapshot shared lock 持有下调用，内部不获取 snapshot 锁）。
+    ClearInvalidHandles();
+
+    // 阶段 3（段锁内）：Commit 卸载，把旧段从注册表移除。
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        for (auto& info : stale) {
+            segment_access.CommitUnmountSegment(info.id, info.client_id,
+                                                info.dec_capacity);
+            LOG(WARNING) << "client_id=" << info.client_id
+                         << ", segment_name=" << info.name
+                         << ", action=unmount_stale_generation_segment"
+                         << ", endpoint=" << info.endpoint;
+            cleanupHttpMetadata(info.name);
+        }
+    }
+
+    // 阶段 4（无锁）：同步清理 etcd（挂载记录 + 最后挂载者卸载时的描述符）。
+    // 多 submaster 下各自独立 evict 本机内存态；RemoveSegmentOwnerForCvm
+    // 内部按「是否仍有其它 master 挂载」决定是否删描述符，天然防误删。
+    for (const auto& info : stale) {
+        RemoveSegmentOwnerForCvm(info.id);
+    }
+
+    // 阶段 5：invalid 集合卫生——死端点/段名不再有对应段，从排除集中清除，
+    // 防止多次 worker 重启导致集合无界增长（与 MountSegment 自愈 erase 对称）。
+    {
+        std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        for (const auto& info : stale) {
+            invalid_replica_endpoints_.erase(info.endpoint);
+            invalid_replica_endpoints_.erase(info.name);
+        }
+    }
+
+    RecomputeTenantEffectiveQuotas();
+}
+
 std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
     // ring_slots 缓存优先（§16.15.5）：本机是哪些 rank 的 primary_id，拥有
     // 这些 rank 的连续 slot 段（兼管多 rank 取并集）。缓存空（shadow write
@@ -2636,6 +2738,7 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
 #else
 void MasterService::PublishSegmentOwnerForCvm(const Segment&) {}
 void MasterService::RemoveSegmentOwnerForCvm(const UUID&) {}
+void MasterService::EvictStaleGenerationForHost(const Segment&) {}
 std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() { return {}; }
 void MasterService::MaybeWarnGhostFallback(const char*, uint16_t) const {}
 std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
@@ -3111,6 +3214,10 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         invalid_replica_endpoints_.erase(segment.name);
     }
     PublishSegmentOwnerForCvm(segment);
+    // 方案一 A：新代段挂载完成后，立即清理同 host 同 name 的旧代死段
+    //（P2PHANDSHAKE 重启场景：端口已换、旧端点无监听），不等 TTL reaper。
+    // 此时段锁已释放，helper 内部独立走两阶段卸载 + etcd 清理。
+    EvictStaleGenerationForHost(segment);
     return {};
 }
 
@@ -6212,6 +6319,15 @@ auto MasterService::AllocateAndInsertMetadata(
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     bool memory_eviction_may_help = false;
+    // 方案二被动层：分配排除集 = 被动上报的坏端点快照（transport_endpoint
+    // 与 segment_name 双形式，见 ReportInvalidReplicaEndpoints）。allocator
+    // 锁 → invalid 锁（shared）与 MountSegment 自愈 erase 的锁序一致。
+    std::set<std::string> excluded_invalid_segments;
+    {
+        std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        excluded_invalid_segments.insert(invalid_replica_endpoints_.begin(),
+                                         invalid_replica_endpoints_.end());
+    }
     if (config.replica_num > 0) {
         const bool use_local_first =
             allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
@@ -6293,7 +6409,7 @@ auto MasterService::AllocateAndInsertMetadata(
             pt_alloc_mem.Start();
             allocation_result = allocation_strategy_->Allocate(
                 allocator_manager, value_length, config.replica_num,
-                preferred_segments, std::set<std::string>(),
+                preferred_segments, excluded_invalid_segments,
                 ReplicaType::MEMORY, ssd_provider);
             pt_alloc_mem.End(allocation_result.has_value() ? 0 : -1);
         }  // allocator_access 在此释放；远程转发在锁外执行，避免分布式死锁
@@ -6348,7 +6464,8 @@ auto MasterService::AllocateAndInsertMetadata(
         pt_alloc_nof.Start();
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.nof_replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::NOF_SSD);
+            preferred_segments, excluded_invalid_segments,
+            ReplicaType::NOF_SSD);
         pt_alloc_nof.End(allocation_result.has_value() ? 0 : -1);
 
         if (!allocation_result.has_value()) {
@@ -9149,6 +9266,62 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     segment_access.UnmountLocalDiskSegment(client_id);
     LOG(INFO) << "client_id=" << client_id
               << ", action=unmount_local_disk_segment_by_rpc";
+    return {};
+}
+
+auto MasterService::ReportInvalidReplicaEndpoints(
+    const std::vector<std::string>& endpoints)
+    -> tl::expected<void, ErrorCode> {
+    if (endpoints.empty()) {
+        return {};
+    }
+
+    // endpoint → segment_name 转换：invalid_replica_endpoints_ 的消费者
+    // 两侧——读路径 IsReplicaReadable 按 transport_endpoint 匹配；分配过滤
+    // （AllocateAndInsertMetadata 排除集，allocation_strategy 按 segment
+    // name 匹配）。因此双形式都插入（与 standby 恢复路径 :5014-5016 及
+    // MountSegment 自愈 erase 的形式一致）。
+    std::vector<std::string> names;
+    {
+        ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+        std::vector<std::pair<Segment, UUID>> all_segments;
+        (void)segment_access.GetAllSegments(all_segments);
+        names.reserve(endpoints.size());
+        for (const auto& [segment, client_id] : all_segments) {
+            if (std::find(endpoints.begin(), endpoints.end(),
+                          segment.transport_endpoint) != endpoints.end()) {
+                names.push_back(segment.name);
+            }
+        }
+    }
+
+    size_t before = 0;
+    size_t after = 0;
+    {
+        std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
+        before = invalid_replica_endpoints_.size();
+        for (const auto& endpoint : endpoints) {
+            if (!endpoint.empty()) {
+                invalid_replica_endpoints_.insert(endpoint);
+            }
+        }
+        for (const auto& name : names) {
+            invalid_replica_endpoints_.insert(name);
+        }
+        after = invalid_replica_endpoints_.size();
+    }
+    LOG(WARNING) << "reported invalid replica endpoints: count="
+                 << endpoints.size()
+                 << ", resolved_segment_names=" << names.size()
+                 << ", invalid_endpoints_total=" << before << "->" << after
+                 << ", endpoints=" << [&endpoints] {
+                        std::string joined;
+                        for (size_t i = 0; i < endpoints.size() && i < 8; ++i) {
+                            if (i) joined += ",";
+                            joined += endpoints[i];
+                        }
+                        return joined;
+                    }();
     return {};
 }
 
@@ -12407,6 +12580,7 @@ void MasterService::ClientMonitorFunc() {
             // Commit unmount of memory segments and clean up local_disk
             // segments for expired clients. Both require the exclusive
             // segment lock.
+            std::vector<UUID> committed_unmount_segments;
             {
                 ScopedSegmentAccess segment_access =
                     segment_manager_.getSegmentAccess();
@@ -12418,10 +12592,21 @@ void MasterService::ClientMonitorFunc() {
                               << ", action=unmount_expired_mem_segment";
                     // Clean up HTTP metadata if enabled
                     cleanupHttpMetadata(segment_names[i]);
+                    committed_unmount_segments.push_back(unmount_segments[i]);
                 }
                 for (auto& client_id : expired_clients) {
                     segment_access.UnmountLocalDiskSegment(client_id);
                 }
+            }
+            // 同步清理 etcd（方案一第 3 步）：client 过期卸载与主动 UnmountSegment
+            // 不同，此前从未清理 CVM 视图记录——segments/<seg_id> 描述符与
+            // snapshot/<master_id>/segments/<seg_id> 挂载记录永久残留，worker
+            // 挂掉后成为死记录，quota planner / CvmHttpServer 据此把数据切分
+            // /展示到死端点（.149:13428 无监听案例）。段锁已释放，etcd RPC
+            // 不阻塞其它操作；RemoveSegmentOwnerForCvm 内部按「其它 master
+            // 是否仍挂载」决定描述符去留，多 submaster 语义安全。
+            for (const auto& seg_id : committed_unmount_segments) {
+                RemoveSegmentOwnerForCvm(seg_id);
             }
             RecomputeTenantEffectiveQuotas();
             pt_unmount.End(0);

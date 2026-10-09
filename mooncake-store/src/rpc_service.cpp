@@ -1723,6 +1723,17 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ReportInvalidReplicaEndpoints(
+    const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "ReportInvalidReplicaEndpoints");
+    timer.LogRequest("action=report_invalid_replica_endpoints, count=",
+                     endpoints.size());
+    auto result = master_service_.ReportInvalidReplicaEndpoints(endpoints);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
@@ -2289,6 +2300,15 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
+    // 上次会话遗漏注册：UnmountLocalDiskSegment（worker 侧 RefreshSubmasterAddresses
+    // removed 分支定向调用，未注册时运行时报 method not found）。
+    server.register_handler<
+        &mooncake::WrappedMasterService::UnmountLocalDiskSegment>(
+        &wrapped_master_service);
+    // 方案二被动层：client 传输失败后的坏端点上报。
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReportInvalidReplicaEndpoints>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

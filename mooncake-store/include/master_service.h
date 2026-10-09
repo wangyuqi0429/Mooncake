@@ -854,6 +854,18 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief 被动坏端点上报（方案二被动层）。
+     *
+     * client 传输失败后上报目标 transport_endpoint，master 将其写入
+     * invalid_replica_endpoints_（transport_endpoint + 对应 segment_name
+     * 双形式），供分配过滤（AllocateAndInsertMetadata 的排除集）与读路径
+     * （IsReplicaReadable）跳过。自愈闭环：worker 重启后 MountSegment
+     * 成功即 erase，端点恢复可用。幂等；批量写与单笔写共用。
+     */
+    auto ReportInvalidReplicaEndpoints(const std::vector<std::string>& endpoints)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -2402,6 +2414,16 @@ class MasterService {
     // HA backend 下生效，其余场景为空操作。
     void PublishSegmentOwnerForCvm(const Segment& segment);
     void RemoveSegmentOwnerForCvm(const UUID& segment_id);
+    // 方案一 A（te_endpoint 代际替换）：worker 每次进程启动都以新 client_id
+    // 重挂段，P2PHANDSHAKE 协议下 te_endpoint 端口随进程变化。MountSegment
+    // 尾部调用本方法：检测「同 segment_name + 同 host_id + 不同 te_endpoint」
+    // 的旧代残留（worker 重启前的死段）并立即清理——内存段两阶段卸载 +
+    // etcd 挂载记录/描述符（RemoveSegmentOwnerForCvm）+ invalid 集合卫生，
+    // 不等 TTL reaper 过期。设计假设：同一 host 的同 name worker 单进程
+    // 部署（进程内所有段共享同一 te_endpoint；跨 boot 端口必变）。
+    // 非 P2PHANDSHAKE 协议（te_endpoint 为固定 hostname，跨 boot 不变）
+    // 检测条件不成立，自动 no-op，由 TTL reaper 与方案一 B 兜底。
+    void EvictStaleGenerationForHost(const Segment& incoming);
     // 动态 KV slot 划分：以 etcd 注册表为唯一事实源，读取已注册的 primary
     // master 列表，按一致性哈希环（cvm::ResolveOwnedSlotsOnRing）计算本机
     // 应拥有的 slot 集合。etcd 读取失败时沿用上一轮结果（sticky），避免

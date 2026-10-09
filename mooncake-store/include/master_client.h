@@ -625,6 +625,22 @@ class MasterClient {
         int64_t ssd_total_capacity_bytes);
 
     /**
+     * @brief 被动坏端点上报（方案二被动层）：传输失败后上报目标
+     * transport_endpoint，master 标记进 invalid_replica_endpoints_（分配
+     * 过滤 + 读路径跳过；worker 重挂载自愈）。多 submaster 下内存段全量
+     * 挂载于所有 submaster，坏端点影响所有 master 的分配，需广播。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportInvalidReplicaEndpoints(
+        const std::vector<std::string>& endpoints);
+
+    /**
+     * @brief 定向 ReportInvalidReplicaEndpoints：向指定 submaster 上报
+     * （不切换当前连接）。与全量挂载广播对称。
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportInvalidReplicaEndpointsTo(
+        const std::string& address, const std::vector<std::string>& endpoints);
+
+    /**
      * @brief Adds multiple new objects to a specified client in batch.
      * @param keys         A list of object keys (names) that were successfully
      * offloaded.

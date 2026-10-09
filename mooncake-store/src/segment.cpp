@@ -535,6 +535,33 @@ ErrorCode ScopedSegmentAccess::GetAllSegments(
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::GetAllSegmentsWithOwner(
+    std::vector<std::pair<Segment, UUID>>& all_segments) {
+    all_segments.clear();
+
+    // segment_id -> true owner client_id, built from the authoritative
+    // client_segments_ forward map (client_by_name_ is name-granular and
+    // would attribute old-generation segments of a restarted same-named
+    // worker to the new client).
+    std::unordered_map<UUID, UUID, boost::hash<UUID>> owner_by_segment;
+    for (const auto& [client_id, segment_ids] :
+         segment_manager_->client_segments_) {
+        for (const auto& segment_id : segment_ids) {
+            owner_by_segment.emplace(segment_id, client_id);
+        }
+    }
+
+    for (auto& segment_pair : segment_manager_->mounted_segments_) {
+        UUID client_id{0, 0};
+        auto owner_it = owner_by_segment.find(segment_pair.first);
+        if (owner_it != owner_by_segment.end()) {
+            client_id = owner_it->second;
+        }
+        all_segments.emplace_back(segment_pair.second.segment, client_id);
+    }
+    return ErrorCode::OK;
+}
+
 std::vector<std::string> ScopedSegmentAccess::GetHostOrderedSegments(
     const std::string& writer_host_id, const std::string& key) const {
     return BuildHostOrderedSegments(segment_manager_->segments_by_host_,

@@ -150,6 +150,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ReportInvalidReplicaEndpoints> {
+    static constexpr const char* value = "ReportInvalidReplicaEndpoints";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::UpsertStart> {
     static constexpr const char* value = "UpsertStart";
 };
@@ -2103,6 +2108,23 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacityTo(
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
     return invoke_rpc_to<&WrappedMasterService::ReportSsdCapacity, void>(
         address, client_id, ssd_total_capacity_bytes);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportInvalidReplicaEndpoints(
+    const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportInvalidReplicaEndpoints");
+    timer.LogRequest("endpoints_count=", endpoints.size());
+    return invoke_rpc<&WrappedMasterService::ReportInvalidReplicaEndpoints,
+                     void>(endpoints);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportInvalidReplicaEndpointsTo(
+    const std::string& address, const std::vector<std::string>& endpoints) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportInvalidReplicaEndpointsTo");
+    timer.LogRequest("address=", address, ", endpoints_count=",
+                     endpoints.size());
+    return invoke_rpc_to<&WrappedMasterService::ReportInvalidReplicaEndpoints,
+                         void>(address, endpoints);
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
