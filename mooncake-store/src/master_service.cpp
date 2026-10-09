@@ -1784,6 +1784,7 @@ bool MasterService::DriveReshardIntent(const cvm::ReshardIntent& intent) {
         created.rank = rank;
         created.primary_id = master_id_;
         created.state = static_cast<int32_t>(cvm::SlotState::kStable);
+        created.epoch = 1;  // CreateRingSlotAssign 守卫：epoch=0 视为未设置
         err = cvm::EtcdViewStore::CreateRingSlotAssign(cluster_id_, created);
         if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
             LOG(WARNING) << "DriveReshardIntent: claim race lost rank=" << rank

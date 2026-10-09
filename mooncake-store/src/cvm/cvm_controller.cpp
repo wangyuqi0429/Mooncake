@@ -1032,6 +1032,7 @@ bool CvmController::TryBootstrapRingSlots() {
         assign.rank = rank;
         assign.primary_id = config_.master_id;
         assign.state = static_cast<int32_t>(SlotState::kStable);
+        assign.epoch = 1;  // CreateRingSlotAssign 守卫：epoch=0 视为未设置
         const ErrorCode err = EtcdViewStore::CreateRingSlotAssign(
             config_.cluster_namespace, assign);
         if (err == ErrorCode::OK) {
@@ -1225,6 +1226,7 @@ bool CvmController::RepairMissingRankRecords(const RingSlotsView& view,
         assign.rank = r;
         assign.primary_id = config_.master_id;
         assign.state = static_cast<int32_t>(SlotState::kStable);
+        assign.epoch = 1;  // CreateRingSlotAssign 守卫：epoch=0 视为未设置
         const ErrorCode err = EtcdViewStore::CreateRingSlotAssign(
             config_.cluster_namespace, assign);
         if (err == ErrorCode::OK) {
