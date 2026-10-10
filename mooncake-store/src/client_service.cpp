@@ -2306,8 +2306,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     // 方案二被动层：收集传输失败副本的目标端点，循环后上报 master。
     // best-effort 归因：TransferWrite 失败也可能源于本地原因（staging 等），
     // 误报由 worker 重挂载时 MountSegment 的 erase 自愈兜底。
-    // vsegment 副本 Descriptor 仅含逻辑位置（物理端点传输时经
-    // SegmentRegistry 解析），无法归因，跳过。
+    // vsegment 副本 Descriptor 仅含逻辑位置，其物理端点经 TransferWrite
+    // 内部解析传输 plan 后回填到 failed_endpoints（条带成员级归因）。
     std::set<std::string> failed_endpoints;
     for (const auto& replica : put_start.replicas) {
         if (replica.is_memory_replica() || replica.is_nof_replica() ||
@@ -2318,7 +2318,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                       : replica.is_vsegment_replica()
                                           ? ReplicaType::MEMORY
                                           : ReplicaType::NOF_SSD;
-            ErrorCode transfer_err = TransferWrite(replica, slices);
+            ErrorCode transfer_err =
+                TransferWrite(replica, slices, &failed_endpoints);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
                 if (replica.is_memory_replica()) {
@@ -2445,13 +2446,15 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
     }
 
-    // 方案二被动层：收集传输失败副本的目标端点（vsegment 无物理端点，
-    // Descriptor 仅含逻辑位置，跳过归因）。
+    // 方案二被动层：收集传输失败副本的目标端点。vsegment 副本 Descriptor
+    // 仅含逻辑位置，其物理端点经 TransferWrite 内部解析传输 plan 后回填
+    // 到 failed_endpoints（条带成员级归因）。
     std::set<std::string> failed_endpoints;
     // Transfer to memory-class replicas (direct memory or vsegment).
     for (const auto& replica : upsert_start.replicas) {
         if (replica.is_memory_replica() || replica.is_vsegment_replica()) {
-            ErrorCode transfer_err = TransferWrite(replica, slices);
+            ErrorCode transfer_err =
+                TransferWrite(replica, slices, &failed_endpoints);
             if (transfer_err != ErrorCode::OK) {
                 if (replica.is_memory_replica()) {
                     failed_endpoints.insert(replica.get_memory_descriptor()
@@ -2558,15 +2561,17 @@ class PutOperation {
         ReplicaType replica_type;
         TransferFuture future;
         // 方案二被动层：传输失败归因用，目标 worker 的 transport endpoint。
-        // vsegment 副本 Descriptor 仅含逻辑位置（分区/偏移），物理端点在
-        // 传输时经 SegmentRegistry 解析，此处留空表示不可归因。
-        std::string transport_endpoint;
+        // memory/nof 副本单端点；vsegment 副本记录传输 plan 解析出的全部
+        // 条带成员端点（best-effort：无法定位具体失败成员，误报由 worker
+        // 重挂载时 MountSegment 的 erase 自愈兜底）。
+        std::vector<std::string> transport_endpoints;
 
         PendingTransferRecord(
             ReplicaType type, TransferFuture&& transfer_future,
-            std::string endpoint = std::string())
-            : replica_type(type), future(std::move(transfer_future)),
-              transport_endpoint(std::move(endpoint)) {}
+            std::vector<std::string> endpoints = {})
+            : replica_type(type),
+              future(std::move(transfer_future)),
+              transport_endpoints(std::move(endpoints)) {}
     };
 
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -2590,8 +2595,11 @@ class PutOperation {
     size_t requested_nof_replicas = 0;
     ReplicaTransferSummary transfer_summary;
 
-    // 方案二被动层：本操作传输失败副本的目标端点集合（memory/nof；
-    // vsegment 无物理端点不归因），批次结束后由调用方聚合上报 master。
+    // 方案二被动层：本操作传输失败副本的目标端点集合。memory/nof 按副本
+    // Descriptor 端点归因；vsegment 副本 Descriptor 仅含逻辑位置，由
+    // SubmitTransfers/WaitForTransfers 经 PendingTransferRecord.
+    // transport_endpoints（传输 plan 全部条带成员端点）best-effort 归因。
+    // 批次结束后由调用方聚合上报 master。
     std::set<std::string> failed_endpoints;
 
     // Error context for debugging
@@ -2926,13 +2934,15 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                                               ? ReplicaType::MEMORY
                                               : ReplicaType::NOF_SSD;
                 // 方案二被动层：提交时记录目标端点，供失败归因使用
-                std::string transport_endpoint;
+                std::vector<std::string> transport_endpoints;
                 if (replica.is_memory_replica()) {
-                    transport_endpoint = replica.get_memory_descriptor()
-                                              .buffer_descriptor.transport_endpoint_;
+                    transport_endpoints.push_back(
+                        replica.get_memory_descriptor()
+                            .buffer_descriptor.transport_endpoint_);
                 } else if (replica.is_nof_replica()) {
-                    transport_endpoint = replica.get_nof_descriptor()
-                                              .buffer_descriptor.transport_endpoint_;
+                    transport_endpoints.push_back(
+                        replica.get_nof_descriptor()
+                            .buffer_descriptor.transport_endpoint_);
                 }
                 std::optional<TransferFuture> submit_result;
                 if (replica.is_vsegment_replica()) {
@@ -2957,6 +2967,10 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                                                           plan.error);
                         op.AppendFailureContext(plan.detail);
                         continue;
+                    }
+                    // vsegment 条带成员物理端点，失败时 best-effort 归因
+                    for (const auto& subrequest : plan.requests) {
+                        transport_endpoints.push_back(subrequest.endpoint);
                     }
                     submit_result = transfer_submitter_->submitVSegment(
                         plan, TransferRequest::WRITE);
@@ -2987,15 +3001,15 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     op.transfer_summary.RecordFailure(replica_type,
                                                       ErrorCode::TRANSFER_FAIL);
                     op.AppendFailureContext(failure_context);
-                    if (!transport_endpoint.empty()) {
-                        op.failed_endpoints.insert(transport_endpoint);
+                    for (const auto& endpoint : transport_endpoints) {
+                        op.failed_endpoints.insert(endpoint);
                     }
                     continue;
                 }
 
                 op.pending_transfers.emplace_back(
                     replica_type, std::move(submit_result.value()),
-                    std::move(transport_endpoint));
+                    std::move(transport_endpoints));
             }
         }
 
@@ -3018,9 +3032,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
                 // 方案二被动层：异步传输失败时按提交时记录的端点归因
-                // （vsegment 无物理端点，transport_endpoint 为空则跳过）
-                if (!pending_transfer.transport_endpoint.empty()) {
-                    op.failed_endpoints.insert(pending_transfer.transport_endpoint);
+                // （vsegment 为 plan 解析出的全部条带成员端点，best-effort）
+                for (const auto& endpoint :
+                     pending_transfer.transport_endpoints) {
+                    op.failed_endpoints.insert(endpoint);
                 }
                 std::string error_context =
                     "Transfer " + std::to_string(i) + " failed";
@@ -3456,7 +3471,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             merged_op.failed_endpoints.insert(seg);
         } else {
             merged_op.pending_transfers.emplace_back(
-                ReplicaType::MEMORY, std::move(submit_result.value()), seg);
+                ReplicaType::MEMORY, std::move(submit_result.value()),
+                std::vector<std::string>{seg});
         }
         if (!all_transfers_submitted) {
             LOG(ERROR) << "Transfer submission failed for key " << op.key
@@ -4963,7 +4979,8 @@ void Client::PutToLocalFile(const std::string& key,
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code) {
+                               TransferRequest::OpCode op_code,
+                               std::set<std::string>* failed_endpoints) {
     // TransferData 读写共函数：仅读路径（op_code==READ）计入 GET_SINGLE_
     // TRANSFER_* 键，写路径 PUT_* 键待后续批次，避免读写流量互相污染。
     // SUBMIT/WAIT 拆分用于区分 RDMA 提交阻塞与传输等待。
@@ -4983,6 +5000,9 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
 
     std::optional<TransferFuture> future;
+    // vsegment 传输 plan 解析出的条带成员物理端点，失败时 best-effort 归因
+    // （无法定位具体失败成员，全部上报；误报由 worker 重挂载自愈兜底）。
+    std::vector<std::string> vsegment_plan_endpoints;
     if (replica_descriptor.is_vsegment_replica()) {
         if (!vsegment_transfer_planner_) {
             LOG(ERROR) << "VSegmentTransferPlanner not initialized";
@@ -5001,6 +5021,9 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
             LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
             if (is_read) pt_full.End(-1);
             return plan.error;
+        }
+        for (const auto& subrequest : plan.requests) {
+            vsegment_plan_endpoints.push_back(subrequest.endpoint);
         }
         if (is_read) pt_submit.Start();
         future = transfer_submitter_->submitVSegment(plan, op_code);
@@ -5025,6 +5048,11 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     }
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
+        if (failed_endpoints) {
+            for (const auto& endpoint : vsegment_plan_endpoints) {
+                failed_endpoints->insert(endpoint);
+            }
+        }
         if (is_read) pt_full.End(-1);
         return ErrorCode::TRANSFER_FAIL;
     }
@@ -5033,6 +5061,11 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
     if (is_read) pt_wait.Start();
     const ErrorCode transfer_result = future->get();
+    if (transfer_result != ErrorCode::OK && failed_endpoints) {
+        for (const auto& endpoint : vsegment_plan_endpoints) {
+            failed_endpoints->insert(endpoint);
+        }
+    }
     if (is_read) {
         const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
         pt_wait.End(pt_status);
@@ -5089,8 +5122,10 @@ ErrorCode Client::TransferReadInternal(
 }
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
-                                std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+                                std::vector<Slice>& slices,
+                                std::set<std::string>* failed_endpoints) {
+    return TransferData(replica_descriptor, slices, TransferRequest::WRITE,
+                        failed_endpoints);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,

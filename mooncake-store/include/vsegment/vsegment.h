@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -156,8 +157,13 @@ class PartitionQuotaAllocator {
     explicit PartitionQuotaAllocator(
         std::vector<PartitionVSegmentConfig> configs);
 
-    VSegmentAllocationResult Allocate(const std::string& vsegment_id,
-                                      const VSegmentProfile& profile);
+    // excluded_segments：运行时坏端点排除集（te_endpoint 与 segment_name 双
+    // 形式的 string 集合，见 MasterService::invalid_replica_endpoints_）。条带
+    // 成员选择时跳过其中的段；可用段不足 member_count 时按配额不足失败，
+    // 避免把新 vsegment 的成员分配到已判死的物理段上。
+    VSegmentAllocationResult Allocate(
+        const std::string& vsegment_id, const VSegmentProfile& profile,
+        const std::set<std::string>* excluded_segments = nullptr);
     ErrorCode Restore(const VSegmentView& view,
                       const VSegmentProfile& profile,
                       std::string* detail = nullptr);

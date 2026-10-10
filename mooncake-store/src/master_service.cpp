@@ -816,6 +816,16 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
         }
         vsegment_service_ =
             std::make_shared<vsegment::VSegmentService>(std::move(quota));
+        // 配额发现活性校验的运行时补充：quota snapshot 是一次性首写（first-
+        // writer-wins），发布后死掉的物理段会永久残留在快照里。此处注入
+        // invalid_replica_endpoints_ 排除集提供者，让新 vsegment 的条带成员
+        // 避开运行时已判死的段（worker 重挂载时 MountSegment erase 自愈）。
+        // 锁序：manager mutex_ → invalid_endpoints_mutex_（与老路径
+        // PutStart 的 allocator 锁 → invalid 锁方向一致，无反向持有）。
+        vsegment_service_->SetExcludedSegmentsProvider([this]() {
+            std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
+            return invalid_replica_endpoints_;
+        });
     }
 
     std::unordered_map<std::string,
@@ -2501,6 +2511,9 @@ void MasterService::EvictStaleGenerationForHost(const Segment& incoming) {
         for (const auto& info : stale) {
             invalid_replica_endpoints_.erase(info.endpoint);
             invalid_replica_endpoints_.erase(info.name);
+            // UUID 形式（ReportInvalidReplicaEndpoints 三形式插入的对称
+            // 清除）：vsegment 物理分配过滤按 quota.segment_id=UUID 匹配。
+            invalid_replica_endpoints_.erase(UuidToString(info.id));
         }
     }
 
@@ -3212,6 +3225,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
         invalid_replica_endpoints_.erase(segment.te_endpoint);
         invalid_replica_endpoints_.erase(segment.name);
+        // UUID 形式（ReportInvalidReplicaEndpoints 三形式插入的对称清除）：
+        // vsegment 物理分配过滤按 quota.segment_id=UUID 匹配排除集。
+        invalid_replica_endpoints_.erase(UuidToString(segment.id));
     }
     PublishSegmentOwnerForCvm(segment);
     // 方案一 A：新代段挂载完成后，立即清理同 host 同 name 的旧代死段
@@ -9276,21 +9292,54 @@ auto MasterService::ReportInvalidReplicaEndpoints(
         return {};
     }
 
-    // endpoint → segment_name 转换：invalid_replica_endpoints_ 的消费者
-    // 两侧——读路径 IsReplicaReadable 按 transport_endpoint 匹配；分配过滤
-    // （AllocateAndInsertMetadata 排除集，allocation_strategy 按 segment
-    // name 匹配）。因此双形式都插入（与 standby 恢复路径 :5014-5016 及
-    // MountSegment 自愈 erase 的形式一致）。
+    // endpoint → (segment_name, segment_id) 解析：invalid_replica_endpoints_
+    // 的消费者三侧——读路径 IsReplicaReadable 按 transport_endpoint 匹配；
+    // 老路径分配过滤（allocation_strategy 按 segment name 匹配）；vsegment
+    // 物理分配过滤（PartitionQuotaAllocator 按 quota.segment_id=UUID 匹配，
+    // 见 VSegmentService::SetExcludedSegmentsProvider）。因此三形式都插入
+    //（与 standby 恢复路径及 MountSegment 自愈 erase 的形式一致）。
+    // 本地段表解析 name+UUID；非本地段（挂载在其他 submaster，vsegment 条带
+    // 成员的常见形态）经 etcd SegmentDescriptor 兜底解析。上报是低频失败
+    // 路径，一次 etcd range 可接受；etcd 解析失败则降级为仅本地结果。
     std::vector<std::string> names;
+    std::vector<std::string> segment_ids;
     {
         ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> all_segments;
         (void)segment_access.GetAllSegments(all_segments);
         names.reserve(endpoints.size());
+        segment_ids.reserve(endpoints.size());
         for (const auto& [segment, client_id] : all_segments) {
             if (std::find(endpoints.begin(), endpoints.end(),
                           segment.te_endpoint) != endpoints.end()) {
                 names.push_back(segment.name);
+                segment_ids.push_back(UuidToString(segment.id));
+            }
+        }
+    }
+    {
+        // etcd 兜底：对本地段表未命中的上报值，拉全量 SegmentDescriptor 按
+        // te_endpoint / segment_name 匹配解析 UUID（quota snapshot 死段残留
+        // 场景中，描述符仍在 etcd，本地却无该段）。
+        std::set<std::string> resolved(endpoints.begin(), endpoints.end());
+        for (const auto& name : names) resolved.insert(name);
+        std::vector<cvm::SegmentDescriptor> descriptors;
+        ViewVersionId revision = 0;
+        if (cvm::EtcdViewStore::LoadAllSegmentDescriptors(
+                cluster_id_, descriptors, revision) == ErrorCode::OK) {
+            for (const auto& desc : descriptors) {
+                const bool by_endpoint =
+                    !desc.te_endpoint.empty() &&
+                    resolved.count(desc.te_endpoint) > 0;
+                const bool by_name =
+                    !desc.segment_name.empty() &&
+                    resolved.count(desc.segment_name) > 0;
+                if (by_endpoint || by_name) {
+                    if (!desc.segment_id.empty())
+                        segment_ids.push_back(desc.segment_id);
+                    if (by_endpoint && !desc.segment_name.empty())
+                        names.push_back(desc.segment_name);
+                }
             }
         }
     }
@@ -9308,11 +9357,15 @@ auto MasterService::ReportInvalidReplicaEndpoints(
         for (const auto& name : names) {
             invalid_replica_endpoints_.insert(name);
         }
+        for (const auto& segment_id : segment_ids) {
+            invalid_replica_endpoints_.insert(segment_id);
+        }
         after = invalid_replica_endpoints_.size();
     }
     LOG(WARNING) << "reported invalid replica endpoints: count="
                  << endpoints.size()
                  << ", resolved_segment_names=" << names.size()
+                 << ", resolved_segment_ids=" << segment_ids.size()
                  << ", invalid_endpoints_total=" << before << "->" << after
                  << ", endpoints=" << [&endpoints] {
                         std::string joined;

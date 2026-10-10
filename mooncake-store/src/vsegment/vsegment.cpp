@@ -414,7 +414,8 @@ PartitionQuotaAllocator::PartitionQuotaAllocator(
 }
 
 VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
-    const std::string& vsegment_id, const VSegmentProfile& profile) {
+    const std::string& vsegment_id, const VSegmentProfile& profile,
+    const std::set<std::string>* excluded_segments) {
     std::lock_guard<std::mutex> lock(mutex_);
     VSegmentAllocationResult result;
     std::string detail;
@@ -444,9 +445,15 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
     };
     std::vector<Candidate> candidates;
     std::set<std::string> visited_segments;
+    size_t excluded_count = 0;
     auto& profile_ranges = free_ranges_.at(profile.name);
     for (const auto& quota : config->second.quotas) {
         if (!visited_segments.insert(quota.segment_id).second) continue;
+        if (excluded_segments != nullptr &&
+            excluded_segments->count(quota.segment_id) > 0) {
+            ++excluded_count;
+            continue;
+        }
         const auto& ranges = profile_ranges.at(quota.segment_id);
         auto range = std::find_if(ranges.begin(), ranges.end(), [&](const auto& r) {
             return r.length >= profile.member_extent_size;
@@ -465,6 +472,9 @@ VSegmentAllocationResult PartitionQuotaAllocator::Allocate(
                 << profile.member_count << " psegments with "
                 << profile.member_extent_size << " free bytes each, but only "
                 << candidates.size() << " are available";
+        if (excluded_count > 0)
+            message << " (" << excluded_count
+                    << " excluded by runtime invalid-endpoint reports)";
         result.detail = message.str();
         return result;
     }

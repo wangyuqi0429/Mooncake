@@ -1,7 +1,9 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +44,11 @@ class VSegmentService final : public VSegmentViewProvider {
     const PartitionPhysicalQuotaSnapshot& quota_snapshot() const {
         return quota_snapshot_;
     }
+    // 注入运行时坏端点排除集提供者，并向所有已存在的 partition manager
+    // 透传；后续新增的 manager 在 AddPartition 时同样透传。物理分配时用
+    // 于把新 vsegment 的条带成员避开已判死的物理段。
+    void SetExcludedSegmentsProvider(
+        std::function<std::set<std::string>()> provider);
 
     VSegmentPutStartResult StartPut(const std::string& partition_id,
                                     uint64_t route_epoch,
@@ -83,6 +90,7 @@ class VSegmentService final : public VSegmentViewProvider {
         const std::string& partition_id);
 
     PartitionPhysicalQuotaSnapshot quota_snapshot_;
+    std::function<std::set<std::string>()> excluded_segments_provider_;
     std::mutex mutex_;
     std::unordered_map<std::string, std::shared_ptr<VSegmentManager>>
         partitions_;

@@ -239,7 +239,16 @@ VSegmentAllocationResult VSegmentManager::CreateSingleFlight(
     const std::string vsegment_id = UuidToString(generate_uuid());
     auto logical = std::make_unique<LogicalRangeAllocator>(
         profile->second.member_extent_size * profile->second.member_count);
-    auto allocation = physical_allocator_.Allocate(vsegment_id, profile->second);
+    // 运行时坏端点排除集快照：把新 vsegment 的条带成员避开已判死的物理段
+    // （provider 为空时不过滤，行为与旧版本一致）。
+    std::set<std::string> excluded_segments;
+    const std::set<std::string>* excluded_segments_ptr = nullptr;
+    if (excluded_segments_provider_) {
+        excluded_segments = excluded_segments_provider_();
+        excluded_segments_ptr = &excluded_segments;
+    }
+    auto allocation = physical_allocator_.Allocate(vsegment_id, profile->second,
+                                                   excluded_segments_ptr);
     if (!allocation) return allocation;
     try {
         vsegments_.emplace(

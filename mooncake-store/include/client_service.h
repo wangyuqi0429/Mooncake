@@ -848,12 +848,18 @@ class Client {
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+                           TransferRequest::OpCode op_code,
+                           std::set<std::string>* failed_endpoints = nullptr);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
+    // failed_endpoints：vsegment 传输失败归因用。vsegment 副本 Descriptor 仅含
+    // 逻辑位置，物理端点在传输 plan 中解析；失败时 best-effort 上报 plan 中
+    // 全部条带成员端点（无法定位具体失败成员，误报由 worker 重挂载时
+    // MountSegment 的 erase 自愈兜底）。非 vsegment 副本不填充。
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices);
+                            std::vector<Slice>& slices,
+                            std::set<std::string>* failed_endpoints = nullptr);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,

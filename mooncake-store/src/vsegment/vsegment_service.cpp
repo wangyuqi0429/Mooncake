@@ -34,6 +34,22 @@ std::shared_ptr<VSegmentManager> VSegmentService::FindPartition(
     return found == partitions_.end() ? nullptr : found->second;
 }
 
+void VSegmentService::SetExcludedSegmentsProvider(
+    std::function<std::set<std::string>()> provider) {
+    std::vector<std::shared_ptr<VSegmentManager>> managers;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        excluded_segments_provider_ = provider;
+        managers.reserve(partitions_.size());
+        for (const auto& [id, manager] : partitions_) {
+            (void)id;
+            managers.push_back(manager);
+        }
+    }
+    for (const auto& manager : managers)
+        manager->SetExcludedSegmentsProvider(provider);
+}
+
 ErrorCode VSegmentService::AddPartition(
     const std::string& partition_id, uint64_t route_epoch,
     std::shared_ptr<VSegmentStateCommitter> committer,
@@ -47,6 +63,13 @@ ErrorCode VSegmentService::AddPartition(
     if (result != ErrorCode::OK) return result;
     auto manager = std::make_shared<VSegmentManager>(
         quota_snapshot_, partition_id, std::move(committer));
+    {
+        // 透传排除集提供者（若在 service 构造后注入）。持 service mutex_ 读
+        // provider 指针，与 SetExcludedSegmentsProvider 的写入互斥。
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (excluded_segments_provider_)
+            manager->SetExcludedSegmentsProvider(excluded_segments_provider_);
+    }
     result = manager->SetRouteEpoch(route_epoch);
     if (result != ErrorCode::OK) return result;
     if (recovered) {

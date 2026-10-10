@@ -1,8 +1,10 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <future>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -130,6 +132,14 @@ class VSegmentManager {
         std::string* detail = nullptr);
     bool FindView(const std::string& vsegment_id, VSegmentView* view) const;
     VSegmentManagerStats Stats() const;
+    // 注入运行时坏端点排除集提供者（te_endpoint 与 segment_name 双形式）。
+    // 物理分配（CreateSingleFlight）时调用获取快照，跳过其中的段，避免把
+    // 新 vsegment 的条带成员落在已判死的物理段上。锁序：manager mutex_ →
+    // provider 内的 invalid 锁（与 MountSegment 自愈 erase 方向一致）。
+    void SetExcludedSegmentsProvider(
+        std::function<std::set<std::string>()> provider) {
+        excluded_segments_provider_ = std::move(provider);
+    }
 
    private:
     struct ManagedVSegment {
@@ -164,6 +174,7 @@ class VSegmentManager {
     std::unordered_map<std::string,
                        std::shared_future<VSegmentAllocationResult>>
         pending_creations_;
+    std::function<std::set<std::string>()> excluded_segments_provider_;
 };
 
 }  // namespace mooncake::vsegment
