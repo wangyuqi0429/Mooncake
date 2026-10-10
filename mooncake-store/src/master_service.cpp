@@ -824,7 +824,10 @@ ErrorCode MasterService::RefreshVSegmentOwnership(const std::string& acquiring) 
         // PutStart 的 allocator 锁 → invalid 锁方向一致，无反向持有）。
         vsegment_service_->SetExcludedSegmentsProvider([this]() {
             std::shared_lock<std::shared_mutex> lock(invalid_endpoints_mutex_);
-            return invalid_replica_endpoints_;
+            // unordered_set → set：provider 约定返回有序集合（消费侧
+            // PartitionQuotaAllocator::Allocate 按值语义持有快照）。
+            return std::set<std::string>(invalid_replica_endpoints_.begin(),
+                                         invalid_replica_endpoints_.end());
         });
     }
 
