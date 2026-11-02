@@ -24,6 +24,9 @@ DEFINE_string(protocol, "tcp", "Protocol");
 DEFINE_int32(port, 50052, "Real Client service port");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_string(local_buffer_size, "0", "Size of local buffer (e.g., 16MB, 1GB)");
+DEFINE_string(ub_numa_nodes, "",
+              "Comma-separated NUMA nodes for UB global segments; empty uses "
+              "all discovered NUMA nodes on multi-NUMA hosts");
 DEFINE_int32(threads, 1, "Number of threads for client service");
 DEFINE_string(tenant_id, "default", "Tenant identifier");
 DEFINE_bool(scheduling, false, "Enable Transfer Engine scheduling");
@@ -184,7 +187,8 @@ int main(int argc, char *argv[]) {
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
-        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port, offload_rpc_thread_num);
+        FLAGS_tenant_id, offload_rpc_thread_num, FLAGS_enable_http_server,
+        FLAGS_http_port, FLAGS_ub_numa_nodes);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

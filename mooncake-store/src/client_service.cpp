@@ -3915,18 +3915,23 @@ tl::expected<void, ErrorCode> Client::warmup(
     return {};
 }
 
-int Client::GetNumaNodeCount() const {
-    if (!transfer_engine_) return 0;
+std::vector<int> Client::GetNumaNodes() const {
+    if (!transfer_engine_) return {};
     auto topo = transfer_engine_->getLocalTopology();
-    if (!topo) return 0;
-    // discoverCpuTopology emits one "cpu:N" entry per NUMA node (regardless of
-    // whether it hosts a NIC), so counting them gives the NUMA node count.
-    int count = 0;
+    if (!topo) return {};
+
+    std::set<int> nodes;
     for (auto& [name, entry] : topo->getMatrix()) {
         (void)entry;
-        if (name.rfind("cpu:", 0) == 0) ++count;
+        if (name.rfind("cpu:", 0) != 0) continue;
+        try {
+            nodes.insert(std::stoi(name.substr(4)));
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Ignore invalid NUMA topology entry '" << name
+                         << "': " << e.what();
+        }
     }
-    return count;
+    return {nodes.begin(), nodes.end()};
 }
 
 tl::expected<void, ErrorCode> Client::MountSegment(

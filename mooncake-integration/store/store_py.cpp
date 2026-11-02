@@ -2145,6 +2145,7 @@ PYBIND11_MODULE(store, m) {
             "  local_buffer_size: Local buffer size (default 16MB).\n"
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
+            "  ub_numa_nodes: Comma-separated NUMA nodes for UB segments.\n"
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"

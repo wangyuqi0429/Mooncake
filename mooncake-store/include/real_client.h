@@ -524,7 +524,8 @@ class RealClient : public PyClient {
         const std::string &tenant_id = "default",
         size_t offload_rpc_thread_num = 8,
         bool enable_client_http_server = false,
-        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT,
+        const std::string &ub_numa_nodes = "");
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);

@@ -1383,11 +1383,12 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto result = InvokeRoutedWithSlotRetry<
-        &WrappedMasterService::GetReplicaList, GetReplicaListResponse>(
-        &timing, tenant_id, object_key,
-        /*rpc_stat_key=*/static_cast<uint32_t>(PerfKey::QUERY_RPC_CALL),
-        object_key, tenant_id, trace_id, client_id_);
+    auto result =
+        InvokeRoutedWithSlotRetry<&WrappedMasterService::GetReplicaList,
+                                  GetReplicaListResponse>(
+            &timing, tenant_id, object_key,
+            /*rpc_stat_key=*/static_cast<uint32_t>(PerfKey::QUERY_RPC_CALL),
+            object_key, tenant_id, trace_id, client_id_);
     timer.LogResponseExpected(result);
 
     const char* status = "ok";

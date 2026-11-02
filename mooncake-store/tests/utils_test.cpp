@@ -230,6 +230,26 @@ TEST(UtilsTest, SplitStringBasic) {
     EXPECT_EQ(tokens[3], "d");
 }
 
+TEST(UtilsTest, ParseNumaNodes) {
+    auto nodes = try_parse_numa_nodes("0, 2,3");
+    ASSERT_TRUE(nodes.has_value());
+    EXPECT_EQ(nodes.value(), (std::vector<int>{0, 2, 3}));
+
+    nodes = try_parse_numa_nodes("7");
+    ASSERT_TRUE(nodes.has_value());
+    EXPECT_EQ(nodes.value(), (std::vector<int>{7}));
+}
+
+TEST(UtilsTest, RejectsInvalidNumaNodes) {
+    EXPECT_FALSE(try_parse_numa_nodes("").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("0,").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("0,,2").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("-1").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("1,1").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("numa0").has_value());
+    EXPECT_FALSE(try_parse_numa_nodes("2147483648").has_value());
+}
+
 TEST(UtilsTest, GetInterfaceIPv4AddressLoopback) {
     auto address = GetInterfaceIPv4Address("lo");
     ASSERT_TRUE(address.has_value()) << address.error();

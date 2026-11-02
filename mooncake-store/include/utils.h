@@ -297,6 +297,15 @@ std::vector<std::string> splitString(const std::string& str,
                                      bool trim_spaces = true,
                                      bool keep_empty = false);
 
+/**
+ * @brief Parse a comma-separated list of non-negative NUMA node IDs.
+ *
+ * Whitespace around entries is ignored. Empty entries, duplicate nodes, and
+ * values outside the range of int are rejected.
+ */
+std::optional<std::vector<int>> try_parse_numa_nodes(
+    const std::string& node_list);
+
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;

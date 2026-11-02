@@ -220,6 +220,7 @@ constexpr const char* CONFIG_KEY_GLOBAL_SEGMENT_SIZE = "global_segment_size";
 constexpr const char* CONFIG_KEY_LOCAL_BUFFER_SIZE = "local_buffer_size";
 constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
+constexpr const char* CONFIG_KEY_UB_NUMA_NODES = "ub_numa_nodes";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
 constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";

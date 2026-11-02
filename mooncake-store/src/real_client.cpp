@@ -712,7 +712,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
-    size_t offload_rpc_thread_num, bool enable_client_http_server, int client_http_port) {
+    size_t offload_rpc_thread_num, bool enable_client_http_server,
+    int client_http_port, const std::string &ub_numa_nodes_config) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -904,29 +905,54 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
-        // For UB, mount ONE segment per NUMA node (each bound to its node,
-        // location="cpu:N"). Memory is spread across ALL NUMA nodes by count,
-        // not just NIC-bearing ones: this works even with a single bonded
-        // device (e.g. bonding_dev_0, NUMA=-1) where NIC-NUMA discovery would
-        // be empty, and it relies only on the (decimal) NUMA count, so it is
-        // unaffected by the hex "numa" attribute. Each segment then drives
-        // selectDevice (cpu:N -> local NIC, else any) and chip affinity
-        // (cpu:N -> chip via numaNodeToChipId). Automatic whenever UB has more
-        // than one NUMA node; independent of both MC_UB_NUMA_AFFINITY_ENABLE
-        // and MC_URMA_BONDING_MULTIPATH_ENABLE.
+        // For UB, mount one segment per selected NUMA node (location="cpu:N").
+        // ub_numa_nodes selects an explicit comma-separated node list. When it
+        // is unset, preserve the existing behavior of using every discovered
+        // NUMA node on multi-NUMA hosts. MC_UB_NUMA_NODES provides the same
+        // override for callers that do not use ConfigDict or the service CLI.
 #ifdef USE_UB
         std::vector<int> ub_numa_nodes;
         if (protocol == "ub") {
-            int numa_count = client_->GetNumaNodeCount();
-            if (numa_count > 1) {
-                std::string nodes_str;
-                for (int i = 0; i < numa_count; ++i) {
-                    ub_numa_nodes.push_back(i);
-                    if (i) nodes_str += ",";
-                    nodes_str += std::to_string(i);
+            const auto available_nodes = client_->GetNumaNodes();
+            std::string requested_nodes = ub_numa_nodes_config;
+            if (requested_nodes.empty()) {
+                const char *env_nodes = std::getenv("MC_UB_NUMA_NODES");
+                if (env_nodes != nullptr) requested_nodes = env_nodes;
+            }
+
+            bool explicit_selection = !requested_nodes.empty();
+            if (explicit_selection) {
+                auto parsed_nodes = try_parse_numa_nodes(requested_nodes);
+                if (!parsed_nodes.has_value()) {
+                    MC_LOG(ERROR)
+                        << "Invalid UB NUMA node list '" << requested_nodes
+                        << "': expected unique non-negative node IDs separated "
+                           "by commas";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                MC_LOG(INFO) << "UB per-NUMA mode: NUMA node count=" << numa_count
-                          << ", nodes=[" << nodes_str << "]";
+                for (int node : parsed_nodes.value()) {
+                    if (!std::binary_search(available_nodes.begin(),
+                                            available_nodes.end(), node)) {
+                        MC_LOG(ERROR)
+                            << "Requested UB NUMA node " << node
+                            << " is not present in the local topology";
+                        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                }
+                ub_numa_nodes = std::move(parsed_nodes.value());
+            } else if (available_nodes.size() > 1) {
+                ub_numa_nodes = available_nodes;
+            }
+
+            if (!ub_numa_nodes.empty()) {
+                std::string nodes_str;
+                for (int node : ub_numa_nodes) {
+                    if (!nodes_str.empty()) nodes_str += ",";
+                    nodes_str += std::to_string(node);
+                }
+                MC_LOG(INFO) << "UB per-NUMA mode: selection="
+                             << (explicit_selection ? "explicit" : "auto")
+                             << ", nodes=[" << nodes_str << "]";
             }
         }
 #endif  // USE_UB
@@ -940,29 +966,37 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            // UB NUMA affinity: split this chunk into one segment per NIC-NUMA
-            // node, each physically bound to its node and registered with
-            // location "cpu:N" (so selectDevice picks the NUMA-local NIC).
+            // Split this chunk across the selected NUMA nodes. The aligned page
+            // count is divided evenly; any remainder is assigned one page at a
+            // time to the first nodes, so the total allocation is only rounded
+            // once instead of once per node.
 #ifdef USE_UB
             if (!ub_numa_nodes.empty()) {
                 size_t page_sz = should_use_hugepage
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
                 size_t n = ub_numa_nodes.size();
-                size_t per_node_size = align_up(segment_size / n, page_sz);
-                if (per_node_size == 0) {
-                    MC_LOG(ERROR) << "UB per-NUMA: per_node_size is 0, segment "
-                                     "too small for " << n << " NUMA nodes";
+                size_t aligned_size = align_up(segment_size, page_sz);
+                size_t page_count = aligned_size / page_sz;
+                if (page_count < n) {
+                    MC_LOG(ERROR) << "UB per-NUMA: segment has " << page_count
+                                  << " aligned pages, fewer than the " << n
+                                  << " selected NUMA nodes";
                     return tl::unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                for (int node : ub_numa_nodes) {
+                size_t base_pages = page_count / n;
+                size_t extra_pages = page_count % n;
+                for (size_t i = 0; i < n; ++i) {
+                    int node = ub_numa_nodes[i];
+                    size_t node_size =
+                        (base_pages + (i < extra_pages ? 1 : 0)) * page_sz;
                     // Use UB's own allocator bound to this node: numa_alloc_onnode
                     // via libnuma, registered in the store-memory table, so URMA
                     // can register it. (A raw mmap+mbind buffer cannot be
                     // registered by urma_register_seg -- it fails with error
                     // 2048 because the VMA has no backing pages at reg time.)
                     void *ptr = mooncake::ub_allocate_memory_onnode(
-                        /*alignment=*/page_sz, per_node_size, node);
+                        /*alignment=*/page_sz, node_size, node);
                     if (!ptr) {
                         MC_LOG(ERROR) << "UB per-NUMA: failed to allocate "
                                          "segment for node " << node;
@@ -970,14 +1004,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                     }
                     // numa_alloc-backed => free via ub_free_memory/numa_free,
                     // NOT munmap. Track with UbSegmentDeleter accordingly.
-                    ub_segment_ptrs_.emplace_back(
-                        ptr, UbSegmentDeleter{per_node_size});
+                    ub_segment_ptrs_.emplace_back(ptr,
+                                                  UbSegmentDeleter{node_size});
 
                     std::string loc = genCpuNodeName(node);  // "cpu:<node>"
-                    MC_LOG(INFO) << "Mounting UB per-NUMA segment: node=" << node
-                              << ", size=" << per_node_size << ", loc=" << loc;
-                    auto mr = client_->MountSegment(ptr, per_node_size, protocol,
-                                                    loc);
+                    MC_LOG(INFO)
+                        << "Mounting UB per-NUMA segment: node=" << node
+                        << ", size=" << node_size << ", loc=" << loc;
+                    auto mr =
+                        client_->MountSegment(ptr, node_size, protocol, loc);
                     if (!mr.has_value()) {
                         MC_LOG(ERROR) << "Failed to mount UB per-NUMA segment: "
                                    << toString(mr.error());
@@ -1349,6 +1384,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string protocol =
         get_config(config, CONFIG_KEY_PROTOCOL, DEFAULT_PROTOCOL);
     std::string rdma_devices = get_config(config, CONFIG_KEY_RDMA_DEVICES);
+    std::string ub_numa_nodes = get_config(config, CONFIG_KEY_UB_NUMA_NODES);
     std::string master_server_addr = get_config(
         config, CONFIG_KEY_MASTER_SERVER_ADDR, DEFAULT_MASTER_SERVER_ADDR);
     std::string ipc_socket_path =
@@ -1406,7 +1442,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                           local_buffer_size, protocol, rdma_devices,
                           master_server_addr, nullptr, ipc_socket_path, 50052,
                           enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          offload_rpc_thread_num, enable_client_http_server, client_http_port);
+                          offload_rpc_thread_num, enable_client_http_server,
+                          client_http_port, ub_numa_nodes);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(

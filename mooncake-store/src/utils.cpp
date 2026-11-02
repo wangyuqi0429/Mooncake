@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <numaif.h>
 #include <sys/mman.h>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 // Feature flag to enable/disable arena allocator. Disabled by default so the
@@ -591,6 +593,30 @@ std::vector<std::string> splitString(const std::string &str, char delimiter,
     }
 
     return result;
+}
+
+std::optional<std::vector<int>> try_parse_numa_nodes(
+    const std::string &node_list) {
+    const auto tokens = splitString(node_list, ',', true, true);
+    if (tokens.empty()) return std::nullopt;
+
+    std::vector<int> nodes;
+    nodes.reserve(tokens.size());
+    std::unordered_set<int> seen;
+    for (const auto &token : tokens) {
+        if (token.empty()) return std::nullopt;
+
+        int node = -1;
+        const char *begin = token.data();
+        const char *end = begin + token.size();
+        auto [ptr, ec] = std::from_chars(begin, end, node);
+        if (ec != std::errc{} || ptr != end || node < 0 ||
+            !seen.insert(node).second) {
+            return std::nullopt;
+        }
+        nodes.push_back(node);
+    }
+    return nodes;
 }
 
 tl::expected<std::string, int> httpGet(const std::string &url) {
