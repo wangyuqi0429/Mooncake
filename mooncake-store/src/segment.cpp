@@ -162,6 +162,25 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         segment_manager_->mounted_segments_.find(segment.id);
     if (exist_segment_it != segment_manager_->mounted_segments_.end()) {
         auto& exist_segment = exist_segment_it->second;
+        if (!segment.persistence_endpoint.empty() &&
+            !exist_segment.segment.persistence_endpoint.empty()) {
+            if (exist_segment.segment.size != segment.size ||
+                exist_segment.segment.name != segment.name ||
+                exist_segment.segment.medium != segment.medium)
+                return ErrorCode::INVALID_VERSION;
+            // The file owner holds an exclusive flock for the mapped file.
+            // Only vsegment descriptors reference this dedicated segment, so
+            // their relative offsets survive replacement of the virtual base.
+            RemoveHostSegment(segment_manager_->segments_by_host_, exist_segment.segment);
+            for (auto& [owner, ids] : segment_manager_->client_segments_)
+                ids.erase(std::remove(ids.begin(), ids.end(), segment.id), ids.end());
+            segment_manager_->client_segments_[client_id].push_back(segment.id);
+            segment_manager_->client_by_name_[segment.name] = client_id;
+            exist_segment.segment = segment;
+            exist_segment.status = SegmentStatus::OK;
+            AddHostSegment(segment_manager_->segments_by_host_, segment);
+            return ErrorCode::OK;
+        }
         if (exist_segment.status == SegmentStatus::OK) {
             LOG(WARNING) << "segment_name=" << segment.name
                          << ", warn=segment_already_exists";
@@ -207,7 +226,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
+    if (segment.persistence_endpoint.empty())
+        segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
@@ -1056,6 +1076,7 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
         for (auto& pair : segment_manager_->mounted_segments_) {
             MountedSegment& mounted_segment = pair.second;
             if (mounted_segment.segment.name == name &&
+                mounted_segment.segment.persistence_endpoint.empty() &&
                 mounted_segment.status == SegmentStatus::OK &&
                 mounted_segment.buf_allocator) {
                 segment_manager_->allocator_manager_.addAllocator(

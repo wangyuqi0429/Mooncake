@@ -175,6 +175,9 @@ TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
     original.segment.size = 1024 * 1024;
     original.segment.te_endpoint = "segment_host1";
     original.segment.host_id = "host1";
+    original.segment.protocol = "tcp";
+    original.segment.medium = "ssd:0";
+    original.segment.persistence_endpoint = "127.0.0.1:32000";
     original.status = SegmentStatus::OK;
 
     msgpack::sbuffer buffer;
@@ -189,6 +192,9 @@ TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
     EXPECT_EQ(restored->segment.id, original.segment.id);
     EXPECT_EQ(restored->segment.name, original.segment.name);
     EXPECT_EQ(restored->segment.host_id, original.segment.host_id);
+    EXPECT_EQ(restored->segment.protocol, original.segment.protocol);
+    EXPECT_EQ(restored->segment.medium, original.segment.medium);
+    EXPECT_EQ(restored->segment.persistence_endpoint, original.segment.persistence_endpoint);
     EXPECT_EQ(restored->status, original.status);
 }
 

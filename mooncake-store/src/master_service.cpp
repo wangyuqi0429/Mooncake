@@ -3457,6 +3457,10 @@ void MasterService::PublishSegmentOwnerForCvm(const Segment& segment) {
 }
 
 void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
+    {
+        std::lock_guard<std::mutex> lock(file_segment_registration_mutex_);
+        live_file_segment_ids_.erase(UuidToString(segment_id));
+    }
     if (!enable_ha_ || ha_backend_type_ != "etcd" || master_id_.empty() ||
         cluster_id_.empty()) {
         return;
@@ -3475,6 +3479,13 @@ void MasterService::RemoveSegmentOwnerForCvm(const UUID& segment_id) {
                      << id << " master=" << master_id_ << " err=" << err;
         return;
     }
+
+    std::vector<cvm::SegmentDescriptor> descriptors;
+    ViewVersionId descriptor_version;
+    if (cvm::EtcdViewStore::LoadAllSegmentDescriptors(
+            cluster_id_, descriptors, descriptor_version) != ErrorCode::OK) return;
+    for (const auto& descriptor : descriptors)
+        if (descriptor.segment_id == id && descriptor.protocol == "nof") return;
 
     // 感知「是否还有其他 master 挂载」：全量扫描 snapshot/*/segments/，过滤
     // 出 segment_id == id 且 master_id != 本机 的挂载记录。
@@ -4107,7 +4118,10 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
 }
 #else
 void MasterService::PublishSegmentOwnerForCvm(const Segment&) {}
-void MasterService::RemoveSegmentOwnerForCvm(const UUID&) {}
+void MasterService::RemoveSegmentOwnerForCvm(const UUID& id) {
+    std::lock_guard<std::mutex> lock(file_segment_registration_mutex_);
+    live_file_segment_ids_.erase(UuidToString(id));
+}
 void MasterService::EvictStaleGenerationForHost(const Segment&,
                                                 const UUID&) {}
 void MasterService::EnqueueStaleGenerationEvict(const Segment&,
@@ -4565,6 +4579,8 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    if (!segment.persistence_endpoint.empty() && !cvm_segments_vsegment_exclusive_)
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     // 30s RPC 超时卡顿归因：挂载是低频端点，结束时输出一次性 breakdown
     // 日志，覆盖 snapshot 锁获取+注册表 / OpLog / 配额重算 / 视图发布 /
     // 旧代清理各段耗时。
@@ -4661,6 +4677,10 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
         invalid_replica_endpoints_.erase(UuidToString(segment.id));
     }
     PublishSegmentOwnerForCvm(segment);
+    if (!segment.persistence_endpoint.empty()) {
+        std::lock_guard<std::mutex> lock(file_segment_registration_mutex_);
+        live_file_segment_ids_.insert(UuidToString(segment.id));
+    }
     const auto t_publish = std::chrono::steady_clock::now();
     // P2-8-2：补登该 client 的 LOCAL_DISK segment_name（首次内存段挂载
     // 时记录），供代际驱逐做 name 级 co-tenant 过滤。LOCAL_DISK-only
@@ -4706,27 +4726,144 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     return {};
 }
 
-auto MasterService::MountNoFSegment(const NoFSegment& segment,
+ErrorCode MasterService::PublishNoFSegmentForVSegment(const NoFSegment& segment) {
+#if defined(USE_NOF) && defined(STORE_USE_ETCD)
+    if (!cvm_segments_vsegment_exclusive_) return ErrorCode::OK;
+    if (!enable_ha_ || ha_backend_type_ != "etcd" || cluster_id_.empty() ||
+        cvm_lease_id_ == 0) return ErrorCode::INVALID_PARAMS;
+    auto* handle = SpdkWrapper::GetInstance().OpenNofSegment(segment.te_endpoint);
+    if (!handle) return ErrorCode::SEGMENT_NOT_FOUND;
+    const auto block = SpdkWrapper::GetInstance().GetBlockSize(handle);
+    if (block == 0 || block == INVALID_BLOCK_SIZE || segment.base % block ||
+        segment.size == 0 || segment.size % block)
+        return ErrorCode::INVALID_PARAMS;
+    cvm::SegmentDescriptor desc;
+    desc.segment_id = UuidToString(segment.id);
+    desc.segment_name = segment.name;
+    desc.capacity = segment.size;
+    desc.te_endpoint = segment.te_endpoint;
+    desc.protocol = "nof";
+    desc.base_offset = segment.base;
+    desc.device_identity = SpdkWrapper::GetInstance().GetNamespaceIdentity(handle);
+    if (desc.device_identity.empty()) return ErrorCode::INVALID_PARAMS;
+    desc.medium = "nof";
+    desc.io_alignment = block;
+    desc.supports_unaligned_io = false;
+    // Conservative: all namespaces of the same target share a failure domain.
+    const auto end = segment.te_endpoint.find(" subnqn:");
+    desc.failure_domain = segment.te_endpoint.substr(0, end);
+    desc.vsegment_exclusive = true;
+    auto error = cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);
+    if (error != ErrorCode::OK) return error;
+    cvm::MountEntry mount;
+    mount.segment_id = desc.segment_id;
+    error = cvm::EtcdViewStore::SaveMountEntryWithLease(
+        cluster_id_, master_id_, mount, cvm_lease_id_);
+    if (error == ErrorCode::OK) NoteVSegmentMountActivity();
+    return error;
+#else
+    return cvm_segments_vsegment_exclusive_ ? ErrorCode::UNAVAILABLE_IN_CURRENT_MODE
+                                          : ErrorCode::OK;
+#endif
+}
+
+auto MasterService::MountNoFSegment(const NoFSegment& requested_segment,
                                     const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    NoFSegment segment = requested_segment;
 #ifndef USE_NOF
     LOG(ERROR) << "client_id=" << client_id << ", segment_name=" << segment.name
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
+#if defined(STORE_USE_ETCD)
+    if (cvm_segments_vsegment_exclusive_) {
+        if (!enable_ha_ || ha_backend_type_ != "etcd" || cluster_id_.empty() || cvm_lease_id_ == 0)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        auto& spdk = SpdkWrapper::GetInstance();
+        auto* handle = spdk.OpenNofSegment(segment.te_endpoint);
+        if (!handle) return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        const auto block = spdk.GetBlockSize(handle);
+        const auto identity = spdk.GetNamespaceIdentity(handle);
+        if (block == 0 || block == INVALID_BLOCK_SIZE || identity.empty() ||
+            segment.size == 0 || segment.base % block || segment.size % block ||
+            segment.base > spdk.GetNamespaceSize(handle) ||
+            segment.size > spdk.GetNamespaceSize(handle) - segment.base)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        std::vector<cvm::SegmentDescriptor> descriptors;
+        ViewVersionId version;
+        auto error = cvm::EtcdViewStore::LoadAllSegmentDescriptors(cluster_id_, descriptors, version);
+        if (error != ErrorCode::OK) return tl::make_unexpected(error);
+        for (const auto& desc : descriptors) {
+            if (desc.protocol != "nof") continue;
+            if (desc.te_endpoint == segment.te_endpoint && desc.device_identity != identity)
+                return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            if (desc.device_identity != identity) continue;
+            if (desc.te_endpoint != segment.te_endpoint)
+                return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            if (desc.base_offset != segment.base || desc.capacity != segment.size)
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            if (!StringToUuid(desc.segment_id, segment.id))
+                return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+        }
+        // CAS the namespace identity before publishing any resource facts. Two
+        // concurrent registrations cannot assign two UUIDs to the same bytes.
+        const auto key = cvm::CvmNamespaceRoot(cluster_id_) + "nof_identities/" + identity;
+        const auto value = UuidToString(segment.id) + " " +
+                           std::to_string(segment.base) + " " + std::to_string(segment.size);
+        auto created = EtcdHelper::Create(key.data(), key.size(), value.data(), value.size());
+        if (created != ErrorCode::OK && created != ErrorCode::ETCD_TRANSACTION_FAIL)
+            return tl::make_unexpected(created);
+        std::string stored;
+        EtcdRevisionId revision;
+        auto loaded = EtcdHelper::Get(key.data(), key.size(), stored, revision);
+        if (loaded != ErrorCode::OK) return tl::make_unexpected(loaded);
+        const auto separator = stored.find(' ');
+        if (separator == std::string::npos ||
+            stored.substr(separator) != " " + std::to_string(segment.base) + " " + std::to_string(segment.size) ||
+            !StringToUuid(stored.substr(0, separator), segment.id))
+            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+#endif
+    bool newly_mounted = false;
+    {
+        ScopedNoFSegmentAccess nof_segment_access =
+            nof_segment_manager_.getNoFSegmentAccess();
 
-    LOG(INFO) << "NoF segment mount: "
-              << "client_id=" << client_id
-              << ", action=mount_segment, segment_name=" << segment.name;
+        LOG(INFO) << "NoF segment mount: "
+                  << "client_id=" << client_id
+                  << ", action=mount_segment, segment_name=" << segment.name;
 
-    auto err = nof_segment_access.MountSegment(segment, client_id);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+        auto err = nof_segment_access.MountSegment(segment, client_id);
+        newly_mounted = err == ErrorCode::OK;
+        if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            // Return OK because this is an idempotent operation
+            // Republish discovery on an idempotent retry.
+        } else if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+    }
+    std::vector<MountedNoFSegmentSnapshot> mounted;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted);
+    for (const auto& entry : mounted) {
+        if (entry.segment.te_endpoint != segment.te_endpoint ||
+            entry.status != SegmentStatus::OK) continue;
+        auto publish = PublishNoFSegmentForVSegment(entry.segment);
+        if (publish != ErrorCode::OK) {
+            // Do not leave an undiscoverable allocator after a failed registration.
+            if (newly_mounted) {
+#ifdef STORE_USE_ETCD
+                if (cvm::EtcdViewStore::DeleteMountEntry(cluster_id_, master_id_,
+                        UuidToString(entry.segment_id)) != ErrorCode::OK)
+                    return tl::make_unexpected(publish);
+#endif
+                auto access = nof_segment_manager_.getNoFSegmentAccess();
+                size_t capacity = 0;
+                if (access.PrepareUnmountSegment(entry.segment_id, capacity) == ErrorCode::OK)
+                    access.CommitUnmountSegment(entry.segment_id, client_id, capacity);
+            }
+            return tl::make_unexpected(publish);
+        }
     }
     return {};
 #endif
@@ -5087,6 +5224,10 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
     for (const auto& seg : segments) {
         PublishSegmentOwnerForCvm(seg);
+        if (!seg.persistence_endpoint.empty()) {
+            std::lock_guard<std::mutex> lock(file_segment_registration_mutex_);
+            live_file_segment_ids_.insert(UuidToString(seg.id));
+        }
     }
 
     // vsegment auto-plan 加速触发点（同 MountSegment 尾部；submaster 重启后
@@ -5108,11 +5249,28 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
                << ", error=nof_pool_disabled";
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
-    ScopedNoFSegmentAccess nof_segment_access =
-        nof_segment_manager_.getNoFSegmentAccess();
-    ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    if (cvm_segments_vsegment_exclusive_) {
+        for (const auto& segment : segments) {
+            auto result = MountNoFSegment(segment, client_id);
+            if (!result) return result;
+        }
+        return {};
+    }
+
+    {
+        ScopedNoFSegmentAccess nof_segment_access =
+            nof_segment_manager_.getNoFSegmentAccess();
+        ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+    }
+    std::vector<MountedNoFSegmentSnapshot> mounted;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted);
+    for (const auto& entry : mounted) {
+        if (entry.status != SegmentStatus::OK) continue;
+        auto error = PublishNoFSegmentForVSegment(entry.segment);
+        if (error != ErrorCode::OK) return tl::make_unexpected(error);
     }
     return {};
 #endif
@@ -6339,6 +6497,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
        // deadlocks
 
     // 2. Remove the metadata of the related objects
+    if (cvm_segments_vsegment_exclusive_) RemoveSegmentOwnerForCvm(segment_id);
     ClearInvalidHandles();
 
     // 3. Commit the unmount operation
@@ -7268,14 +7427,65 @@ MasterService::GetPSegmentEndpoint(const std::string& segment_id) {
     UUID id;
     if (!StringToUuid(segment_id, id))
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#ifdef USE_NOF
+    std::vector<MountedNoFSegmentSnapshot> nof_segments;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(nof_segments);
+    for (const auto& mounted : nof_segments) {
+        if (mounted.segment_id != id || mounted.status != SegmentStatus::OK) continue;
+        auto* handle = SpdkWrapper::GetInstance().OpenNofSegment(mounted.segment.te_endpoint);
+        if (!handle) return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        const auto block = SpdkWrapper::GetInstance().GetBlockSize(handle);
+        if (block == 0 || block == INVALID_BLOCK_SIZE)
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return vsegment::PSegmentLocation{mounted.segment.te_endpoint,
+            static_cast<uint64_t>(mounted.segment.base),
+            vsegment::PSegmentBackend::NOF, block};
+    }
+#endif
+#if defined(USE_NOF) && defined(STORE_USE_ETCD)
+    if (cvm_segments_vsegment_exclusive_ && !cluster_id_.empty()) {
+        std::vector<cvm::SegmentDescriptor> descriptors;
+        std::vector<std::pair<std::string, cvm::MountEntry>> mounts;
+        std::vector<cvm::MasterRegistration> masters;
+        ViewVersionId version;
+        if (cvm::EtcdViewStore::LoadAllSegmentDescriptors(cluster_id_, descriptors, version) != ErrorCode::OK ||
+            cvm::EtcdViewStore::LoadAllMountEntries(cluster_id_, mounts, version) != ErrorCode::OK ||
+            cvm::EtcdViewStore::LoadAllMasters(cluster_id_, masters, version) != ErrorCode::OK)
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        for (const auto& desc : descriptors) {
+            if (desc.segment_id != segment_id || desc.protocol != "nof") continue;
+            bool live = false;
+            for (const auto& [owner, mount] : mounts)
+                if (mount.segment_id == segment_id &&
+                    std::any_of(masters.begin(), masters.end(), [&](const auto& master) {
+                        return master.master_id == owner;
+                    })) live = true;
+            if (!live) return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+            auto& spdk = SpdkWrapper::GetInstance();
+            auto* handle = spdk.OpenNofSegment(desc.te_endpoint);
+            if (!handle || desc.device_identity.empty() ||
+                spdk.GetNamespaceIdentity(handle) != desc.device_identity ||
+                spdk.GetBlockSize(handle) != desc.io_alignment)
+                return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+            return vsegment::PSegmentLocation{desc.te_endpoint, desc.base_offset,
+                vsegment::PSegmentBackend::NOF, desc.io_alignment};
+        }
+    }
+#endif
     ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
     Segment segment;
     if (!access.GetSegment(id, segment))
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    if (!segment.persistence_endpoint.empty()) {
+        std::lock_guard<std::mutex> lock(file_segment_registration_mutex_);
+        if (!live_file_segment_ids_.contains(segment_id))
+            return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     if (segment.te_endpoint.empty())
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     return vsegment::PSegmentLocation{
-        segment.te_endpoint, static_cast<uint64_t>(segment.base)};
+        segment.te_endpoint, static_cast<uint64_t>(segment.base),
+        vsegment::PSegmentBackend::TRANSFER_ENGINE, 1, segment.persistence_endpoint};
 }
 
 vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
@@ -8081,7 +8291,7 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
 #ifdef USE_NOF
-    if (config.nof_replica_num > 0 &&
+    if (!cvm_segments_vsegment_exclusive_ && config.nof_replica_num > 0 &&
         nof_segment_manager_.getMountedSegmentCount() > 0) {
         ScopedAllocatorAccess allocator_access =
             nof_segment_manager_.getAllocatorAccess();
@@ -13233,8 +13443,8 @@ MasterService::EvictTenantMemoryForQuota(
                 return evict_replicas(metadata, deferred_replicas);
             }
 
-            // VSegment extents are already durable psegment allocations and
-            // cannot be passed to the memory-buffer offload pipeline.
+            // VSegment descriptors refer to striped extents, not individual
+            // memory buffers accepted by the legacy offload pipeline.
             if (has_vsegment_replica(metadata)) {
                 return evict_replicas(metadata, deferred_replicas);
             }
@@ -14658,6 +14868,7 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         }
     }
 
+    if (cvm_segments_vsegment_exclusive_) RemoveSegmentOwnerForCvm(snapshot.segment_id);
     ClearInvalidHandles();
 
     {
@@ -15078,6 +15289,10 @@ MasterService::MetadataSerializer::Deserialize(
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
 
+    {
+        std::lock_guard<std::mutex> lock(service_->file_segment_registration_mutex_);
+        service_->live_file_segment_ids_.clear();
+    }
     service_->recovered_vsegment_snapshots_.clear();
     if (vsegment_partitions_obj != nullptr) {
         if (vsegment_partitions_obj->type != msgpack::type::BIN) {

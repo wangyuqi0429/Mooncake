@@ -303,6 +303,7 @@ int SpdkWrapper::ConnectController(const struct spdk_nvme_transport_id *trid,
 }
 
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
+    if (!InitializeEnv()) return nullptr;
     tr_info tr;
     int ret = ParseTransPortStr(tr_str, &tr);
     if (ret != 0) {
@@ -370,6 +371,30 @@ uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     return spdk_nvme_ns_get_sector_size(seg_handle->ns);
 }
 
+uint64_t SpdkWrapper::GetNamespaceSize(const nof_seg_handle *handle) {
+    return handle && handle->ns ? spdk_nvme_ns_get_size(handle->ns) : 0;
+}
+
+std::string SpdkWrapper::GetNamespaceIdentity(const nof_seg_handle *handle) {
+    if (!handle || !handle->ns) return {};
+    const auto* data = spdk_nvme_ns_get_data(handle->ns);
+    if (!data) return {};
+    std::string identity;
+    bool nonzero = false;
+    constexpr char digits[] = "0123456789abcdef";
+    for (const auto byte : data->nguid) {
+        nonzero |= byte != 0;
+        identity += digits[byte >> 4];
+        identity += digits[byte & 15];
+    }
+    for (const auto byte : data->eui64) {
+        nonzero |= byte != 0;
+        identity += digits[byte >> 4];
+        identity += digits[byte & 15];
+    }
+    return nonzero ? identity : std::string{};
+}
+
 int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                uint64_t lba, uint32_t lba_count, int op,
                                spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
@@ -385,7 +410,7 @@ int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                      cb_ctx, 0);
     } else if (op == kSpdkNofOpWrite) {
         return spdk_nvme_ns_cmd_write(ns, qpair, ptr, lba, lba_count, cb_fn,
-                                      cb_ctx, 0);
+                                      cb_ctx, SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS);
     }
     return -1;
 }

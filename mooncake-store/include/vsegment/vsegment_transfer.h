@@ -21,11 +21,17 @@ class VSegmentViewProvider {
                                std::string* detail = nullptr) = 0;
 };
 
+enum class PSegmentBackend : uint8_t { TRANSFER_ENGINE = 0, NOF = 1 };
+
 struct PSegmentLocation {
     std::string endpoint;
     uint64_t base_address{0};
+    PSegmentBackend backend{PSegmentBackend::TRANSFER_ENGINE};
+    uint64_t io_alignment{1};
+    std::string persistence_endpoint;
 };
-YLT_REFL(PSegmentLocation, endpoint, base_address);
+YLT_REFL(PSegmentLocation, endpoint, base_address, backend, io_alignment,
+         persistence_endpoint);
 
 class SegmentEndpointResolver {
    public:
@@ -56,6 +62,9 @@ class VSegmentViewCache {
 struct EndpointTransferSubRequest {
     TransferSubRequest transfer;
     std::string endpoint;
+    PSegmentBackend backend{PSegmentBackend::TRANSFER_ENGINE};
+    std::string persistence_endpoint;
+    uint64_t segment_offset{0};
 };
 
 struct VSegmentTransferPlan {

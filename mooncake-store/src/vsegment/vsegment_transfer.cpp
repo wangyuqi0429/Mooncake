@@ -150,10 +150,20 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
             plan.requests.clear();
             return plan;
         }
+        const auto segment_offset = request.physical_offset;
         request.physical_offset += location.base_address;
         // NOTE: endpoint is shared by every sub-request of this segment, so it
         // must be copied rather than moved.
-        plan.requests.push_back({std::move(request), location.endpoint});
+        if (location.backend == PSegmentBackend::NOF &&
+            (location.io_alignment == 0 ||
+             request.physical_offset % location.io_alignment != 0 ||
+             request.client_address % location.io_alignment != 0 ||
+             request.length % location.io_alignment != 0)) {
+            return {ErrorCode::INVALID_PARAMS, {}, "unaligned NoF stripe or client slice"};
+        }
+        plan.requests.push_back({std::move(request), location.endpoint,
+                                 location.backend, location.persistence_endpoint,
+                                 segment_offset});
     }
     return plan;
 }

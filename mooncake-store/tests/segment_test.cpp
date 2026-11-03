@@ -169,6 +169,34 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 // 2. MountSegment with different segment id and the same segment name should be
 // considered as different segments. Validate the status of SegmentManager use
 // ValidateMountedSegments function.
+TEST_F(SegmentTest, FileSegmentRebindsBaseAndPreservesGeometry) {
+    SegmentManager manager;
+    Segment original;
+    original.id = generate_uuid();
+    original.name = UuidToString(original.id);
+    original.size = 16 * 1024 * 1024;
+    original.base = 0x100000000;
+    original.medium = "ssd:0";
+    original.persistence_endpoint = "127.0.0.1:32000";
+    const auto old_client = generate_uuid();
+    const auto new_client = generate_uuid();
+    auto access = manager.getSegmentAccess();
+    ASSERT_EQ(access.MountSegment(original, old_client), ErrorCode::OK);
+    auto rebound = original;
+    rebound.base = 0x200000000;
+    rebound.persistence_endpoint = "127.0.0.1:32001";
+    ASSERT_EQ(access.MountSegment(rebound, new_client), ErrorCode::OK);
+    Segment resolved;
+    ASSERT_TRUE(access.GetSegment(original.id, resolved));
+    EXPECT_EQ(resolved.base, rebound.base);
+    EXPECT_EQ(resolved.persistence_endpoint, rebound.persistence_endpoint);
+    std::vector<Segment> old_segments;
+    ASSERT_EQ(access.GetClientSegments(old_client, old_segments), ErrorCode::OK);
+    EXPECT_TRUE(old_segments.empty());
+    rebound.size *= 2;
+    EXPECT_EQ(access.MountSegment(rebound, new_client), ErrorCode::INVALID_VERSION);
+}
+
 TEST_F(SegmentTest, MountSegmentDuplicate) {
     SegmentManager segment_manager;
     // Create a valid segment and client ID

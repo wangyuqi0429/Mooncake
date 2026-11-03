@@ -45,6 +45,8 @@ class SpdkWrapper {
     nof_seg_handle *OpenNofSegment(const std::string &tr_str);
 
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
+    std::string GetNamespaceIdentity(const nof_seg_handle *seg_handle);
+    uint64_t GetNamespaceSize(const nof_seg_handle *seg_handle);
 
     int SubmitRequest(const nof_seg_handle *seg_handle, void *ptr, uint64_t lba,
                       uint32_t lba_count, int op, spdk_nvme_cmd_cb cb_fn,

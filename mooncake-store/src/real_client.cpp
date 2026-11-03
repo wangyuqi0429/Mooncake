@@ -1,5 +1,7 @@
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/xattr.h>
 #include <sys/mman.h>
 #include <numa.h>
 #include <numaif.h>
@@ -1460,6 +1462,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
 
     // Reset all resources
     client_.reset();
+    file_segment_rpc_server_.reset();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -1512,6 +1515,9 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
                              size_t size, const std::string &protocol,
                              const std::string &location,
                              std::vector<std::string> &out_segment_ids) {
+    std::lock_guard<std::mutex> mount_lock(file_mount_mutex_);
+    out_segment_ids.clear();
+    if (size == 0) return -1;
     if (!client_) {
         LOG(ERROR) << "Client not initialized";
         return -1;
@@ -1557,6 +1563,25 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
         return -1;
     }
 
+    // flock is tied to the open file description, so dup'd chunk descriptors
+    // keep the lock across path aliases and across processes until final unmount.
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return -1;
+    }
+    auto file = std::make_shared<vsegment::FileSegmentFd>();
+    file->fd = fd;
+    if (!file_segment_rpc_server_) {
+        file_segment_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(2, 0, "0.0.0.0");
+        file_segment_rpc_server_->register_handler<&vsegment::FileSegmentStore::Persist>(&file_segment_store_);
+        file_segment_rpc_server_->async_start();
+        if (file_segment_rpc_server_->get_errc()) {
+            file_segment_rpc_server_.reset();
+            return -1;
+        }
+        file_segment_rpc_endpoint_ = buildHostNameWithPort(
+            getHostNameWithoutPort(local_hostname), file_segment_rpc_server_->port());
+    }
     size_t aligned_max_chunk = (max_mr_size / page_size) * page_size;
     size_t remaining = size;
     size_t current_offset = offset;
@@ -1574,36 +1599,62 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
             break;
         }
 
-        auto result =
-            client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
+        // Stable identities follow the inode through rename/hardlink.
+        auto identity = vsegment::LoadFileSegmentId(fd, current_offset, chunk_size);
+        if (!identity) {
+            munmap(ptr, chunk_size);
+            break;
+        }
+        const auto stable_id = *identity;
+        const auto id_text = UuidToString(stable_id);
+        if (!file_segment_store_.Register(id_text, {ptr, chunk_size, current_offset, file})) {
+            munmap(ptr, chunk_size);
+            break;
+        }
+        auto result = client_->MountSegmentAndGetId(
+            ptr, chunk_size, protocol, location, stable_id, file_segment_rpc_endpoint_);
         if (!result.has_value()) {
             LOG(ERROR) << "MountSegmentAndGetId failed";
-            munmap(ptr, chunk_size);
+            auto rollback = client_->UnmountSegmentById(stable_id);
+            if (!rollback && rollback.error() != ErrorCode::SEGMENT_NOT_FOUND) {
+                std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+                mounted_segment_records_[id_text] = {ptr, chunk_size, path, file};
+                out_segment_ids.push_back(id_text);
+            } else {
+                file_segment_store_.Unregister(id_text);
+                munmap(ptr, chunk_size);
+            }
             break;
         }
 
         std::string segment_id = UuidToString(result.value());
         mounted_ids.push_back(segment_id);
-        mounted_records.push_back({ptr, chunk_size, path});
+        mounted_records.push_back({ptr, chunk_size, path, file});
 
         remaining -= chunk_size;
         current_offset += chunk_size;
     }
 
-    close(fd);
+    // The shared descriptor remains open until all mappings are released.
 
     // If not all chunks were mounted, roll back successfully mounted ones
     if (remaining > 0) {
         for (size_t i = 0; i < mounted_ids.size(); ++i) {
             UUID id;
             if (StringToUuid(mounted_ids[i], id)) {
-                client_->UnmountSegmentById(id);
+                auto removed = client_->UnmountSegmentById(id);
+                if (!removed) {
+                    std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
+                    mounted_segment_records_[mounted_ids[i]] = mounted_records[i];
+                    out_segment_ids.push_back(mounted_ids[i]);
+                    continue;  // Keep registered memory alive until a later cleanup.
+                }
             }
+            file_segment_store_.Unregister(mounted_ids[i]);
             if (mounted_records[i].mmap_base) {
                 munmap(mounted_records[i].mmap_base, mounted_records[i].size);
             }
         }
-        out_segment_ids.clear();
         return -1;
     }
 
@@ -1630,6 +1681,7 @@ void RealClient::ReleaseMountedSegmentRecord(const std::string &segment_id) {
         }
     }
     if (found && record.mmap_base) {
+        file_segment_store_.Unregister(segment_id);
         munmap(record.mmap_base, record.size);
     }
 }
@@ -1640,6 +1692,7 @@ void RealClient::ReleaseAllMountedSegmentRecords() {
         std::lock_guard<std::mutex> lock(mounted_segment_records_mutex_);
         records.reserve(mounted_segment_records_.size());
         for (auto &entry : mounted_segment_records_) {
+            file_segment_store_.Unregister(entry.first);
             records.push_back(entry.second);
         }
         mounted_segment_records_.clear();

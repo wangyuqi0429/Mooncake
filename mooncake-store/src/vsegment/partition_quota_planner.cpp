@@ -270,7 +270,7 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
 
     std::map<std::string, std::vector<PSegmentGeometry>> by_medium;
     for (const auto& segment : request.segments) {
-        if (segment.healthy && segment.supports_unaligned_io)
+        if (segment.healthy)
             by_medium[segment.medium].push_back(segment);
     }
     for (auto& [medium, segments] : by_medium)
@@ -322,6 +322,10 @@ PartitionQuotaPlanResult PartitionQuotaPlanner::Plan(
                 quota.medium = medium;
             }
             for (const auto& segment : pool->second) {
+                if (!segment.supports_unaligned_io &&
+                    profile.io_alignment % segment.io_alignment != 0)
+                    return Fail(ErrorCode::INVALID_PARAMS,
+                                "profile io_alignment must be a multiple of device block size");
                 const uint64_t usable = AlignDown(
                     static_cast<uint64_t>(std::floor(
                         static_cast<long double>(segment.capacity) *

@@ -1,4 +1,9 @@
 #include "vsegment/vsegment.h"
+#include "vsegment/file_segment.h"
+#include <cstdio>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/mman.h>
 #include "vsegment/vsegment_runtime.h"
 #include "vsegment/vsegment_transfer.h"
 #include "cvm/cvm_keys.h"
@@ -22,6 +27,49 @@
 
 namespace mooncake::vsegment {
 namespace {
+
+TEST(FileSegmentTest, PersistsExactRangeAndRejectsInvalidBounds) {
+    std::unique_ptr<FILE, decltype(&fclose)> temp(tmpfile(), fclose);
+    ASSERT_NE(temp, nullptr);
+    ASSERT_EQ(ftruncate(fileno(temp.get()), 64), 0);
+    auto file = std::make_shared<FileSegmentFd>();
+    file->fd = dup(fileno(temp.get()));
+    ASSERT_GE(file->fd, 0);
+    std::string data = "abcdefgh";
+    FileSegmentStore store;
+    ASSERT_TRUE(store.Register("segment", {data.data(), data.size(), 16, file}));
+    EXPECT_FALSE(store.Register("segment", {data.data(), data.size(), 16, file}));
+    EXPECT_EQ(store.Persist("segment", 2, 4), ErrorCode::OK);
+    char result[64]{};
+    ASSERT_EQ(pread(file->fd, result, sizeof(result), 0), 64);
+    EXPECT_EQ(std::string(result + 18, 4), "cdef");
+    EXPECT_EQ(result[17], 0);
+    EXPECT_EQ(result[22], 0);
+    EXPECT_EQ(store.Persist("segment", 7, 2), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(store.Persist("segment", std::numeric_limits<uint64_t>::max(), 1),
+              ErrorCode::INVALID_PARAMS);
+    store.Unregister("segment");
+    EXPECT_EQ(store.Persist("segment", 0, 1), ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+TEST(FileSegmentTest, StableIdentityAndExclusiveFileLock) {
+    std::unique_ptr<FILE, decltype(&fclose)> temp(tmpfile(), fclose);
+    ASSERT_NE(temp, nullptr);
+    auto first = LoadFileSegmentId(fileno(temp.get()), 0, 4096);
+    if (!first) GTEST_SKIP() << "temporary filesystem does not support user xattrs";
+    auto reopened = open(("/proc/self/fd/" + std::to_string(fileno(temp.get()))).c_str(), O_RDWR);
+    ASSERT_GE(reopened, 0);
+    auto other = std::make_shared<FileSegmentFd>();
+    other->fd = reopened;
+    auto same = LoadFileSegmentId(reopened, 0, 4096);
+    ASSERT_TRUE(same);
+    EXPECT_EQ(*same, *first);
+    auto next = LoadFileSegmentId(reopened, 4096, 4096);
+    ASSERT_TRUE(next);
+    EXPECT_NE(*next, *first);
+    ASSERT_EQ(flock(fileno(temp.get()), LOCK_EX | LOCK_NB), 0);
+    EXPECT_NE(flock(reopened, LOCK_EX | LOCK_NB), 0);
+}
 
 uint64_t MetricValue(const std::string& name) {
     const auto text = VSegmentMetrics::Instance().Serialize();
@@ -168,9 +216,13 @@ class TestEndpointResolver : public SegmentEndpointResolver {
         ++resolves;
         location->endpoint = "endpoint://" + segment_id;
         location->base_address = base_address;
+        location->backend = backend;
+        location->io_alignment = io_alignment;
         return ErrorCode::OK;
     }
     uint64_t base_address{4096};
+    PSegmentBackend backend{PSegmentBackend::TRANSFER_ENGINE};
+    uint64_t io_alignment{1};
     int resolves{0};
 };
 
@@ -275,6 +327,24 @@ TEST(PartitionQuotaPlannerTest, SplitsEveryMediumAcrossAllPartitions) {
               ErrorCode::OK);
     EXPECT_EQ(config.quotas.size(), 2);
     EXPECT_EQ(config.config_generation, 7);
+}
+
+TEST(PartitionQuotaPlannerTest, SupportsBlockAlignedNoFGeometry) {
+    PartitionQuotaPlanRequest request;
+    request.config_generation = 1;
+    request.policy_digest = "nof-policy";
+    request.default_profile = "default";
+    request.partition_ids = {"partition-a"};
+    auto profile = Profile(2);
+    profile.required_medium = "nof";
+    request.profile_specs = {profile};
+    request.segments = {{"nof-a", 4096, 0, 8, "nof", true, false, "target-a"},
+                        {"nof-b", 4096, 0, 8, "nof", true, false, "target-b"}};
+    auto result = PartitionQuotaPlanner().Plan(request);
+    ASSERT_TRUE(result) << result.detail;
+    EXPECT_EQ(ValidateQuotaSnapshot(result.snapshot, request.segments), ErrorCode::OK);
+    request.profile_specs[0].io_alignment = 1;
+    EXPECT_EQ(PartitionQuotaPlanner().Plan(request).error, ErrorCode::INVALID_PARAMS);
 }
 
 TEST(PartitionQuotaPlannerTest, RejectsInsufficientMemberSegments) {
@@ -565,6 +635,27 @@ TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
     EXPECT_EQ(provider.loads, 1);
 }
 
+TEST(VSegmentTransferPlannerTest, NoFUsesByteOffsetsAndRejectsUnalignedSlices) {
+    TestViewProvider provider;
+    provider.view = View();
+    TestEndpointResolver endpoints;
+    endpoints.backend = PSegmentBackend::NOF;
+    endpoints.io_alignment = 8;
+    endpoints.base_address = 8192;
+    VSegmentViewCache cache;
+    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto plan = planner.Plan(replica, {{1024, 96}});
+    ASSERT_TRUE(plan) << plan.detail;
+    EXPECT_EQ(plan.requests[0].backend, PSegmentBackend::NOF);
+    EXPECT_EQ(plan.requests[0].transfer.physical_offset, 8192 + 48);
+    EXPECT_EQ(planner.Plan(replica, {{1025, 96}}).error, ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(planner.Plan(replica, {{1024, 7}, {2048, 89}}).error,
+              ErrorCode::INVALID_PARAMS);
+    endpoints.base_address = 8193;
+    EXPECT_EQ(planner.Plan(replica, {{1024, 96}}).error, ErrorCode::INVALID_PARAMS);
+}
+
 TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
@@ -736,6 +827,20 @@ TEST(CreationCoordinatorTest, ConcurrentCallersShareOneCreation) {
     EXPECT_EQ(calls, 1);
     EXPECT_EQ(first.view.vsegment_id, "vs-1");
     EXPECT_EQ(second.view.vsegment_id, "vs-1");
+}
+
+TEST(VSegmentManagerTest, RejectsUnalignedNoFReservationWithoutConsumingSpace) {
+    auto profile = Profile();
+    profile.required_medium = "nof";
+    VSegmentManager manager(Config(), {profile}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    EXPECT_EQ(manager.ReservePut(allocation.view.vsegment_id, "bad", 7).error,
+              ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(manager.StartPut("bad-start", 7).error, ErrorCode::INVALID_PARAMS);
+    auto reservation = manager.ReservePut(allocation.view.vsegment_id, "good", 16);
+    ASSERT_TRUE(reservation);
+    EXPECT_EQ(reservation.range.offset, 0u);
 }
 
 TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {
