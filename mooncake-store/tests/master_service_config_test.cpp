@@ -4,6 +4,17 @@
 
 namespace mooncake::test {
 
+TEST(MasterServiceConfigTest, AdminMetricsIntervalPropagatesToSupervisor) {
+    MasterConfig master_config{};
+    MasterServiceSupervisorConfig defaults;
+    EXPECT_EQ(defaults.admin_metrics_log_interval_sec,
+              master_config.admin_metrics_log_interval_sec);
+
+    master_config.admin_metrics_log_interval_sec = 37;
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    EXPECT_EQ(supervisor_config.admin_metrics_log_interval_sec, 37u);
+}
+
 TEST(MasterServiceConfigTest, OplogBatchMaxEntriesDefaultsTo1024) {
     MasterConfig master_config;
     EXPECT_EQ(1024u, master_config.oplog_batch_max_entries);

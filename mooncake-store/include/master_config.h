@@ -236,6 +236,8 @@ class MasterServiceSupervisorConfig {
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
     // Parameters with default values (optional parameters)
+    // Forward the admin log interval to the HA supervisor admin server.
+    uint32_t admin_metrics_log_interval_sec = 10;
     std::string rpc_address = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
@@ -373,6 +375,7 @@ class MasterServiceSupervisorConfig {
         // Set required parameters using RequiredParam
         enable_metric_reporting = config.enable_metric_reporting;
         metrics_port = static_cast<int>(config.metrics_port);
+        admin_metrics_log_interval_sec = config.admin_metrics_log_interval_sec;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
