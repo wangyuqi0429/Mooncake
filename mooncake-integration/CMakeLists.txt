@@ -227,6 +227,8 @@ install(
 if(WITH_TE)
   install(
     FILES "${CMAKE_CURRENT_SOURCE_DIR}/shared_segment.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/sparse_copy.py"
+          "${CMAKE_CURRENT_SOURCE_DIR}/_sparse_copy_kernel.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
 endif()

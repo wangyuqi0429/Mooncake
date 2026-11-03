@@ -40,6 +40,7 @@ from .engine import SharedSegment as _CppSharedSegment
 __all__ = [
     "SharedSegment",
     "SharedSegmentError",
+    "SharedBlockLayout",
     "create_shared_segment",
     "shared_segment_supported",
 ]
@@ -150,6 +151,18 @@ def create_shared_segment(
     return SharedSegment(segment, specs, offsets, stride, device)
 
 
+@dataclass(frozen=True)
+class SharedBlockLayout:
+    """Contiguous entries in one block; offsets and strides are in bytes."""
+
+    count: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    offset: int
+    entry_stride: int
+    nbytes: int
+
+
 class SharedSegment:
     """Handle to one shared host segment. Alive for as long as the mapping is needed."""
 
@@ -179,6 +192,17 @@ class SharedSegment:
         yields host CPU tensors. Views share physical pages across the TP
         group. Each view holds a reference back to this segment.
         """
+        return self._tensor_views(block, self._device_base)
+
+    def host_tensors(self, block: str) -> list[torch.Tensor]:
+        """CPU views of the same entries, even when a device VA is available.
+
+        Host operations must use these views rather than interpreting a mapped
+        NPU address as a CPU pointer. Original views retain the segment.
+        """
+        return self._tensor_views(block, None)
+
+    def _tensor_views(self, block: str, device_base: int | None) -> list[torch.Tensor]:
         spec = self._specs.get(block)
         if spec is None:
             raise SharedSegmentError(f"Unknown shared segment block {block!r}")
@@ -187,9 +211,9 @@ class SharedSegment:
         views = []
         for index in range(spec.count):
             byte_off = offset + index * self._stride
-            if self._device_base is not None:
+            if device_base is not None:
                 view = _tensor_from_device_ptr(
-                    self._device_base + byte_off,
+                    device_base + byte_off,
                     spec.nbytes,
                     spec.shape,
                     spec.dtype,
@@ -212,6 +236,24 @@ class SharedSegment:
 
     def total_size(self) -> int:
         return self._segment.size()
+
+    def device_addr(self) -> int:
+        """Device-accessible base, or zero when this mapping has no device VA."""
+        return self._device_base or 0
+
+    def block_layout(self, block: str) -> SharedBlockLayout:
+        """Describe entries without exposing or duplicating the layout algorithm."""
+        spec = self._specs.get(block)
+        if spec is None:
+            raise SharedSegmentError(f"Unknown shared segment block {block!r}")
+        return SharedBlockLayout(
+            count=spec.count,
+            shape=spec.shape,
+            dtype=spec.dtype,
+            offset=self._offsets[block],
+            entry_stride=self._stride,
+            nbytes=spec.nbytes,
+        )
 
 
 def shared_segment_supported(mmap: bool = True, host_register: bool = False) -> bool:
