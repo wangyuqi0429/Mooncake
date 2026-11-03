@@ -155,8 +155,12 @@ inline bool IsMemberAlive(const std::vector<MasterRegistration>& members,
 struct RingMeta {
     uint32_t submaster_count{1};
     uint32_t slot_group_count{1};
+    // Defaults to the historical value when reading metadata written by an
+    // older version. New deployments persist the value selected by
+    // MC_STORE_PARTITION_SLOT_COUNT so clients can reject configuration drift.
+    uint32_t slot_count{16384};
 };
-YLT_REFL(RingMeta, submaster_count, slot_group_count);
+YLT_REFL(RingMeta, submaster_count, slot_group_count, slot_count);
 
 // ---------------------------------------------------------------------------
 // RingSlot 槽位组归属（§16.14.1），持久化于 /cvm/{ns}/ring_slots/{rank}。

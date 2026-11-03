@@ -210,10 +210,17 @@ class MasterService {
     // 测试专用：阻塞等待 stale-evict 异步 drain 队列清空（含 1s debounce
     // 与在途请求），上限 5s。生产代码勿用；non-etcd 构建为空操作。
     void FlushStaleEvictQueueForTesting();
-    tl::expected<vsegment::VSegmentView, ErrorCode> GetVSegmentView(
-        const std::string& partition_id, const std::string& vsegment_id);
-    tl::expected<vsegment::PSegmentLocation, ErrorCode> GetPSegmentEndpoint(
-        const std::string& segment_id);
+    // Builds a deduplicated layout table for the given (partition_id,
+    // vsegment_id) pairs. Best-effort: entries that cannot be resolved are
+    // omitted (hard C has no legacy fallback; callers fail for those
+    // vsegments).
+    std::vector<VSegmentLayoutEntry> BuildVSegmentLayoutTable(
+        const std::vector<std::pair<std::string, std::string>>& vsegments);
+    // Attaches the runtime layout table for the vsegment replicas contained in
+    // `response`. No-op when the response has no vsegment replica or when the
+    // table cannot be resolved (best-effort; the client falls back).
+    void EnrichVSegmentLayouts(GetReplicaListResponse* response);
+    void InvalidateVSegmentLayoutCache();
     vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,
         const std::string& operation_id, uint64_t length,
@@ -1799,7 +1806,7 @@ class MasterService {
     bool IsTenantRegistered(const TenantId& tenant_id) const;
     bool TenantHasObjects(const TenantId& tenant_id) const;
 
-    // Helper to get the logical slot (Redis Cluster style, 16384 slots) for
+    // Helper to get the configured logical slot for
     // a tenant-scoped key. Slots are the unit of cross-master ownership.
     uint16_t getSlot(const TenantId& tenant_id,
                      const std::string& user_key) const {
@@ -2542,6 +2549,12 @@ class MasterService {
     // 建线程共用；临界区仅含 Load + make_shared + provider 注入（毫秒级），
     // 锁等待可忽略；稳态走外层空判快路径，零成本。
     std::mutex vsegment_service_init_mutex_;
+    // Runtime-resolved vsegment layouts for inline responses, keyed by
+    // vsegment_id. Cleared on segment lifecycle changes; best-effort entries
+    // are omitted on resolution failure.
+    mutable std::mutex vsegment_layout_cache_mutex_;
+    std::unordered_map<std::string, VSegmentLayoutEntry>
+        vsegment_layout_cache_;
     // ----- vsegment 首建状态机（运行期异步门控）-----
     // 心跳线程绝不内联执行分钟级的「首建 + 首次全量 reconcile sweep」：
     //   kIdle       未初始化（或后台初始化失败已复位，等待重触发）

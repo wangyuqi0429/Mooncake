@@ -38,8 +38,10 @@ class RingSlotsView {
     RingSlotsView() = default;
     // 由 CvmController 在 ring_slots_mutex_ 锁内构建（BuildRingSlotsView）。
     explicit RingSlotsView(std::vector<RingSlotAssign> assigns,
-                           uint32_t group_count)
-        : assigns_(std::move(assigns)), group_count_(group_count) {}
+                           uint32_t group_count, uint64_t revision = 0)
+        : assigns_(std::move(assigns)),
+          group_count_(group_count),
+          revision_(revision) {}
 
     // 模型是否启用（存在任一归属记录）。等价于
     // CvmController::HasCachedRingSlotAssigns 的快照时刻取值。
@@ -75,9 +77,14 @@ class RingSlotsView {
     // 补位扫描/自愈扫描）直接使用，避免类接口为每个遍历场景膨胀。
     const std::vector<RingSlotAssign>& assigns() const { return assigns_; }
 
+    // 快照对应的 etcd 版本（LoadAllRingSlotAssigns 返回的 revision）。
+    // 消费方（vsegment 路由加载）用它判定视图有效，要求非零。
+    uint64_t revision() const { return revision_; }
+
    private:
     std::vector<RingSlotAssign> assigns_;
     uint32_t group_count_{0};
+    uint64_t revision_{0};
 };
 
 // In-process control plane for the CVM (Cache View Master).
@@ -262,7 +269,7 @@ class CvmController {
     // ---- RingSlot 归属缓存与 watch（§16.14.6 / §16.19.4）----
     // ring_slots_mutex_ 保护整个视图（group_count + assigns）：
     // RingSlotsWatchLoop / MembershipLoop 写，GetCached* 读。assigns 按
-    // rank 索引，G 上限 kSlotCount，size 与 group_count 允许暂不一致
+    // rank 索引，G 上限 SlotCount()，size 与 group_count 允许暂不一致
     //（成员死亡晋升的修正流未完成时）。
     std::mutex ring_slots_mutex_;
     uint32_t ring_slot_group_count_{0};

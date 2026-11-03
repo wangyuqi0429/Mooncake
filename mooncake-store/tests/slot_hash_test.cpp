@@ -38,21 +38,37 @@ TEST(SlotHashTest, RegistrationOrderedRingAgreesWithOwnerLookup) {
     }
 }
 
-TEST(SlotHashTest, SlotOfUsesLow14Bits) {
+TEST(SlotHashTest, ParsesConfiguredSlotCount) {
+    uint16_t parsed = 0;
+    EXPECT_TRUE(cvm::ParseSlotCount("1", &parsed));
+    EXPECT_EQ(parsed, 1u);
+    EXPECT_TRUE(cvm::ParseSlotCount("1024", &parsed));
+    EXPECT_EQ(parsed, 1024u);
+    EXPECT_TRUE(cvm::ParseSlotCount("16384", &parsed));
+    EXPECT_EQ(parsed, cvm::kDefaultSlotCount);
+    EXPECT_FALSE(cvm::ParseSlotCount(nullptr, &parsed));
+    EXPECT_FALSE(cvm::ParseSlotCount("", &parsed));
+    EXPECT_FALSE(cvm::ParseSlotCount("0", &parsed));
+    EXPECT_FALSE(cvm::ParseSlotCount("3", &parsed));
+    EXPECT_FALSE(cvm::ParseSlotCount("16385", &parsed));
+    EXPECT_FALSE(cvm::ParseSlotCount("1024x", &parsed));
+    EXPECT_FALSE(cvm::ParseSlotCount("1024", nullptr));
+}
+
+TEST(SlotHashTest, SlotOfUsesConfiguredMask) {
     EXPECT_EQ(cvm::SlotOf(0u), 0u);
     EXPECT_EQ(cvm::SlotOf(1u), 1u);
-    EXPECT_EQ(cvm::SlotOf(cvm::kSlotCount - 1), cvm::kSlotCount - 1);
-    // 第 15 位及以上被丢弃：16384 (2^14) 映射回 0。
-    EXPECT_EQ(cvm::SlotOf(cvm::kSlotCount), 0u);
-    EXPECT_EQ(cvm::SlotOf(0xFFFFFFFFu), cvm::kSlotMask);
+    EXPECT_EQ(cvm::SlotOf(cvm::SlotCount() - 1), cvm::SlotCount() - 1);
+    EXPECT_EQ(cvm::SlotOf(cvm::SlotCount()), 0u);
+    EXPECT_EQ(cvm::SlotOf(0xFFFFFFFFu), cvm::SlotCount() - 1);
 }
 
 TEST(SlotHashTest, KeySlotInRange) {
     const std::vector<std::string> keys = {"", "a", "hello", "key-123",
                                            "a-longer-key-for-coverage"};
     for (const auto& key : keys) {
-        EXPECT_LT(cvm::KeySlot(TenantId::Default(), key), cvm::kSlotCount);
-        EXPECT_LT(cvm::KeySlot(TenantId("tenant-a"), key), cvm::kSlotCount);
+        EXPECT_LT(cvm::KeySlot(TenantId::Default(), key), cvm::SlotCount());
+        EXPECT_LT(cvm::KeySlot(TenantId("tenant-a"), key), cvm::SlotCount());
     }
 }
 
@@ -97,7 +113,7 @@ TEST(SlotHashTest, VNodePositionInRangeAndDeterministic) {
     const std::string master = "master-1:10001";
     for (uint16_t vnode = 0; vnode < cvm::kVnodeCount; ++vnode) {
         const uint16_t pos = cvm::VNodePosition(master, vnode);
-        EXPECT_LT(pos, cvm::kSlotCount);
+        EXPECT_LT(pos, cvm::SlotCount());
         EXPECT_EQ(pos, cvm::VNodePosition(master, vnode));
     }
 }
@@ -115,12 +131,12 @@ TEST(SlotHashTest, ResolveOwnedSlotsOnRingSingleMaster) {
     // n=1 时退化：本机拥有全部 slot。
     const std::vector<std::string> ids = {"m-a"};
     const auto slots = cvm::ResolveOwnedSlotsOnRing(ids, "m-a");
-    EXPECT_EQ(slots.size(), static_cast<size_t>(cvm::kSlotCount));
+    EXPECT_EQ(slots.size(), static_cast<size_t>(cvm::SlotCount()));
 }
 
 TEST(SlotHashTest, ResolveOwnedSlotsOnRingCoversAllSlots) {
     const std::vector<std::string> ids = {"m-a", "m-b", "m-c"};
-    std::vector<bool> covered(cvm::kSlotCount, false);
+    std::vector<bool> covered(cvm::SlotCount(), false);
     size_t total = 0;
     for (const auto& id : ids) {
         const auto slots = cvm::ResolveOwnedSlotsOnRing(ids, id);
@@ -131,8 +147,8 @@ TEST(SlotHashTest, ResolveOwnedSlotsOnRingCoversAllSlots) {
         }
     }
     // 每个 slot 恰好归属一个 primary（不重叠 + 全覆盖）。
-    EXPECT_EQ(total, static_cast<size_t>(cvm::kSlotCount));
-    for (size_t s = 0; s < cvm::kSlotCount; ++s) {
+    EXPECT_EQ(total, static_cast<size_t>(cvm::SlotCount()));
+    for (size_t s = 0; s < cvm::SlotCount(); ++s) {
         EXPECT_TRUE(covered[s]) << "slot " << s << " has no owner";
     }
 }
@@ -162,7 +178,7 @@ TEST(SlotHashTest, ResolveOwnedSlotsOnRingStableOnRemoval) {
     }
     // 移除后 a/b 覆盖全量 slot，且总量较移除前增加（接管了被移除者的 slot）。
     EXPECT_EQ(a2_set.size() + b2_set.size(),
-              static_cast<size_t>(cvm::kSlotCount));
+              static_cast<size_t>(cvm::SlotCount()));
     EXPECT_GT(a2_set.size() + b2_set.size(), a_set.size() + b_set.size());
 }
 
@@ -189,7 +205,8 @@ TEST(SlotHashTest, SlotToRankBoundaryEndpoints) {
     // 不变量①：slot=0 → rank 0；slot=16383 → rank G-1（对所有合法 G）。
     for (uint32_t g : {1u, 2u, 3u, 5u, 7u, 13u, 16383u, 16384u}) {
         EXPECT_EQ(cvm::SlotToRank(0, g), 0u) << "G=" << g;
-        EXPECT_EQ(cvm::SlotToRank(cvm::kSlotCount - 1, g), g - 1) << "G=" << g;
+        EXPECT_EQ(cvm::SlotToRank(cvm::SlotCount() - 1, g), g - 1)
+            << "G=" << g;
     }
 }
 
@@ -197,7 +214,7 @@ TEST(SlotHashTest, SlotToRankMonotonicNonDecreasing) {
     // 不变量②：slot 递增 → rank 不减（连续段性质）。
     for (uint32_t g : {3u, 5u, 100u}) {
         uint32_t prev = 0;
-        for (uint16_t s = 0; s < cvm::kSlotCount; ++s) {
+        for (uint16_t s = 0; s < cvm::SlotCount(); ++s) {
             const uint32_t rank = cvm::SlotToRank(s, g);
             EXPECT_GE(rank, prev) << "G=" << g << " slot=" << s;
             prev = rank;
@@ -215,12 +232,14 @@ TEST(SlotHashTest, RankOwnedSlotsIntervalMatchesFormula) {
         for (uint32_t r = 0; r < g; ++r) {
             const auto slots = cvm::RankOwnedSlots(r, g);
             ASSERT_FALSE(slots.empty()) << "G=" << g << " rank=" << r;
-            EXPECT_EQ(slots.front(), ceil_div(r * cvm::kSlotCount, g));
+            EXPECT_EQ(slots.front(), ceil_div(r * cvm::SlotCount(), g));
             EXPECT_EQ(slots.back(),
-                      ceil_div((r + 1) * cvm::kSlotCount, g) - 1);
+                      ceil_div((r + 1) * cvm::SlotCount(), g) - 1);
             EXPECT_EQ(slots.size(),
-                      static_cast<size_t>(ceil_div((r + 1) * cvm::kSlotCount, g)) -
-                          static_cast<size_t>(ceil_div(r * cvm::kSlotCount, g)));
+                      static_cast<size_t>(
+                          ceil_div((r + 1) * cvm::SlotCount(), g)) -
+                          static_cast<size_t>(
+                              ceil_div(r * cvm::SlotCount(), g)));
         }
     }
 }
@@ -229,7 +248,7 @@ TEST(SlotHashTest, RankOwnedSlotsPartitionAllSlots) {
     // 不变量④：所有 rank 的段并集 == [0,16384) 且互不相交（双射）。
     // G 不整除 16384 时段长不均（如 G=3 → 5462/5461/5461）。
     std::vector<uint16_t> expected;
-    for (uint16_t s = 0; s < cvm::kSlotCount; ++s) {
+    for (uint16_t s = 0; s < cvm::SlotCount(); ++s) {
         expected.push_back(s);
     }
     for (uint32_t g : {1u, 2u, 3u, 5u, 7u, 13u}) {
@@ -240,7 +259,7 @@ TEST(SlotHashTest, RankOwnedSlotsPartitionAllSlots) {
             total += slots.size();
             actual.insert(actual.end(), slots.begin(), slots.end());
         }
-        EXPECT_EQ(total, static_cast<size_t>(cvm::kSlotCount)) << "G=" << g;
+        EXPECT_EQ(total, static_cast<size_t>(cvm::SlotCount())) << "G=" << g;
         EXPECT_EQ(actual, expected) << "G=" << g;
     }
 }

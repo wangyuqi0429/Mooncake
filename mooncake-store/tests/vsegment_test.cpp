@@ -9,6 +9,7 @@
 #include "vsegment/vsegment_metrics.h"
 #include "vsegment/partition_quota_planner.h"
 #include "master_service.h"
+#include "rpc_types.h"
 
 #include <gtest/gtest.h>
 
@@ -16,8 +17,11 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstdlib>
 #include <future>
 #include <limits>
+#include <map>
+#include <set>
 #include <thread>
 
 namespace mooncake::vsegment {
@@ -100,6 +104,248 @@ TEST(VSegmentSnapshotCompatibilityTest, ReadsLegacyCompletedOperation) {
               0u);
 }
 
+struct LegacyGetReplicaListResponse {
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t lease_ttl_ms{0};
+    std::optional<uint64_t> object_checksum;
+};
+YLT_REFL(LegacyGetReplicaListResponse, replicas, lease_ttl_ms,
+         object_checksum);
+
+struct LegacyPutStartResult {
+    std::string operation_id;
+    std::vector<Replica::Descriptor> replicas;
+};
+YLT_REFL(LegacyPutStartResult, operation_id, replicas);
+
+VSegmentLayoutEntry MakeTestLayoutEntry() {
+    VSegmentLayoutEntry entry;
+    entry.vsegment_id = "vs-1";
+    entry.partition_id = "partition-1";
+    entry.stripe_size = 4096;
+    entry.logical_capacity = 8192;
+    entry.mapping_algorithm = 0;
+    entry.checksum = 0x1234;
+    entry.members.push_back(
+        {"seg-1", 0, 8192, "127.0.0.1:19000", 0x100000});
+    return entry;
+}
+
+TEST(VSegmentLayoutWireTest, LegacyGetReplicaListDecodesWithoutLayout) {
+    LegacyGetReplicaListResponse legacy{{}, 17, 42};
+    const auto bytes = struct_pack::serialize(legacy);
+    GetReplicaListResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.lease_ttl_ms, 17u);
+    ASSERT_TRUE(decoded.object_checksum.has_value());
+    EXPECT_EQ(*decoded.object_checksum, 42u);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, NewGetReplicaListIsReadableByLegacyReader) {
+    GetReplicaListResponse response;
+    response.lease_ttl_ms = 17;
+    response.object_checksum = 42;
+    response.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(response);
+    LegacyGetReplicaListResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.lease_ttl_ms, 17u);
+    ASSERT_TRUE(decoded.object_checksum.has_value());
+    EXPECT_EQ(*decoded.object_checksum, 42u);
+}
+
+TEST(VSegmentLayoutWireTest, OldPutStartDecodesWithoutLayout) {
+    LegacyPutStartResult legacy{"op-1", {}};
+    const auto bytes = struct_pack::serialize(legacy);
+    PutStartResult decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_EQ(decoded.operation_id, "op-1");
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+struct LegacyCopyStartResponse {
+    Replica::Descriptor source;
+    std::vector<Replica::Descriptor> targets;
+};
+YLT_REFL(LegacyCopyStartResponse, source, targets);
+
+struct LegacyMoveStartResponse {
+    Replica::Descriptor source;
+    std::optional<Replica::Descriptor> target;
+};
+YLT_REFL(LegacyMoveStartResponse, source, target);
+
+TEST(VSegmentLayoutWireTest, CopyStartRoundTripKeepsLayoutTable) {
+    CopyStartResponse response;
+    response.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(response);
+    CopyStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_TRUE(decoded.vsegment_layouts.has_value());
+    ASSERT_EQ(decoded.vsegment_layouts->size(), 1u);
+    EXPECT_EQ((*decoded.vsegment_layouts)[0].vsegment_id, "vs-1");
+}
+
+TEST(VSegmentLayoutWireTest, LegacyCopyStartDecodesWithoutLayoutTable) {
+    LegacyCopyStartResponse legacy;
+    const auto bytes = struct_pack::serialize(legacy);
+    CopyStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, NewCopyStartIsReadableByLegacyReader) {
+    CopyStartResponse response;
+    response.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    const auto bytes = struct_pack::serialize(response);
+    LegacyCopyStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_TRUE(decoded.targets.empty());
+}
+
+TEST(VSegmentLayoutWireTest, LegacyMoveStartDecodesWithoutLayoutTable) {
+    LegacyMoveStartResponse legacy;
+    const auto bytes = struct_pack::serialize(legacy);
+    MoveStartResponse decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    EXPECT_FALSE(decoded.vsegment_layouts.has_value());
+}
+
+TEST(VSegmentLayoutWireTest, BatchVectorRoundTripKeepsDedupTable) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
+    GetReplicaListResponse first;
+    first.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    batch.push_back(std::move(first));
+    batch.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    const auto bytes = struct_pack::serialize(batch);
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.size(), 2u);
+    ASSERT_TRUE(decoded[0]->vsegment_layouts.has_value());
+    ASSERT_EQ(decoded[0]->vsegment_layouts->size(), 1u);
+    EXPECT_EQ(decoded[0]->vsegment_layouts->front().vsegment_id, "vs-1");
+    ASSERT_EQ(decoded[0]->vsegment_layouts->front().members.size(), 1u);
+    EXPECT_EQ(decoded[0]->vsegment_layouts->front().members.front().endpoint,
+              "127.0.0.1:19000");
+}
+
+TEST(VSegmentLayoutWireTest, BatchPutStartRoundTripKeepsPerKeyLayouts) {
+    std::vector<tl::expected<PutStartResult, ErrorCode>> batch;
+    PutStartResult first{"op-1", {}};
+    first.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    batch.push_back(std::move(first));
+    batch.push_back(tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE));
+
+    const auto bytes = struct_pack::serialize(batch);
+    std::vector<tl::expected<PutStartResult, ErrorCode>> decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.size(), 2u);
+    ASSERT_TRUE(decoded[0].has_value());
+    EXPECT_EQ(decoded[0]->operation_id, "op-1");
+    ASSERT_TRUE(decoded[0]->vsegment_layouts.has_value());
+    ASSERT_EQ(decoded[0]->vsegment_layouts->size(), 1u);
+    EXPECT_EQ(decoded[0]->vsegment_layouts->front().vsegment_id, "vs-1");
+    ASSERT_FALSE(decoded[1].has_value());
+    EXPECT_EQ(decoded[1].error(), ErrorCode::NO_AVAILABLE_HANDLE);
+}
+
+TEST(VSegmentLayoutWireTest, CachedQueryResultMapRoundTripKeepsLayout) {
+    CachedQueryResultResponse cached{GetReplicaListResponse{}};
+    cached.value.vsegment_layouts = std::vector<VSegmentLayoutEntry>{
+        MakeTestLayoutEntry()};
+    std::map<std::string, CachedQueryResultResponse> cache;
+    cache.emplace("key-1", std::move(cached));
+
+    const auto bytes = struct_pack::serialize(cache);
+    std::map<std::string, CachedQueryResultResponse> decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.count("key-1"), 1u);
+    ASSERT_TRUE(decoded.at("key-1").value.vsegment_layouts.has_value());
+    EXPECT_EQ(decoded.at("key-1").value.vsegment_layouts->front().vsegment_id,
+              "vs-1");
+}
+
+// BatchGetReplicaList keeps its legacy wire type
+// (vector<expected<GetReplicaListResponse, ...>>); the deduplicated table rides
+// on the first successful per-key response. This is the same
+// GetReplicaListResponse type, so old readers simply ignore the compatible
+// field.
+TEST(VSegmentLayoutWireTest, BatchVectorCarriesTableOnFirstResponse) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
+    batch.push_back(tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    batch.push_back(GetReplicaListResponse{});
+    batch.push_back(GetReplicaListResponse{});
+    AttachVSegmentLayoutTableToFirstSuccess(
+        batch, {MakeTestLayoutEntry()});
+    EXPECT_FALSE(batch[0].has_value());
+    ASSERT_TRUE(batch[1]->vsegment_layouts.has_value());
+    EXPECT_FALSE(batch[2]->vsegment_layouts.has_value());
+
+    // Same wire type round-trip keeps the table on the same element.
+    const auto bytes = struct_pack::serialize(batch);
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> decoded;
+    ASSERT_EQ(struct_pack::deserialize_to(decoded, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(decoded.size(), 3u);
+    ASSERT_TRUE(decoded[1]->vsegment_layouts.has_value());
+    EXPECT_EQ(decoded[1]->vsegment_layouts->front().vsegment_id, "vs-1");
+
+    // And the legacy reader (struct without the compatible field) still works.
+    std::vector<tl::expected<LegacyGetReplicaListResponse, ErrorCode>>
+        legacy_reader;
+    ASSERT_EQ(struct_pack::deserialize_to(legacy_reader, bytes),
+              struct_pack::errc::ok);
+    ASSERT_EQ(legacy_reader.size(), 3u);
+    EXPECT_TRUE(legacy_reader[1].has_value());
+}
+
+TEST(VSegmentLayoutWireTest, CollectsTablesFromBatchResults) {
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> batch;
+    batch.push_back(GetReplicaListResponse{});
+    auto second = MakeTestLayoutEntry();
+    second.vsegment_id = "vs-2";
+    GetReplicaListResponse with_table;
+    with_table.vsegment_layouts = std::vector<VSegmentLayoutEntry>{second};
+    batch.push_back(std::move(with_table));
+
+    std::vector<VSegmentLayoutEntry> merged;
+    MergeVSegmentLayoutTablesFromResults(batch, merged);
+    ASSERT_EQ(merged.size(), 1u);
+    EXPECT_EQ(merged.front().vsegment_id, "vs-2");
+}
+
+TEST(VSegmentLayoutWireTest, MergeVSegmentLayoutTableDeduplicates) {
+    std::vector<VSegmentLayoutEntry> target;
+    auto first = MakeTestLayoutEntry();
+    MergeVSegmentLayoutTable(target, {first});
+    auto duplicate = MakeTestLayoutEntry();
+    duplicate.members.front().endpoint = "other:1";
+    MergeVSegmentLayoutTable(target, {duplicate});
+    ASSERT_EQ(target.size(), 1u);
+    EXPECT_EQ(target.front().members.front().endpoint, "127.0.0.1:19000");
+
+    auto second = MakeTestLayoutEntry();
+    second.vsegment_id = "vs-2";
+    MergeVSegmentLayoutTable(target, {second});
+    ASSERT_EQ(target.size(), 2u);
+}
+
 TEST(VSegmentRouteStoreTest, RouteSerializationRoundTrip) {
     partition::PartitionRoute route{
         {"partition-7"}, "submaster-a", 9,
@@ -143,35 +389,6 @@ class TestStateCommitter : public VSegmentStateCommitter {
     std::string fail_mutation;
     std::vector<std::string> mutations;
     PartitionVSegmentSnapshot last_state;
-};
-
-class TestViewProvider : public VSegmentViewProvider {
-   public:
-    ErrorCode LoadView(const std::string& partition_id,
-                       const std::string& vsegment_id, VSegmentView* output,
-                       std::string*) override {
-        ++loads;
-        if (view.partition_id != partition_id ||
-            view.vsegment_id != vsegment_id)
-            return ErrorCode::SEGMENT_NOT_FOUND;
-        *output = view;
-        return ErrorCode::OK;
-    }
-    int loads{0};
-    VSegmentView view;
-};
-
-class TestEndpointResolver : public SegmentEndpointResolver {
-   public:
-    ErrorCode ResolveLocation(const std::string& segment_id,
-                              PSegmentLocation* location) override {
-        ++resolves;
-        location->endpoint = "endpoint://" + segment_id;
-        location->base_address = base_address;
-        return ErrorCode::OK;
-    }
-    uint64_t base_address{4096};
-    int resolves{0};
 };
 
 std::shared_ptr<TestStateCommitter> Committer() {
@@ -541,129 +758,147 @@ TEST(VSegmentResolverTest, RejectsBufferLengthMismatchAndLogicalOverflow) {
               ErrorCode::INVALID_PARAMS);
 }
 
-TEST(VSegmentTransferPlannerTest, LoadsImmutableViewAndResolvesEndpoints) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
-    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
-
-    auto first = planner.Plan(replica, {{1000, 96}});
-    ASSERT_TRUE(first) << first.detail;
-    ASSERT_EQ(first.requests.size(), 3);
-    EXPECT_EQ(first.requests[0].endpoint, "endpoint://segment-a");
-    EXPECT_EQ(first.requests[0].transfer.physical_offset, 4096 + 48);
-    EXPECT_EQ(first.requests[1].endpoint, "endpoint://segment-b");
-    EXPECT_EQ(provider.loads, 1);
-
-    auto cached = planner.Plan(replica, {{2000, 96}});
-    ASSERT_TRUE(cached);
-    EXPECT_EQ(provider.loads, 1);
+VSegmentLayoutEntry MakeLayoutEntryFromView(const VSegmentView& view,
+                                            uint64_t base_address) {
+    VSegmentLayoutEntry entry;
+    entry.vsegment_id = view.vsegment_id;
+    entry.partition_id = view.partition_id;
+    entry.stripe_size = view.stripe_size;
+    entry.logical_capacity = view.logical_capacity;
+    entry.mapping_algorithm = static_cast<uint32_t>(view.mapping_algorithm);
+    entry.checksum = view.checksum;
+    entry.members.reserve(view.members.size());
+    for (const auto& member : view.members) {
+        entry.members.push_back({member.segment_id, member.base_offset,
+                                 member.length,
+                                 "inline://" + member.segment_id,
+                                 base_address});
+    }
+    return entry;
 }
 
-TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctSegmentOnce) {
+TEST(VSegmentTransferPlannerTest, UsesInlineLayoutTable) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    std::vector<VSegmentLayoutEntry> layouts{MakeLayoutEntryFromView(
+        allocation.view, /*base_address=*/0x200000)};
 
-    // 512 bytes over 64-byte stripes = 8 sub-requests, but only 2 distinct
-    // psegments (member_count = 2). The resolver must be hit once per
-    // distinct segment, not once per sub-request.
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    ASSERT_TRUE(plan) << plan.detail;
+    ASSERT_EQ(plan.requests.size(), 3u);
+    EXPECT_EQ(plan.requests[0].endpoint, "inline://segment-a");
+    EXPECT_EQ(plan.requests[0].transfer.physical_offset, 0x200000 + 48);
+}
+
+TEST(VSegmentTransferPlannerTest, ResolvesEachDistinctMemberEndpoint) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    std::vector<VSegmentLayoutEntry> layouts{MakeLayoutEntryFromView(
+        allocation.view, /*base_address=*/0x200000)};
+
+    // 512 bytes over 64-byte stripes = 8 sub-requests across 2 distinct
+    // members (member_count = 2).
     VSegmentDescriptor replica{"partition-1", "vs-1", 0, 512};
-    auto plan = planner.Plan(replica, {{1000, 512}});
+    auto plan = planner.Plan(replica, {{1000, 512}}, &layouts);
     ASSERT_TRUE(plan) << plan.detail;
     ASSERT_EQ(plan.requests.size(), 8u);
-    EXPECT_EQ(endpoints.resolves, 2);
+    std::set<std::string> endpoints;
+    for (const auto& request : plan.requests) {
+        endpoints.insert(request.endpoint);
+    }
+    EXPECT_EQ(endpoints.size(), 2u);
+}
+
+TEST(VSegmentTransferPlannerTest, RequiresLayoutTable) {
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, nullptr);
+    EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_NE(plan.detail.find("required but absent"), std::string::npos);
+    EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsTableWithoutMatchingVSegment) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    entry.vsegment_id = "vs-other";
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_NE(plan.detail.find("no entry for vs-1"), std::string::npos);
+    EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsLayoutFromAnotherPartition) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    entry.partition_id = "partition-2";
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    EXPECT_EQ(plan.error, ErrorCode::INVALID_VERSION);
+    EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsLayoutChecksumMismatch) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    entry.checksum ^= 1;
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    EXPECT_EQ(plan.error, ErrorCode::CHECKSUM_MISMATCH);
+    EXPECT_TRUE(plan.requests.empty());
+}
+
+TEST(VSegmentTransferPlannerTest, RejectsLayoutMemberWithoutEndpoint) {
+    PartitionQuotaAllocator allocator(Config());
+    auto allocation = allocator.Allocate("vs-1", Profile());
+    ASSERT_TRUE(allocation);
+    VSegmentTransferPlanner planner;
+    VSegmentDescriptor replica{"partition-1", "vs-1", 48, 96};
+    auto entry = MakeLayoutEntryFromView(allocation.view, 0x200000);
+    ASSERT_FALSE(entry.members.empty());
+    entry.members.front().endpoint.clear();
+    std::vector<VSegmentLayoutEntry> layouts{std::move(entry)};
+
+    // An unmounted member has no endpoint and hard C has no RPC fallback.
+    auto plan = planner.Plan(replica, {{1000, 96}}, &layouts);
+    EXPECT_EQ(plan.error, ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_NE(plan.detail.find("no endpoint"), std::string::npos);
+    EXPECT_TRUE(plan.requests.empty());
 }
 
 TEST(VSegmentTransferPlannerTest, RejectsAbsoluteAddressOverflow) {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
     ASSERT_TRUE(allocation);
-    TestViewProvider provider;
-    provider.view = allocation.view;
-    TestEndpointResolver endpoints;
-    endpoints.base_address = std::numeric_limits<uint64_t>::max();
-    VSegmentViewCache cache;
-    VSegmentTransferPlanner planner(&provider, &endpoints, &cache);
+    VSegmentTransferPlanner planner;
     VSegmentDescriptor replica{"partition-1", "vs-1", 1, 8};
-    EXPECT_EQ(planner.Plan(replica, {{1000, 8}}).error,
+    std::vector<VSegmentLayoutEntry> layouts{MakeLayoutEntryFromView(
+        allocation.view, std::numeric_limits<uint64_t>::max())};
+
+    EXPECT_EQ(planner.Plan(replica, {{1000, 8}}, &layouts).error,
               ErrorCode::INVALID_PARAMS);
-}
-
-TEST(VSegmentTransferPlannerTest, RejectsConflictingCachedView) {
-    PartitionQuotaAllocator allocator(Config());
-    auto allocation = allocator.Allocate("vs-1", Profile());
-    ASSERT_TRUE(allocation);
-    VSegmentViewCache cache;
-    ASSERT_EQ(cache.Insert(allocation.view), ErrorCode::OK);
-    auto conflicting = allocation.view;
-    conflicting.members[0].base_offset += 8;
-    conflicting.checksum = ComputeViewChecksum(conflicting);
-    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
-}
-
-TEST(VSegmentViewCacheTest, ComparesLayoutInsteadOfTrustingChecksum) {
-    auto original = View();
-    VSegmentViewCache cache;
-    ASSERT_EQ(cache.Insert(original), ErrorCode::OK);
-
-    auto conflicting = original;
-    conflicting.members[0].base_offset += original.stripe_size;
-    // Simulate a checksum collision or incorrectly copied checksum. Structure
-    // remains valid because checksum still matches the supplied value only
-    // after deliberately retaining the original checksum.
-    conflicting.checksum = original.checksum;
-    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::CHECKSUM_MISMATCH);
-
-    conflicting.checksum = ComputeViewChecksum(conflicting);
-    EXPECT_EQ(cache.Insert(conflicting), ErrorCode::INVALID_VERSION);
-}
-
-TEST(VSegmentViewCacheTest, ScopesIdentityByPartition) {
-    auto first = View();
-    auto second = first;
-    second.partition_id = "partition-2";
-    second.stripe_size *= 2;
-    second.checksum = ComputeViewChecksum(second);
-
-    VSegmentViewCache cache;
-    ASSERT_EQ(cache.Insert(first), ErrorCode::OK);
-    ASSERT_EQ(cache.Insert(second), ErrorCode::OK);
-    VSegmentView loaded;
-    ASSERT_TRUE(cache.Find(first.partition_id, first.vsegment_id, &loaded));
-    EXPECT_EQ(loaded.stripe_size, first.stripe_size);
-    ASSERT_TRUE(cache.Find(second.partition_id, second.vsegment_id, &loaded));
-    EXPECT_EQ(loaded.stripe_size, second.stripe_size);
-}
-
-TEST(VSegmentViewCacheTest, EvictsOldestViewAtCapacity) {
-    VSegmentViewCache cache(2);
-    auto first = View();
-    auto second = first;
-    second.vsegment_id = "vs-2";
-    second.checksum = ComputeViewChecksum(second);
-    auto third = first;
-    third.vsegment_id = "vs-3";
-    third.checksum = ComputeViewChecksum(third);
-
-    ASSERT_EQ(cache.Insert(first), ErrorCode::OK);
-    ASSERT_EQ(cache.Insert(second), ErrorCode::OK);
-    ASSERT_EQ(cache.Insert(third), ErrorCode::OK);
-    EXPECT_EQ(cache.Size(), 2u);
-    VSegmentView loaded;
-    EXPECT_FALSE(cache.Find(first.partition_id, first.vsegment_id, &loaded));
-    EXPECT_TRUE(cache.Find(second.partition_id, second.vsegment_id, &loaded));
-    EXPECT_TRUE(cache.Find(third.partition_id, third.vsegment_id, &loaded));
 }
 
 TEST(VSegmentViewTest, KeepsProfileIdentityOutsideImmutableView) {
@@ -1881,6 +2116,156 @@ TEST(VSegmentIntegrationTest, OrdinaryPutReturnsAndCommitsVSegmentReplica) {
     EXPECT_TRUE(loaded->replicas.front().is_vsegment_replica());
 }
 
+TEST(VSegmentLayoutMasterTest, BatchAndSingleResponsesCarryResolvedLayouts) {
+    const std::string key = "layout-master-batch";
+    const auto& tenant = TenantId::Default();
+    const std::string partition_id =
+        std::to_string(cvm::KeySlot(tenant, key));
+    const UUID segment_a = generate_uuid();
+    const UUID segment_b = generate_uuid();
+
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {{partition_id,
+                     "default",
+                     "DRAM",
+                     {{UuidToString(segment_a), 0, 512},
+                      {UuidToString(segment_b), 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+
+    MasterServiceConfig config;
+    config.default_kv_lease_ttl = 10000;
+    MasterService master(config);
+    master.SetVSegmentService(vsegments);
+
+    const UUID client = generate_uuid();
+    Segment mounted_a;
+    mounted_a.id = segment_a;
+    mounted_a.name = "layout-seg-a";
+    mounted_a.base = 0x400000;
+    mounted_a.size = 1 << 20;
+    mounted_a.te_endpoint = "10.0.0.1:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_a, client).has_value());
+    Segment mounted_b;
+    mounted_b.id = segment_b;
+    mounted_b.name = "layout-seg-b";
+    mounted_b.base = 0x500000;
+    mounted_b.size = 1 << 20;
+    mounted_b.te_endpoint = "10.0.0.2:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_b, client).has_value());
+
+    ReplicateConfig replicas;
+    replicas.replica_num = 1;
+    tl::expected<std::optional<PutStartResult>, ErrorCode> started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = master.TryVSegmentPutStart(client, key, tenant, 64, replicas);
+        if (started && started->has_value()) break;
+        if (!started && started.error() != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started.has_value());
+    ASSERT_TRUE(started->has_value());
+    const auto& replica = (**started).replicas.front();
+    ASSERT_TRUE(replica.is_vsegment_replica());
+    const std::string vsegment_id =
+        replica.get_vsegment_descriptor().vsegment_id;
+    // Phase 2: the single PutStart response already carries the table.
+    ASSERT_TRUE((**started).vsegment_layouts.has_value());
+    EXPECT_EQ((**started).vsegment_layouts->front().vsegment_id, vsegment_id);
+
+    ObjectMeta object{key, std::nullopt};
+    ASSERT_TRUE(master.PutEnd(client, object, tenant, ReplicaType::MEMORY,
+                              (**started).operation_id));
+
+    // Batch: the deduplicated table rides on the first successful response.
+    auto batch = master.BatchGetReplicaList({key}, tenant);
+    ASSERT_EQ(batch.size(), 1u);
+    ASSERT_TRUE(batch[0].has_value());
+    ASSERT_TRUE(batch[0]->vsegment_layouts.has_value());
+    const auto& entry = batch[0]->vsegment_layouts->front();
+    EXPECT_EQ(entry.vsegment_id, vsegment_id);
+    EXPECT_EQ(entry.partition_id, partition_id);
+    ASSERT_EQ(entry.members.size(), 2u);
+    EXPECT_EQ(entry.members[0].endpoint, "10.0.0.1:12345");
+    EXPECT_EQ(entry.members[0].base_address, 0x400000u);
+    EXPECT_EQ(entry.members[1].endpoint, "10.0.0.2:12345");
+    EXPECT_EQ(entry.members[1].base_address, 0x500000u);
+
+    // Cache: a second call returns the same single entry (no duplicate), and
+    // only the first successful key carries it.
+    auto cached = master.BatchGetReplicaList({key, key}, tenant);
+    ASSERT_EQ(cached.size(), 2u);
+    ASSERT_TRUE(cached[0]->vsegment_layouts.has_value());
+    EXPECT_EQ(cached[0]->vsegment_layouts->size(), 1u);
+    EXPECT_FALSE(cached[1]->vsegment_layouts.has_value());
+
+    // Single read also carries the table.
+    auto loaded = master.GetReplicaList(key, tenant);
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded->vsegment_layouts.has_value());
+    EXPECT_EQ(loaded->vsegment_layouts->front().vsegment_id, vsegment_id);
+}
+
+TEST(VSegmentLayoutMasterTest, UnmountInvalidatesCachedLayouts) {
+    const std::string partition_id = "partition-layout-unmount";
+    const UUID segment_a = generate_uuid();
+    const UUID segment_b = generate_uuid();
+
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {{partition_id,
+                     "default",
+                     "DRAM",
+                     {{UuidToString(segment_a), 0, 512},
+                      {UuidToString(segment_b), 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = vsegments->StartPut(partition_id, 1, "layout-unmount", 64);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+
+    MasterServiceConfig config;
+    MasterService master(config);
+    master.SetVSegmentService(vsegments);
+    const UUID client = generate_uuid();
+    Segment mounted_a;
+    mounted_a.id = segment_a;
+    mounted_a.name = "u-seg-a";
+    mounted_a.base = 0x400000;
+    mounted_a.size = 1 << 20;
+    mounted_a.te_endpoint = "10.0.0.1:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_a, client).has_value());
+    Segment mounted_b;
+    mounted_b.id = segment_b;
+    mounted_b.name = "u-seg-b";
+    mounted_b.base = 0x500000;
+    mounted_b.size = 1 << 20;
+    mounted_b.te_endpoint = "10.0.0.2:12345";
+    ASSERT_TRUE(master.MountSegment(mounted_b, client).has_value());
+
+    auto table = master.BuildVSegmentLayoutTable(
+        {{partition_id, started.replica.vsegment_id}});
+    ASSERT_EQ(table.size(), 1u);
+
+    ASSERT_TRUE(master.UnmountSegment(segment_a, client).has_value());
+    auto after = master.BuildVSegmentLayoutTable(
+        {{partition_id, started.replica.vsegment_id}});
+    EXPECT_TRUE(after.empty());
+}
+
 TEST(VSegmentIntegrationTest, OrdinaryMemoryRevokeRemovesVSegmentReplica) {
     const std::string key = "ordinary-vsegment-revoke";
     const auto& tenant = TenantId::Default();
@@ -2121,7 +2506,7 @@ TEST(BuildDiscoveredQuotaPlanTest, AcceptsExclusiveSegmentsAndReadsRealFacts) {
     EXPECT_EQ(request.segments[0].base_offset, 0u);
     EXPECT_EQ(request.segments[0].capacity, 4096u);
     // Partition 列表由 KV PT 生成（slot 数）。
-    EXPECT_EQ(request.partition_ids.size(), cvm::kSlotCount);
+    EXPECT_EQ(request.partition_ids.size(), cvm::SlotCount());
     EXPECT_EQ(request.profile_specs.size(), 1u);
     EXPECT_EQ(request.profile_specs[0].member_count, 2u);
 }
@@ -2381,7 +2766,7 @@ TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeBuildsProfilePerMedium) {
     auto result = planner.Plan(request);
     ASSERT_EQ(result.error, ErrorCode::OK) << result.detail;
     // 每个 partition 有 2 个 quota（DRAM 一个、NVMe 一个）。
-    // partition_ids.size() == kSlotCount，quotas.size() == 2 * kSlotCount。
+    // quotas.size() == 2 * SlotCount()。
     EXPECT_EQ(result.snapshot.quotas.size(),
               request.partition_ids.size() * 2);
 }

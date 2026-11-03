@@ -445,6 +445,7 @@ std::string CvmHttpServer::GetRingSlotsViewJson() const {
         static_cast<Json::Value::UInt>(meta.slot_group_count);
     root["submaster_count"] =
         static_cast<Json::Value::UInt>(meta.submaster_count);
+    root["slot_count"] = static_cast<Json::Value::UInt>(meta.slot_count);
     // 与 CvmController::HasCachedRingSlotAssigns 同语义：存在归属记录 =
     // 模型启用；false = 旧集群灰度回退中（ranks 为空数组）。
     root["model_active"] = !assigns.empty();

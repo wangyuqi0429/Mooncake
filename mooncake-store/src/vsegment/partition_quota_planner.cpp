@@ -222,7 +222,7 @@ ErrorCode BuildDiscoveredQuotaPlan(
                   return a.segment_id < b.segment_id;
               });
     // Partition 列表由 KV PT 生成（确定性哈希方案，slot 即 partition）。
-    for (uint16_t slot = 0; slot < cvm::kSlotCount; ++slot)
+    for (uint16_t slot = 0; slot < cvm::SlotCount(); ++slot)
         next.partition_ids.push_back(std::to_string(slot));
     std::string serialized;
     struct_json::to_json(next, serialized);

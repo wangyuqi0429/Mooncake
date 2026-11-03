@@ -1,6 +1,11 @@
 #pragma once
 
 #include <optional>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <ylt/struct_pack/compatible.hpp>
+#include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
 #include "replica.h"
@@ -13,6 +18,34 @@ struct ObjectMeta {
     std::optional<uint64_t> object_checksum;
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
+
+// Runtime-resolved location of one vsegment member. Only filled for vsegment
+// replicas; ordinary memory/NoF/disk replicas carry their own endpoint/base in
+// Replica::Descriptor.
+struct VSegmentLayoutMember {
+    std::string segment_id;
+    uint64_t base_offset{0};
+    uint64_t length{0};
+    std::string endpoint;
+    uint64_t base_address{0};
+};
+YLT_REFL(VSegmentLayoutMember, segment_id, base_offset, length, endpoint,
+         base_address);
+
+// Deduplicated per-vsegment layout carried alongside replica descriptors.
+// The layout is immutable; endpoint/base are runtime values resolved by the
+// owner master when the response is built.
+struct VSegmentLayoutEntry {
+    std::string vsegment_id;
+    std::string partition_id;
+    uint64_t stripe_size{0};
+    uint64_t logical_capacity{0};
+    uint32_t mapping_algorithm{0};
+    uint32_t checksum{0};
+    std::vector<VSegmentLayoutMember> members;
+};
+YLT_REFL(VSegmentLayoutEntry, vsegment_id, partition_id, stripe_size,
+         logical_capacity, mapping_algorithm, checksum, members);
 
 /**
  * @brief Response structure for Ping operation
@@ -41,6 +74,9 @@ struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
     std::optional<uint64_t> object_checksum;
+    // Only entries for vsegment replicas in `replicas`; empty otherwise.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
@@ -51,7 +87,8 @@ struct GetReplicaListResponse {
           lease_ttl_ms(lease_ttl_ms_param),
           object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum,
+         vsegment_layouts);
 
 /**
  * @brief PutStart 响应（vsegment 两阶段写预留接口）。
@@ -61,6 +98,9 @@ YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 struct PutStartResult {
     std::string operation_id;
     std::vector<Replica::Descriptor> replicas;
+    // Only entries for vsegment replicas in `replicas`; empty otherwise.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 
     PutStartResult() = default;
     PutStartResult(std::string operation_id_param,
@@ -68,7 +108,63 @@ struct PutStartResult {
         : operation_id(std::move(operation_id_param)),
           replicas(std::move(replicas_param)) {}
 };
-YLT_REFL(PutStartResult, operation_id, replicas);
+YLT_REFL(PutStartResult, operation_id, replicas, vsegment_layouts);
+
+// BatchGetReplicaList keeps its legacy vector wire type. Its deduplicated table
+// rides on the first successful per-key GetReplicaListResponse, whose
+// compatible field keeps that RPC wire-compatible. BatchPutStart intentionally
+// returns per-key PutStartResult values instead; that direct RPC type change
+// requires clients and masters to be upgraded together.
+
+// Attaches the deduplicated batch table to the first successful per-key
+// response. No-op when there is no table or no successful key.
+inline void AttachVSegmentLayoutTableToFirstSuccess(
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry> layouts) {
+    if (layouts.empty()) return;
+    for (auto& result : results) {
+        if (result) {
+            result->vsegment_layouts = std::move(layouts);
+            return;
+        }
+    }
+}
+
+// Collects layout tables carried by any per-key response of a batch (new
+// masters put one deduplicated table on the first successful key; legacy
+// masters carry none). Deduplicated by vsegment_id.
+inline void MergeVSegmentLayoutTablesFromResults(
+    const std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry>& target);
+
+// Appends `incoming` to `target`, keeping the first entry per vsegment_id.
+// Used to merge tables built by different masters (route groups) into the
+// table of one batch response.
+inline void MergeVSegmentLayoutTable(
+    std::vector<VSegmentLayoutEntry>& target,
+    const std::vector<VSegmentLayoutEntry>& incoming) {
+    if (incoming.empty()) return;
+    // Hash-based dedup: a 30k-key batch can carry thousands of entries, and the
+    // merge runs once per route group.
+    std::unordered_set<std::string> seen;
+    seen.reserve(target.size() + incoming.size());
+    for (const auto& entry : target) seen.insert(entry.vsegment_id);
+    for (const auto& entry : incoming) {
+        if (seen.insert(entry.vsegment_id).second) {
+            target.push_back(entry);
+        }
+    }
+}
+
+inline void MergeVSegmentLayoutTablesFromResults(
+    const std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>& results,
+    std::vector<VSegmentLayoutEntry>& target) {
+    for (const auto& result : results) {
+        if (result && result->vsegment_layouts.has_value()) {
+            MergeVSegmentLayoutTable(target, *result->vsegment_layouts);
+        }
+    }
+}
 
 struct CachedQueryResultResponse {
     bool success;
@@ -118,8 +214,13 @@ YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
 struct CopyStartResponse {
     Replica::Descriptor source;
     std::vector<Replica::Descriptor> targets;
+    // Hard C: layout table for vsegment descriptors in source/targets. The
+    // client has no endpoint RPC to fall back to, so a vsegment copy without
+    // this table fails.
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 };
-YLT_REFL(CopyStartResponse, source, targets);
+YLT_REFL(CopyStartResponse, source, targets, vsegment_layouts);
 
 /**
  * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
@@ -136,8 +237,10 @@ YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
 struct MoveStartResponse {
     Replica::Descriptor source;
     std::optional<Replica::Descriptor> target;
+    struct_pack::compatible<std::vector<VSegmentLayoutEntry>, 2>
+        vsegment_layouts;
 };
-YLT_REFL(MoveStartResponse, source, target);
+YLT_REFL(MoveStartResponse, source, target, vsegment_layouts);
 
 /**
  * @brief Response structure for InterMasterHandshake: identity + ownership

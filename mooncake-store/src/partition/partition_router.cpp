@@ -51,11 +51,23 @@ ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
                      << " (cluster may not have published ring config yet)";
         return err;
     }
+    if (meta.slot_count != cvm::SlotCount()) {
+        LOG(ERROR) << "PartitionRouter slot count mismatch: cluster="
+                   << meta.slot_count << ", local=" << cvm::SlotCount()
+                   << ", env=" << cvm::kSlotCountEnv
+                   << ". Use the same value on every master and client.";
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     // ---- RingSlot 路由（§16.17.3）：ring_slots → rank 表 ----
     // G 防御 clamp：旧数据 slot_group_count 缺省 1（YLT_REFL 默认值）。
     const uint32_t group_count =
         std::max<uint32_t>(1, meta.slot_group_count);
+    if (group_count > cvm::SlotCount()) {
+        LOG(ERROR) << "PartitionRouter invalid ring metadata: groups="
+                   << group_count << ", slot_count=" << cvm::SlotCount();
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     std::vector<cvm::RingSlotAssign> assigns;
     ViewVersionId assigns_revision = 0;
@@ -119,8 +131,8 @@ ErrorCode PartitionRouter::LoadFromEtcdSnapshot(
     }
 
     std::unordered_map<uint16_t, std::string> next;
-    next.reserve(cvm::kSlotCount);
-    for (uint16_t s = 0; s < cvm::kSlotCount; ++s) {
+    next.reserve(cvm::SlotCount());
+    for (uint16_t s = 0; s < cvm::SlotCount(); ++s) {
         std::string owner = cvm::ResolveSlotOwnerOnRing(ids, s);
         if (!owner.empty()) {
             next[s] = std::move(owner);

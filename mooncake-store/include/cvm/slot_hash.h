@@ -1,8 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "crc32c.h"
@@ -12,9 +17,47 @@
 namespace mooncake {
 namespace cvm {
 
-// Number of logical slots, aligned with Redis Cluster (16384 == 2^14).
-constexpr uint16_t kSlotCount = 16384;
-constexpr uint16_t kSlotMask = kSlotCount - 1;  // 16383
+// Number of logical slots. The default is aligned with Redis Cluster
+// (16384 == 2^14), while smaller power-of-two values can be selected before
+// process startup with MC_STORE_PARTITION_SLOT_COUNT. Every master and client
+// in a cluster must use the same value. Changing it requires a fresh cluster
+// namespace because it changes key hashing and partition ownership.
+constexpr uint16_t kDefaultSlotCount = 16384;
+constexpr char kSlotCountEnv[] = "MC_STORE_PARTITION_SLOT_COUNT";
+
+inline bool ParseSlotCount(const char* value, uint16_t* slot_count) {
+    if (value == nullptr || *value == '\0' || slot_count == nullptr) {
+        return false;
+    }
+    uint32_t parsed = 0;
+    const char* end = value + std::strlen(value);
+    const auto [ptr, error] = std::from_chars(value, end, parsed);
+    if (error != std::errc{} || ptr != end || parsed == 0 ||
+        parsed > kDefaultSlotCount || (parsed & (parsed - 1)) != 0) {
+        return false;
+    }
+    *slot_count = static_cast<uint16_t>(parsed);
+    return true;
+}
+
+inline uint16_t SlotCount() {
+    static const uint16_t slot_count = [] {
+        const char* value = std::getenv(kSlotCountEnv);
+        if (value == nullptr || *value == '\0') {
+            return kDefaultSlotCount;
+        }
+        uint16_t parsed = 0;
+        if (!ParseSlotCount(value, &parsed)) {
+            std::fprintf(stderr,
+                         "Invalid %s=%s: expected a power of two in [1, %u]\n",
+                         kSlotCountEnv, value,
+                         static_cast<unsigned>(kDefaultSlotCount));
+            std::abort();
+        }
+        return parsed;
+    }();
+    return slot_count;
+}
 
 // Number of virtual nodes per master on the consistent-hash ring used for
 // dynamic slot ownership. More vnodes yield a more balanced distribution at
@@ -22,10 +65,10 @@ constexpr uint16_t kSlotMask = kSlotCount - 1;  // 16383
 // skew low (~1%) while remaining cheap to recompute.
 constexpr uint16_t kVnodeCount = 128;
 
-// Maps a stable hash value to a slot by taking the low 14 bits. This is
-// equivalent to `hash % kSlotCount` but cheaper.
+// Maps a stable hash value to a slot by taking the low log2(SlotCount()) bits.
+// This is equivalent to `hash % SlotCount()` but cheaper.
 inline uint16_t SlotOf(uint32_t hash) {
-    return static_cast<uint16_t>(hash & kSlotMask);
+    return static_cast<uint16_t>(hash & (SlotCount() - 1));
 }
 
 // Computes the logical slot for a tenant-scoped key.
@@ -46,7 +89,7 @@ inline uint16_t KeySlot(const TenantId& tenant, const std::string& user_key) {
 }
 
 // Position of a master's virtual node on the consistent-hash ring, in
-// [0, kSlotCount). Placement depends only on (master_id, vnode_index), so it
+// [0, SlotCount()). Placement depends only on (master_id, vnode_index), so it
 // is deterministic across processes/compilers and independent of the current
 // master set. The vnode index is encoded as fixed little-endian bytes so the
 // hash is stable regardless of host endianness.
@@ -75,8 +118,8 @@ inline std::vector<uint16_t> ResolveOwnedSlotsOnRing(
     const size_t n = ids.size();
     if (n <= 1) {
         std::vector<uint16_t> slots;
-        slots.reserve(kSlotCount);
-        for (uint16_t s = 0; s < kSlotCount; ++s) {
+        slots.reserve(SlotCount());
+        for (uint16_t s = 0; s < SlotCount(); ++s) {
             slots.push_back(s);
         }
         return slots;
@@ -102,8 +145,8 @@ inline std::vector<uint16_t> ResolveOwnedSlotsOnRing(
     });
 
     std::vector<uint16_t> slots;
-    slots.reserve(kSlotCount / n + 1);
-    for (uint16_t s = 0; s < kSlotCount; ++s) {
+    slots.reserve(SlotCount() / n + 1);
+    for (uint16_t s = 0; s < SlotCount(); ++s) {
         // 环上第一个 position >= s 的虚拟节点（越界则环绕到 ring[0]）。
         auto it = std::lower_bound(
             ring.begin(), ring.end(), s,
@@ -175,34 +218,37 @@ inline std::string ResolveSlotOwnerOnRing(const std::vector<std::string>& ids,
 // 将 slot 映射到槽位组 rank ∈ [0, group_count)。
 //
 // 连续段划分（rank 单调、无空洞、无重叠、全覆盖）：
-//   SlotToRank(s, G) = floor(s * G / 16384)
-//   rank r 独占 s ∈ [ceil(r*16384/G), ceil((r+1)*16384/G))
-// 两式的整除方向是对偶的（一向下、一向上），G 不整除 16384 时（如
-// G=3 → 段长 5462/5461/5461）也只有这一组合能保证互逆，双向 floor 会
+//   SlotToRank(s, G) = floor(s * G / S), S = SlotCount()
+//   rank r 独占 s ∈ [ceil(r*S/G), ceil((r+1)*S/G))
+// 两式的整除方向是对偶的（一向下、一向上），G 不整除 S 时也只有这一
+// 组合能保证互逆，双向 floor 会
 // 在段界 slot 上出现「SlotToRank(s)=r-1 但 s ∈ RankOwnedSlots(r)」的
 // 归属裂缝。G=1 退化为单 primary 全量（与 §15 单主等价，回滚保证）。
 inline uint32_t SlotToRank(uint16_t slot, uint32_t group_count) {
-    // 先提升到 32 位再乘：16383 * 16384 = 2^28，uint32_t 足够，
+    // 先提升到 32 位再乘；slot_count 和 group_count 均不超过 16384，
+    // 最大乘积小于 2^28，uint32_t 足够，
     // 但 uint16 直接乘可能截断，必须显式 cast。
-    return static_cast<uint32_t>(slot) * group_count / kSlotCount;
+    const uint32_t slot_count = SlotCount();
+    return static_cast<uint32_t>(slot) * group_count / slot_count;
 }
 
 // 返回 rank 所拥有的 slot 段（升序、连续），即
-// [ceil(rank*16384/G), ceil((rank+1)*16384/G))。
+// [ceil(rank*S/G), ceil((rank+1)*S/G))，S = SlotCount()。
 //
 // 防御：group_count == 0 或 rank >= group_count 返回空（正常不应发生）。
-// 循环变量必须为 uint32_t：G > 16384 时段尾会超出 uint16_t 域（见上）。
+// 循环变量使用 uint32_t，避免中间算术发生 uint16_t 截断。
 inline std::vector<uint16_t> RankOwnedSlots(uint32_t rank,
                                             uint32_t group_count) {
     if (group_count == 0 || rank >= group_count) {
         return {};
     }
     // 上取整对偶（见 SlotToRank 注释）：ceil(x/G) = (x + G - 1) / G。
-    // rank < G <= 16384 时 (rank+1)*16384 + G - 1 < 2^28，无溢出。
+    // rank < G <= S <= 16384，所以下面的 uint32_t 中间值无溢出。
+    const uint32_t slot_count = SlotCount();
     const uint32_t first =
-        (rank * kSlotCount + group_count - 1) / group_count;        // 段首（含）
-    const uint32_t last =
-        ((rank + 1) * kSlotCount + group_count - 1) / group_count;  // 段尾（不含）
+        (rank * slot_count + group_count - 1) / group_count;  // 段首（含）
+    const uint32_t last = ((rank + 1) * slot_count + group_count - 1) /
+                          group_count;  // 段尾（不含）
     std::vector<uint16_t> slots;
     slots.reserve(last - first);
     for (uint32_t s = first; s < last; ++s) {

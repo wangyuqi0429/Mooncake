@@ -330,57 +330,6 @@ WrappedMasterService::GetReplicaList(const std::string& key,
     return result;
 }
 
-tl::expected<vsegment::VSegmentView, ErrorCode>
-WrappedMasterService::GetVSegmentView(const std::string& partition_id,
-                                      const std::string& vsegment_id) {
-    // Server-side observability for the vsegment view RPC (sampled access
-    // log + SpDiag histogram). MasterService::GetVSegmentView is a cheap
-    // in-memory lookup; latency here reflects handler + serialization cost.
-    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
-    const auto t0 = sample ? std::chrono::steady_clock::now()
-                           : std::chrono::steady_clock::time_point{};
-    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_GET_VSEGMENT_VIEW,
-                         SpDiag::PerfLevel::MODULE);
-    pt.Start();
-    auto result = master_service_.GetVSegmentView(partition_id, vsegment_id);
-    pt.End(result ? 0 : -1);
-    if (sample) {
-        const auto latency_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count();
-        MC_LOG(INFO) << "GetVSegmentView partition=" << partition_id
-                     << " vsegment=" << vsegment_id << " latency_us="
-                     << latency_us << " status="
-                     << (result.has_value() ? "ok" : toString(result.error()));
-    }
-    return result;
-}
-
-tl::expected<vsegment::PSegmentLocation, ErrorCode>
-WrappedMasterService::GetPSegmentEndpoint(const std::string& segment_id) {
-    // Server-side observability for the psegment endpoint RPC (sampled
-    // access log + SpDiag histogram). Cheap in-memory registry lookup.
-    const bool sample = mooncake::logging::ShouldSampleHiFreqLog();
-    const auto t0 = sample ? std::chrono::steady_clock::now()
-                           : std::chrono::steady_clock::time_point{};
-    SpDiag::PerfPoint pt(PerfKey::MASTER_RPC_GET_PSEGMENT_ENDPOINT,
-                         SpDiag::PerfLevel::MODULE);
-    pt.Start();
-    auto result = master_service_.GetPSegmentEndpoint(segment_id);
-    pt.End(result ? 0 : -1);
-    if (sample) {
-        const auto latency_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0)
-                .count();
-        MC_LOG(INFO) << "GetPSegmentEndpoint psegment=" << segment_id
-                     << " latency_us=" << latency_us << " status="
-                     << (result.has_value() ? "ok" : toString(result.error()));
-    }
-    return result;
-}
-
 vsegment::VSegmentPutStartResult WrappedMasterService::VSegmentPutStart(
     const std::string& partition_id, uint64_t route_epoch,
     const std::string& operation_id, uint64_t length,
@@ -517,13 +466,19 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 WrappedMasterService::BatchGetReplicaListForAdmin(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
-    return WithRequestTenantBatch(
+    auto results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
         keys.size(), [&](const TenantId& resolved_tenant_id) {
             return master_service_.BatchGetReplicaListForAdmin(
                 keys, resolved_tenant_id);
         });
+    // Admin batch has no envelope: each response carries the layout table for
+    // its own vsegment replicas (not perf-critical; no cross-key dedup).
+    for (auto& result : results) {
+        if (result) master_service_.EnrichVSegmentLayouts(&(*result));
+    }
+    return results;
 }
 
 tl::expected<GetReplicaListResponse, ErrorCode>
@@ -691,7 +646,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<PutStartResult, ErrorCode>>
 WrappedMasterService::BatchPutStart(const UUID& client_id,
                                     const std::vector<std::string>& keys,
                                     const std::vector<uint64_t>& slice_lengths,
@@ -711,11 +666,31 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
+    std::vector<tl::expected<PutStartResult, ErrorCode>> results;
     results.reserve(keys.size());
     auto resolved_tenant_id = ResolveTenantIdForWrite(
         tenant_id, master_service_.IsTenantQuotaEnabled());
+
+    auto start_one = [&](size_t index, const ReplicateConfig& key_config)
+        -> tl::expected<PutStartResult, ErrorCode> {
+        auto vsegment = master_service_.TryVSegmentPutStart(
+            client_id, keys[index], resolved_tenant_id.value(),
+            slice_lengths[index], key_config);
+        if (!vsegment) {
+            return tl::make_unexpected(vsegment.error());
+        }
+        if (vsegment->has_value()) {
+            return std::move(**vsegment);
+        }
+
+        auto descriptors = master_service_.PutStart(
+            client_id, keys[index], resolved_tenant_id.value(),
+            slice_lengths[index], key_config);
+        if (!descriptors) {
+            return tl::make_unexpected(descriptors.error());
+        }
+        return PutStartResult{{}, std::move(descriptors.value())};
+    };
 
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchPutStart: keys.size()=" << keys.size()
@@ -736,13 +711,10 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = new_config.ForSingleKey(i);
-            auto result = master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config);
-            results.emplace_back(result);
+            auto result = start_one(i, key_config);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
-                for (const auto& replica : result.value()) {
+                for (const auto& replica : result->replicas) {
                     if (replica.is_memory_replica()) {
                         auto handles =
                             replica.get_memory_descriptor().buffer_descriptor;
@@ -755,13 +727,12 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                     new_config.preferred_segment = preferred_segment;
                 }
             }
+            results.emplace_back(std::move(result));
         }
     } else {
         for (size_t i = 0; i < keys.size(); ++i) {
             auto key_config = config.ForSingleKey(i);
-            results.emplace_back(master_service_.PutStart(
-                client_id, keys[i], resolved_tenant_id.value(),
-                slice_lengths[i], key_config));
+            results.emplace_back(start_one(i, key_config));
         }
     }
 
@@ -2132,7 +2103,26 @@ WrappedMasterService::InterMasterBatchGetReplicaList(
     const std::vector<std::string>& keys, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "InterMasterBatchGetReplicaList");
     timer.LogRequest("keys_count=", keys.size());
-    return master_service_.InterMasterBatchGetReplicaList(keys, tenant_id);
+    // This master is the slot owner for `keys` (peer trust), so its vsegment
+    // service can resolve the layouts. The table rides on the first successful
+    // per-key response (a batch envelope would change the wire type).
+    auto results =
+        master_service_.InterMasterBatchGetReplicaList(keys, tenant_id);
+    std::vector<std::pair<std::string, std::string>> vsegments;
+    for (const auto& result : results) {
+        if (!result) continue;
+        for (const auto& replica : result->replicas) {
+            if (!replica.is_vsegment_replica()) continue;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        }
+    }
+    if (!vsegments.empty()) {
+        auto layouts = master_service_.BuildVSegmentLayoutTable(vsegments);
+        AttachVSegmentLayoutTableToFirstSuccess(results, std::move(layouts));
+    }
+    return results;
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -2303,11 +2293,6 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetVSegmentView>(
-        &wrapped_master_service);
-    server.register_handler<
-        &mooncake::WrappedMasterService::GetPSegmentEndpoint>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::VSegmentPutStart>(
         &wrapped_master_service);

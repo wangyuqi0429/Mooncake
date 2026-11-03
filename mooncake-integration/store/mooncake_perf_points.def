@@ -24,7 +24,7 @@ PERF_KEY_DEF(GET_BATCH_INTERNAL_PREPARATION, "real_client.cpp::batch_get_buffer_
 PERF_KEY_DEF(GET_BATCH_INTERNAL_SELECT_REPLICA, "real_client.cpp::batch_get_buffer_internal", "SelectReplica")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_ALLOC_BUFFER,       "real_client.cpp::batch_get_buffer_internal", "AllocBuffer")
 PERF_KEY_DEF(GET_BATCH_INTERNAL_SSD_READ,    "real_client.cpp::batch_get_buffer_internal", "SSDRead")
-PERF_KEY_DEF(GET_BATCH_INTERNAL_MEMDISH_READ,"real_client.cpp::batch_get_buffer_internal", "MemDiskRead")
+PERF_KEY_DEF(GET_BATCH_INTERNAL_DATA_READ,   "real_client.cpp::batch_get_buffer_internal", "DataRead")
 
 // === get_into_internal steps ===
 PERF_KEY_DEF(GET_INTO_INTERNAL_QUERY,        "real_client.cpp::get_into_internal",         "Query")
@@ -38,7 +38,7 @@ PERF_KEY_DEF(GET_INTO_INTERNAL_DISK_READ,    "real_client.cpp::get_into_internal
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_QUERY,  "real_client.cpp::batch_get_into_internal",   "BatchQuery")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_SELECT_REPLICA, "real_client.cpp::batch_get_into_internal", "SelectReplica")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_ALLOC_BUFFER, "real_client.cpp::batch_get_into_internal", "AllocBuffer")
-PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_MEM_READ, "real_client.cpp::batch_get_into_internal", "MemRead")
+PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_DIRECT_READ, "real_client.cpp::batch_get_into_internal", "DirectRead")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_DISK_READ, "real_client.cpp::batch_get_into_internal", "DiskRead")
 PERF_KEY_DEF(GET_BATCH_INTO_INTERNAL_SSD_READ, "real_client.cpp::batch_get_into_internal", "SSDRead")
 
@@ -288,13 +288,25 @@ PERF_KEY_DEF(CVM_ROUTE_BACKOFF,       "master_client.cpp::InvokeRoutedWithSlotRe
 PERF_KEY_DEF(GET_SSD_LEASE_EXPIRED,   "real_client.cpp::batch_get_into_offload_object_internal", "SsdLeaseExpired")
 // PromotionEnqueue: 读命中仅 LOCAL_DISK 副本时的 promotion 异步入队（master 侧）
 PERF_KEY_DEF(GET_PROMOTION_ENQUEUE,   "master_service.cpp::TryPushPromotionQueue", "PromotionEnqueue")
-// === vsegment 观测（master RPC + client 翻译层） ===
-PERF_KEY_DEF(MASTER_RPC_GET_VSEGMENT_VIEW,     "rpc_service.cpp::GetVSegmentView",     "GetVSegmentView")
-PERF_KEY_DEF(MASTER_RPC_GET_PSEGMENT_ENDPOINT, "rpc_service.cpp::GetPSegmentEndpoint", "GetPSegmentEndpoint")
-PERF_KEY_DEF(VSEGMENT_READ_PLAN,               "client_service.cpp::TransferData",     "VSegPlan")
-PERF_KEY_DEF(VSEGMENT_VIEW_LOAD,               "client_service.cpp::TransferData",     "VSegViewLoad")
-PERF_KEY_DEF(VSEGMENT_ENDPOINT_RESOLVE,        "client_service.cpp::TransferData",     "VSegEndpointResolve")
+// === vsegment 读链路（Hard C inline-layout 路径） ===
+// LayoutBuild: Master 在原 Query RPC 内从 cache/view 构造响应 layout 表。
+// LayoutCopy:  客户端复制或合并响应 layout 表并挂入 QueryResult。
+// Plan:   layout 查找/校验、逻辑地址条带拆分和 endpoint 映射。
+// Submit: openSegment、TransferRequest 构造和 Transfer Engine 批量提交。
+// Wait:   已提交传输的完成等待；覆盖单读、range read 和 BatchGet。
+PERF_KEY_DEF(VSEGMENT_READ_LAYOUT_BUILD, "master_service.cpp::vsegment_read", "VSegLayoutBuild")
+PERF_KEY_DEF(VSEGMENT_READ_LAYOUT_COPY,  "client_service.cpp::vsegment_read", "VSegLayoutCopy")
+PERF_KEY_DEF(VSEGMENT_READ_PLAN,   "client_service.cpp::vsegment_read", "VSegPlan")
+PERF_KEY_DEF(VSEGMENT_READ_SUBMIT, "client_service.cpp::vsegment_read", "VSegSubmit")
+PERF_KEY_DEF(VSEGMENT_READ_WAIT,   "client_service.cpp::vsegment_read", "VSegWait")
 // === Query 路径下钻（GET 路径核心通信段统计） ===
 PERF_KEY_DEF(QUERY_ROUTE_SWITCH,  "master_client.cpp::Query",  "QueryRouteSwitch")
 PERF_KEY_DEF(QUERY_RPC_CALL,      "master_client.cpp::Query",  "QueryRpcCall")
 PERF_KEY_DEF(QUERY_RPC_TOTAL,     "master_client.cpp::Query",  "QueryRpcTotal")
+
+// === Replica-specific single-read points ===
+// Appended to preserve the numeric identity of all pre-existing PerfKeys.
+PERF_KEY_DEF(GET_INTERNAL_NOF_READ,       "real_client.cpp::get_buffer_internal", "NoFRead")
+PERF_KEY_DEF(GET_INTERNAL_VSEG_READ,      "real_client.cpp::get_buffer_internal", "VSegRead")
+PERF_KEY_DEF(GET_INTO_INTERNAL_NOF_READ,  "real_client.cpp::get_into_internal",   "NoFRead")
+PERF_KEY_DEF(GET_INTO_INTERNAL_VSEG_READ, "real_client.cpp::get_into_internal",   "VSegRead")

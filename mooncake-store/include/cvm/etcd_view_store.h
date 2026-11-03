@@ -74,7 +74,7 @@ class EtcdViewStore {
                                     ViewVersionId& version);
 
     // ---- Cluster ring metadata (cluster_meta) ----
-    // Persists/reads the cluster-wide RingMeta { submaster_count, G } (§15.3 /
+    // Persists/reads RingMeta { submaster_count, G, slot_count } (§15.3 /
     // §16.14.2). Masters write it once at startup (idempotent); clients read it
     // to derive the same primary ring locally.
     static ErrorCode SaveClusterMeta(const std::string& cluster_namespace,

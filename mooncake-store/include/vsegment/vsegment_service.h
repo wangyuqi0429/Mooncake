@@ -18,7 +18,7 @@ namespace mooncake::vsegment {
 
 // SubMaster-local registry. One instance owns only the Partitions currently
 // routed to that SubMaster; Partition migration removes/adds the whole manager.
-class VSegmentService final : public VSegmentViewProvider {
+class VSegmentService final {
    public:
     explicit VSegmentService(
         PartitionPhysicalQuotaSnapshot quota_snapshot,
@@ -102,7 +102,7 @@ class VSegmentService final : public VSegmentViewProvider {
 
     ErrorCode LoadView(const std::string& partition_id,
                        const std::string& vsegment_id, VSegmentView* view,
-                       std::string* detail = nullptr) override;
+                       std::string* detail = nullptr);
 
    private:
     std::shared_ptr<VSegmentManager> FindPartition(

@@ -20,12 +20,16 @@ flowchart TB
     SSDTransfer --> SSDRelease["步骤3: release_offload_buffer()<br/>通知远端释放buffer(fire-and-forget)<br/>🔑 real_client.cpp::batch_get_into_offload_object_internal/ReleaseBuffer"]
     SSDRelease --> Done["返回"]
 
-    CheckDisk -->|No| ReadType{is_memory_replica?}
+    CheckDisk -->|No| ReadType{选中的副本类型}
 
-    ReadType -->|Yes| MemRead["部分4b-Memory: client_->Get(key, filtered_qr, slices)<br/>内存副本RDMA读取<br/>🔑 real_client.cpp::get_buffer_internal/MemRead"]
-    ReadType -->|No| DiskRead["部分4b-Disk: client_->Get(key, filtered_qr, slices)<br/>磁盘副本文件I/O读取<br/>🔑 real_client.cpp::get_buffer_internal/DiskRead"]
+    ReadType -->|MEMORY| MemRead["部分4b-Memory: client_->Get(key, filtered_qr, slices)<br/>内存副本传输<br/>🔑 real_client.cpp::get_buffer_internal/MemRead"]
+    ReadType -->|NoF| NoFRead["部分4b-NoF: client_->Get(key, filtered_qr, slices)<br/>NoF副本传输<br/>🔑 real_client.cpp::get_buffer_internal/NoFRead"]
+    ReadType -->|VSEGMENT| VSegRead["部分4b-VSegment: client_->Get(key, filtered_qr, slices)<br/>按虚拟条带计划读取<br/>🔑 real_client.cpp::get_buffer_internal/VSegRead"]
+    ReadType -->|DISK| DiskRead["部分4b-Disk: client_->Get(key, filtered_qr, slices)<br/>磁盘副本文件I/O读取<br/>🔑 real_client.cpp::get_buffer_internal/DiskRead"]
 
     MemRead --> ClientGetSub["Client::Get内部子步骤<br/>"]
+    NoFRead --> ClientGetSub
+    VSegRead --> ClientGetSub
     DiskRead --> ClientGetSub
 
     ClientGetSub --> FindReplica["子步骤1: FindFirstCompleteReplica<br/>🔑 client_service.cpp::Get/FindReplica"]
@@ -47,6 +51,8 @@ flowchart TB
     style SSDTransfer fill:#fce4ec
     style SSDRelease fill:#fce4ec
     style MemRead fill:#bbdefb
+    style NoFRead fill:#b2dfdb
+    style VSegRead fill:#d1c4e9
     style DiskRead fill:#ffccbc
     style ClientGetSub fill:#e3f2fd
     style FindReplica fill:#f3e5f5
@@ -75,9 +81,9 @@ flowchart TB
     SSDRpc --> SSDTransfer["步骤2: BatchGetOffloadObject()<br/>🔑 real_client.cpp::batch_get_into_offload_object_internal/TransferData"]
     SSDTransfer --> SSDRelease["步骤3: release_offload_buffer()<br/>🔑 real_client.cpp::batch_get_into_offload_object_internal/ReleaseBuffer"]
 
-    CheckDisk -->|No| MemDiskRead["部分3b: client_->BatchGet(keys, query_results, slices)<br/>批量读取内存/磁盘副本<br/>🔑 real_client.cpp::batch_get_buffer_internal/MemDiskRead"]
+    CheckDisk -->|No| DataRead["部分3b: client_->BatchGet(keys, query_results, slices)<br/>批量读取直接传输/本地文件副本<br/>🔑 real_client.cpp::batch_get_buffer_internal/DataRead"]
 
-    MemDiskRead --> BatchGetSub["Client::BatchGet内部子步骤<br/>"]
+    DataRead --> BatchGetSub["Client::BatchGet内部子步骤<br/>"]
 
     BatchGetSub --> SubmitLoop["提交阶段 [循环]<br/>├ FindFirstCompleteReplica → client_service.cpp::BatchGet/FindReplica<br/>├ RedirectToHotCache → client_service.cpp::BatchGet/HotCache<br/>└ submit → client_service.cpp::BatchGet/Submit"]
     SubmitLoop --> WaitLoop["等待阶段 [循环]<br/>├ future.get() → client_service.cpp::BatchGet/Wait<br/>├ ReleaseHotKey → client_service.cpp::BatchGet/ReleaseCache<br/>└ ProcessSlicesAsync → client_service.cpp::BatchGet/AsyncCache"]
@@ -94,7 +100,7 @@ flowchart TB
     style SSDRpc fill:#fce4ec
     style SSDTransfer fill:#fce4ec
     style SSDRelease fill:#fce4ec
-    style MemDiskRead fill:#bbdefb
+    style DataRead fill:#bbdefb
     style BatchGetSub fill:#e3f2fd
     style SubmitLoop fill:#f3e5f5
     style WaitLoop fill:#f3e5f5
@@ -108,12 +114,12 @@ flowchart TB
 
     RangeInternal --> Metadata["resolve_ranged_read_metadata(key)<br/>查询元数据并选择最优副本"]
     Metadata --> QueryPart["部分1: client_->Query(key)<br/>向Master查询对象副本元数据<br/>🔑 real_client.cpp::get_into_internal/Query"]
-    QueryPart --> SelectPart["部分2: SelectBestReplica<br/>优先级：本地MEMORY → 远端MEMORY → LOCAL_DISK → DISK<br/>🔑 real_client.cpp::get_into_internal/SelectReplica"]
+    QueryPart --> SelectPart["部分2: SelectBestReplica<br/>按共享策略选择 MEMORY / NoF / VSEGMENT / LOCAL_DISK / DISK<br/>🔑 real_client.cpp::get_into_internal/SelectReplica"]
     SelectPart --> ExecuteRead["execute_ranged_read(key, buffer, offsets, size, metadata)<br/>根据副本类型和范围执行读取"]
 
     ExecuteRead --> FullRead{完整对象读取?}
     FullRead -->|Yes| ReplicaType{副本类型}
-    FullRead -->|No| PartialRead["范围读取<br/>MEMORY可按src_offset直接读<br/>DISK/LOCAL_DISK先读临时buffer再scatter"]
+    FullRead -->|No| PartialRead["范围读取<br/>MEMORY可按src_offset直接读<br/>DISK/LOCAL_DISK先读临时buffer再scatter<br/>NoF/VSEGMENT当前不支持部分范围读取"]
 
     ReplicaType -->|LOCAL_DISK| SSDRead["部分3a: batch_get_into_offload_object_internal<br/>远端SSD读取后写入用户buffer<br/>🔑 real_client.cpp::get_into_internal/SSDRead"]
     SSDRead --> SSDRpc["步骤1: batch_get_offload_object()<br/>RPC到远端节点从SSD读入offload buffer<br/>🔑 real_client.cpp::batch_get_into_offload_object_internal/OffloadRpc"]
@@ -125,6 +131,8 @@ flowchart TB
     DiskRead --> Scatter["scatter_host_to_maybe_device<br/>从CPU临时buffer拷贝/搬运到用户buffer"]
 
     ReplicaType -->|MEMORY| MemRead["部分3c: client_->Get(key, filtered_qr, slices)<br/>内存副本直接读入用户buffer<br/>🔑 real_client.cpp::get_into_internal/MemRead"]
+    ReplicaType -->|NoF| NoFRead["部分3d: client_->Get(key, filtered_qr, slices)<br/>NoF副本直接读入用户buffer<br/>🔑 real_client.cpp::get_into_internal/NoFRead"]
+    ReplicaType -->|VSEGMENT| VSegRead["部分3e: client_->Get(key, filtered_qr, slices)<br/>虚拟条带直接读入用户buffer<br/>🔑 real_client.cpp::get_into_internal/VSegRead"]
 
     PartialRead --> PartialType{副本类型}
     PartialType -->|LOCAL_DISK| PartialSSD["读取[0, src_offset+size)到CPU临时buffer<br/>再scatter目标范围<br/>🔑 real_client.cpp::get_into_internal/SSDRead"]
@@ -132,6 +140,8 @@ flowchart TB
     PartialType -->|MEMORY| PartialMem["client_->Get(key, query_result, slices, src_offset)<br/>从源offset直接读到用户buffer<br/>🔑 real_client.cpp::get_into_internal/MemRead"]
 
     MemRead --> ClientGetSub["Client::Get内部子步骤<br/>"]
+    NoFRead --> ClientGetSub
+    VSegRead --> ClientGetSub
     DiskRead --> ClientGetSub
     PartialMem --> ClientGetSub
     PartialDisk --> Done["返回"]
@@ -161,6 +171,8 @@ flowchart TB
     style DiskRead fill:#ffccbc
     style Scatter fill:#ffccbc
     style MemRead fill:#bbdefb
+    style NoFRead fill:#b2dfdb
+    style VSegRead fill:#d1c4e9
     style PartialRead fill:#e3f2fd
     style PartialSSD fill:#fce4ec
     style PartialDisk fill:#ffccbc
@@ -181,13 +193,13 @@ flowchart TB
     Start["store_->batch_get_into(keys, buffers, sizes)<br/>每个key写入对应用户buffer，逐项返回字节数或错误码<br/>🔑 real_client.cpp::batch_get_into/BatchGetIntoInternal"] --> Internal["batch_get_into_internal(keys, buffers, sizes)<br/>核心逻辑：批量查询→逐key分类→分路径批量读取"]
 
     Internal --> QueryPart["部分1: client_->BatchQuery(keys)<br/>批量向Master查询副本元数据<br/>🔑 real_client.cpp::batch_get_into_internal/BatchQuery"]
-    QueryPart --> LoopPart["部分2: 循环逐key处理<br/>├ SelectBestReplica → real_client.cpp::batch_get_into_internal/SelectReplica<br/>├ 校验sizes[i] >= total_size<br/>└ 按副本类型分类为MEMORY/DISK/LOCAL_DISK"]
+    QueryPart --> LoopPart["部分2: 循环逐key处理<br/>├ SelectBestReplica → real_client.cpp::batch_get_into_internal/SelectReplica<br/>├ 校验sizes[i] >= total_size<br/>└ 分类为直接传输(MEMORY/NoF/VSEGMENT)、DISK、LOCAL_DISK"]
 
-    LoopPart --> MemOps{有 MEMORY 副本?}
-    MemOps -->|Yes| MemRead["部分3a: client_->BatchGet(memory_keys, query_results, slices)<br/>批量直接写入用户buffers<br/>🔑 real_client.cpp::batch_get_into_internal/MemRead"]
-    MemOps -->|No| DiskOps
+    LoopPart --> DirectOps{有直接传输副本?}
+    DirectOps -->|Yes| DirectRead["部分3a: client_->BatchGet(direct_keys, query_results, slices)<br/>批量直接写入用户buffers<br/>🔑 real_client.cpp::batch_get_into_internal/DirectRead"]
+    DirectOps -->|No| DiskOps
 
-    MemRead --> BatchGetSub["Client::BatchGet内部子步骤<br/>"]
+    DirectRead --> BatchGetSub["Client::BatchGet内部子步骤<br/>"]
     BatchGetSub --> SubmitLoop["提交阶段 [循环]<br/>├ FindFirstCompleteReplica → client_service.cpp::BatchGet/FindReplica<br/>├ RedirectToHotCache → client_service.cpp::BatchGet/HotCache<br/>└ submit → client_service.cpp::BatchGet/Submit"]
     SubmitLoop --> WaitLoop["等待阶段 [循环]<br/>├ future.get() → client_service.cpp::BatchGet/Wait<br/>├ ReleaseHotKey → client_service.cpp::BatchGet/ReleaseCache<br/>└ ProcessSlicesAsync → client_service.cpp::BatchGet/AsyncCache"]
 
@@ -211,7 +223,7 @@ flowchart TB
     style Internal fill:#e3f2fd
     style QueryPart fill:#fff3e0
     style LoopPart fill:#fff3e0
-    style MemRead fill:#bbdefb
+    style DirectRead fill:#bbdefb
     style BatchGetSub fill:#e3f2fd
     style SubmitLoop fill:#f3e5f5
     style WaitLoop fill:#f3e5f5

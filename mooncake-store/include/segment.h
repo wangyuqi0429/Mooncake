@@ -509,6 +509,14 @@ class SegmentManager {
         return ScopedSegmentAccess(this, segment_mutex_);
     }
 
+    // Bulk read of segment runtime locations under a shared lock. Returns false
+    // if any segment is missing or has no transport endpoint. Unlike
+    // getSegmentAccess()/GetSegment(), this does not take the segment mutex
+    // exclusively.
+    bool GetSegmentLocations(const std::vector<UUID>& segment_ids,
+                             std::vector<std::string>* endpoints,
+                             std::vector<uint64_t>* bases) const;
+
     /**
      * @brief Get RAII-style access to use allocators
      * @return ScopedAllocatorAccess object that holds the lock

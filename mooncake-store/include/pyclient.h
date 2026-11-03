@@ -433,11 +433,15 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     if (query_result->IsLeaseExpired(now)) {
         return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
     }
-    return CachedQueryResultResponse(GetReplicaListResponse(
+    GetReplicaListResponse response(
         std::vector<Replica::Descriptor>(query_result->replicas.begin(),
                                          query_result->replicas.end()),
         remaining_lease_ttl_ms(*query_result, now),
-        query_result->object_checksum));
+        query_result->object_checksum);
+    if (query_result->vsegment_layouts) {
+        response.vsegment_layouts = *query_result->vsegment_layouts;
+    }
+    return CachedQueryResultResponse(std::move(response));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -446,11 +450,17 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     if (!cached_result.success) {
         return tl::make_unexpected(cached_result.error);
     }
-    return QueryResult(
+    QueryResult query(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
         cached_result.value.object_checksum);
+    if (cached_result.value.vsegment_layouts.has_value()) {
+        query.vsegment_layouts =
+            std::make_shared<const std::vector<VSegmentLayoutEntry>>(
+                *cached_result.value.vsegment_layouts);
+    }
+    return query;
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

@@ -1070,10 +1070,25 @@ MasterService::TryVSegmentPutStart(
     it->second.reserved_quota_charge_bytes = quota_charge;
     RegisterGroupMember(tenant_state, *normalized, key, group_id);
     tenant_state.processing_keys.insert(key);
-    return std::optional<PutStartResult>(
-        PutStartResult{operation_ids.size() == 1 ? operation_ids.front()
-                                                : std::string{},
-                       std::move(descriptors)});
+    PutStartResult result{
+        operation_ids.size() == 1 ? operation_ids.front() : std::string{},
+        std::move(descriptors)};
+    {
+        std::vector<std::pair<std::string, std::string>> vsegments;
+        for (const auto& replica : result.replicas) {
+            if (!replica.is_vsegment_replica()) continue;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        }
+        if (!vsegments.empty()) {
+            auto layouts = BuildVSegmentLayoutTable(vsegments);
+            if (!layouts.empty()) {
+                result.vsegment_layouts = std::move(layouts);
+            }
+        }
+    }
+    return std::optional<PutStartResult>(std::move(result));
 }
 
 void MasterService::KickSlotHeartbeat() {
@@ -1122,7 +1137,7 @@ ErrorCode LoadEffectivePartitionRoute(
             cluster_id, partition_id, route, version);
     }
     if (parsed != partition_id.size() ||
-        numeric >= cvm::kSlotCount) {
+        numeric >= cvm::SlotCount()) {
         return cvm::EtcdViewStore::LoadPartitionRoute(
             cluster_id, partition_id, route, version);
     }
@@ -1585,7 +1600,7 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
                 partition_id.find_first_not_of("0123456789") ==
                     std::string::npos &&
                 partition_id.size() <= 5 &&
-                std::stoul(partition_id) < cvm::kSlotCount;
+                std::stoul(partition_id) < cvm::SlotCount();
             if (numeric_slot) {
                 // The release hook stages state and ACK detaches it. Removing
                 // here would lose the manager before the release hook can
@@ -2181,7 +2196,7 @@ tl::expected<SlotMetadataExport, ErrorCode> MasterService::BuildSlotMetadataExpo
 tl::expected<std::vector<SlotMetadataExport>, ErrorCode>
 MasterService::BuildSlotMetadataExportBatch(
     uint16_t first_slot, uint16_t last_slot, bool require_not_owned) {
-    if (first_slot > last_slot || last_slot >= cvm::kSlotCount)
+    if (first_slot > last_slot || last_slot >= cvm::SlotCount())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     std::shared_ptr<vsegment::VSegmentService> service;
     {
@@ -2588,7 +2603,7 @@ ErrorCode MasterService::ImportSlotMetadata(
 
 ErrorCode MasterService::OnSlotRangeAcquired(
     uint16_t first_slot, uint16_t last_slot, std::vector<ErrorCode>& results) {
-    if (first_slot > last_slot || last_slot >= cvm::kSlotCount)
+    if (first_slot > last_slot || last_slot >= cvm::SlotCount())
         return ErrorCode::INVALID_PARAMS;
     const size_t count = static_cast<size_t>(last_slot) - first_slot + 1;
     results.assign(count, ErrorCode::SLOT_MIGRATING);
@@ -3945,6 +3960,10 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
                 last_logged_owned_count_ = new_count;
             }
             cvm_last_resolved_owned_slots_ = owned;
+            // ★ ring_slots 视图的 etcd 版本：vsegment 的
+            // LoadEffectivePartitionRoute 要求 ring_revision > 0，
+            // 否则所有 Partition 都会被判成 INVALID_VERSION。
+            cvm_ring_revision_ = view.revision();
             return owned;
         }
         // 缓存有记录但本机非任何 rank 的 primary：本机 standby，返回空段。
@@ -3967,6 +3986,7 @@ std::vector<uint16_t> MasterService::ResolveOwnedSlotsForCvm() {
                 last_logged_owned_count_ = 0;
             }
             cvm_last_resolved_owned_slots_.clear();
+            cvm_ring_revision_ = view.revision();
         }
         return {};
     }
@@ -4153,15 +4173,15 @@ std::optional<std::string> MasterService::ResolveSlotOwnerMasterId(
 
 void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
     std::unique_lock<std::shared_mutex> lock(owned_slots_mutex_);
-    expected_owned_.assign(cvm::kSlotCount, false);
+    expected_owned_.assign(cvm::SlotCount(), false);
     for (uint16_t slot : slots) {
-        if (slot < cvm::kSlotCount) {
+        if (slot < cvm::SlotCount()) {
             expected_owned_[slot] = true;
         }
     }
     // Retained slots remain ready. Newly acquired slots are not serviceable
     // until both object metadata and their vsegment state have been installed.
-    ready_owned_.resize(cvm::kSlotCount, false);
+    ready_owned_.resize(cvm::SlotCount(), false);
     uint32_t ready_count = 0;
     for (size_t slot = 0; slot < ready_owned_.size(); ++slot) {
         ready_owned_[slot] = ready_owned_[slot] && expected_owned_[slot];
@@ -4177,7 +4197,7 @@ void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
     // 记录本机当前负责的 slot 规模；心跳周期内重复不变则静默。
     if (!owned_slot_count_logged_ || slots.size() != last_logged_owned_count_) {
         LOG(INFO) << "Owned slots updated (consistent-hash ring): count="
-                  << slots.size() << "/" << cvm::kSlotCount
+                  << slots.size() << "/" << cvm::SlotCount()
                   << (owned_slot_count_logged_ ? " (changed)" : "");
         owned_slot_count_logged_ = true;
         last_logged_owned_count_ = slots.size();
@@ -4187,9 +4207,9 @@ void MasterService::UpdateExpectedSlots(const std::vector<uint16_t>& slots) {
 
 void MasterService::MarkSlotsReady(const std::vector<uint16_t>& slots) {
     std::unique_lock<std::shared_mutex> lock(owned_slots_mutex_);
-    if (ready_owned_.size() != cvm::kSlotCount) {
+    if (ready_owned_.size() != cvm::SlotCount()) {
         ready_owned_.assign(ready_owned_.size(), false);
-        ready_owned_.resize(cvm::kSlotCount, false);
+        ready_owned_.resize(cvm::SlotCount(), false);
     }
     for (uint16_t slot : slots) {
         if (slot < ready_owned_.size() && slot < expected_owned_.size() &&
@@ -4325,7 +4345,7 @@ ErrorCode MasterService::CheckVSegmentServiceability(
     if (!partition_id.empty() && partition_id.size() <= 5 &&
         partition_id.find_first_not_of("0123456789") == std::string::npos) {
         const auto slot = std::stoul(partition_id);
-        if (slot < cvm::kSlotCount)
+        if (slot < cvm::SlotCount())
             return CheckSlotServiceability(static_cast<uint16_t>(slot));
     }
     return ErrorCode::OK;  // Named Partitions use explicit PartitionRoute.
@@ -4601,6 +4621,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     // 旧代清理各段耗时。
     const auto mount_t0 = std::chrono::steady_clock::now();
     ErrorCode mount_result = ErrorCode::OK;
+    InvalidateVSegmentLayoutCache();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     {
         ScopedSegmentAccess segment_access =
@@ -4789,6 +4810,7 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    InvalidateVSegmentLayoutCache();
     std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -6255,6 +6277,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
+    InvalidateVSegmentLayoutCache();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
     {
@@ -6309,6 +6332,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 auto MasterService::GracefulUnmountSegment(
     const UUID& segment_id, const UUID& client_id,
     uint64_t grace_period_ms) -> tl::expected<void, ErrorCode> {
+    InvalidateVSegmentLayoutCache();
     std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
@@ -6695,7 +6719,7 @@ void MasterService::RestoreFromStandbySnapshot(
         if (kv_partition_enabled) {
             const std::vector<uint16_t> owned_slots = ResolveOwnedSlotsForCvm();
             if (!owned_slots.empty()) {
-                owned_slot_lookup.assign(cvm::kSlotCount, false);
+                owned_slot_lookup.assign(cvm::SlotCount(), false);
                 for (uint16_t slot : owned_slots) {
                     owned_slot_lookup[slot] = true;
                 }
@@ -7279,34 +7303,77 @@ auto MasterService::GetReplicaList(const std::string& key,
     return GetReplicaListLocal(object_id);
 }
 
-tl::expected<vsegment::VSegmentView, ErrorCode>
-MasterService::GetVSegmentView(const std::string& partition_id,
-                               const std::string& vsegment_id) {
-    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    const auto ready = CheckVSegmentServiceability(partition_id);
-    if (ready != ErrorCode::OK) return tl::make_unexpected(ready);
-    if (!vsegment_service_)
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    vsegment::VSegmentView view;
-    auto result =
-        vsegment_service_->LoadView(partition_id, vsegment_id, &view);
-    if (result != ErrorCode::OK) return tl::make_unexpected(result);
-    return view;
+void MasterService::InvalidateVSegmentLayoutCache() {
+    std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
+    vsegment_layout_cache_.clear();
 }
 
-tl::expected<vsegment::PSegmentLocation, ErrorCode>
-MasterService::GetPSegmentEndpoint(const std::string& segment_id) {
-    UUID id;
-    if (!StringToUuid(segment_id, id))
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    ScopedSegmentAccess access = segment_manager_.getSegmentAccess();
-    Segment segment;
-    if (!access.GetSegment(id, segment))
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    if (segment.te_endpoint.empty())
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    return vsegment::PSegmentLocation{
-        segment.te_endpoint, static_cast<uint64_t>(segment.base)};
+std::vector<VSegmentLayoutEntry> MasterService::BuildVSegmentLayoutTable(
+    const std::vector<std::pair<std::string, std::string>>& vsegments) {
+    std::vector<VSegmentLayoutEntry> result;
+
+    // 锁序：本函数在 GetReplicaListLocal/ForAdmin 的末尾被调用，此时
+    // snapshot_mutex_（共享）仍被持有；而 vsegment 首建线程持有
+    // vsegment_service_init_mutex_ 期间会做 reconcile。若这里再取 init
+    // mutex 就构成 S→I 与 I→S 的反向锁序。vsegment_service_ 是一次性发布、
+    // 永不重置的 shared_ptr（与心跳快路径的无锁空判同前提），因此直接拷贝，
+    // 不取 init mutex。
+    std::shared_ptr<vsegment::VSegmentService> service = vsegment_service_;
+    if (!service) return result;
+
+    std::unordered_set<std::string> seen;
+    for (const auto& [partition_id, vsegment_id] : vsegments) {
+        if (!seen.insert(vsegment_id).second) continue;
+        {
+            std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
+            auto found = vsegment_layout_cache_.find(vsegment_id);
+            if (found != vsegment_layout_cache_.end()) {
+                result.push_back(found->second);
+                continue;
+            }
+        }
+        vsegment::VSegmentView view;
+        auto rc = service->LoadView(partition_id, vsegment_id, &view);
+        if (rc != ErrorCode::OK) continue;
+        std::vector<UUID> member_ids;
+        member_ids.reserve(view.members.size());
+        bool ids_ok = true;
+        for (const auto& member : view.members) {
+            UUID id;
+            if (!StringToUuid(member.segment_id, id)) {
+                ids_ok = false;
+                break;
+            }
+            member_ids.push_back(id);
+        }
+        if (!ids_ok) continue;
+        std::vector<std::string> endpoints;
+        std::vector<uint64_t> bases;
+        if (!segment_manager_.GetSegmentLocations(member_ids, &endpoints,
+                                                  &bases)) {
+            continue;
+        }
+        VSegmentLayoutEntry entry;
+        entry.vsegment_id = view.vsegment_id;
+        entry.partition_id = view.partition_id;
+        entry.stripe_size = view.stripe_size;
+        entry.logical_capacity = view.logical_capacity;
+        entry.mapping_algorithm =
+            static_cast<uint32_t>(view.mapping_algorithm);
+        entry.checksum = view.checksum;
+        entry.members.reserve(view.members.size());
+        for (size_t i = 0; i < view.members.size(); ++i) {
+            entry.members.push_back(
+                {view.members[i].segment_id, view.members[i].base_offset,
+                 view.members[i].length, endpoints[i], bases[i]});
+        }
+        {
+            std::lock_guard<std::mutex> lock(vsegment_layout_cache_mutex_);
+            vsegment_layout_cache_[vsegment_id] = entry;
+        }
+        result.push_back(std::move(entry));
+    }
+    return result;
 }
 
 vsegment::VSegmentPutStartResult MasterService::VSegmentPutStart(
@@ -7516,7 +7583,30 @@ auto MasterService::GetReplicaListLocal(const ObjectIdentity& object_id)
     (void)record_io_access;
     (void)io_access;
     pt_total.End(0);
+    EnrichVSegmentLayouts(&resp);
     return resp;
+}
+
+void MasterService::EnrichVSegmentLayouts(GetReplicaListResponse* response) {
+    if (response == nullptr) return;
+    // Enrich only when the response contains vsegment replicas; ordinary
+    // replicas already carry their own endpoint/base.
+    std::vector<std::pair<std::string, std::string>> vsegments;
+    for (const auto& replica : response->replicas) {
+        if (!replica.is_vsegment_replica()) continue;
+        const auto& descriptor = replica.get_vsegment_descriptor();
+        vsegments.emplace_back(descriptor.partition_id,
+                               descriptor.vsegment_id);
+    }
+    if (vsegments.empty()) return;
+    SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_BUILD,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto layouts = BuildVSegmentLayoutTable(vsegments);
+    pt.End(layouts.empty() ? -1 : 0);
+    if (!layouts.empty()) {
+        response->vsegment_layouts = std::move(layouts);
+    }
 }
 
 auto MasterService::GetReplicaListForAdmin(const std::string& key,
@@ -7545,19 +7635,19 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_,
-                                  metadata.object_checksum);
+    GetReplicaListResponse response(std::move(replica_list),
+                                    default_kv_lease_ttl_,
+                                    metadata.object_checksum);
+    EnrichVSegmentLayouts(&response);
+    return response;
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                                    const TenantId& tenant_id) {
-    using GetResult = tl::expected<GetReplicaListResponse, ErrorCode>;
-
     assert(tenant_id.IsValid());
 
-    std::vector<GetResult> results(
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results(
         keys.size(), tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND));
     if (keys.empty()) {
         return results;
@@ -7609,6 +7699,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
+    std::vector<VSegmentLayoutEntry> layouts;
 #ifdef STORE_USE_ETCD
     for (const auto& [owner, indices] : forward_groups) {
         std::vector<std::string> group_keys;
@@ -7618,12 +7709,37 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
         auto group_result = inter_master_rpc_->BatchGetReplicaList(
             owner, group_keys, normalized_tenant.value());
+        // Collect the owner-built table before moving the per-key results out.
+        MergeVSegmentLayoutTablesFromResults(group_result, layouts);
         for (size_t j = 0; j < indices.size() && j < group_result.size(); ++j) {
             results[indices[j]] = std::move(group_result[j]);
         }
     }
 #endif
 
+    // 本地组：视图只由本机 vsegment service 持有，故本机解析；转发组的表
+    // 已由 owner 在转发响应里带回（上面的 layouts）。两端按 vsegment_id 去重。
+    std::vector<std::pair<std::string, std::string>> local_vsegments;
+    for (size_t idx : local_indices) {
+        const auto& result = results[idx];
+        if (!result) continue;
+        for (const auto& replica : result->replicas) {
+            if (!replica.is_vsegment_replica()) continue;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            local_vsegments.emplace_back(descriptor.partition_id,
+                                         descriptor.vsegment_id);
+        }
+    }
+    if (!local_vsegments.empty()) {
+        SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_BUILD,
+                             SpDiag::PerfLevel::MODULE);
+        pt.Start();
+        auto local_layouts = BuildVSegmentLayoutTable(local_vsegments);
+        pt.End(local_layouts.empty() ? -1 : 0);
+        MergeVSegmentLayoutTable(layouts, local_layouts);
+    }
+    // 批量级别没有独立 envelope（类型码不允许），去重表挂到第一个成功项。
+    AttachVSegmentLayoutTableToFirstSuccess(results, std::move(layouts));
     return results;
 }
 
@@ -9727,6 +9843,25 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         replica_ids.push_back(replica.id());
         response.targets.emplace_back(replica.get_descriptor());
     }
+    // Hard C: the client reads the copy source with the table carried here;
+    // it has no GetVSegmentView/GetPSegmentEndpoint fallback.
+    {
+        std::vector<std::pair<std::string, std::string>> vsegments;
+        auto collect = [&vsegments](const Replica::Descriptor& replica) {
+            if (!replica.is_vsegment_replica()) return;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        };
+        collect(response.source);
+        for (const auto& target : response.targets) collect(target);
+        if (!vsegments.empty()) {
+            auto layouts = BuildVSegmentLayoutTable(vsegments);
+            if (!layouts.empty()) {
+                response.vsegment_layouts = std::move(layouts);
+            }
+        }
+    }
 
     // Create replication task for tracking.
     auto& tenant_state = accessor.GetTenantState();
@@ -10053,6 +10188,25 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         response.target = replicas[0].get_descriptor();
     } else {
         response.target = std::nullopt;
+    }
+    // Hard C: the client transfers the move source with the table carried
+    // here; it has no GetVSegmentView/GetPSegmentEndpoint fallback.
+    {
+        std::vector<std::pair<std::string, std::string>> vsegments;
+        auto collect = [&vsegments](const Replica::Descriptor& replica) {
+            if (!replica.is_vsegment_replica()) return;
+            const auto& descriptor = replica.get_vsegment_descriptor();
+            vsegments.emplace_back(descriptor.partition_id,
+                                   descriptor.vsegment_id);
+        };
+        collect(response.source);
+        if (response.target.has_value()) collect(*response.target);
+        if (!vsegments.empty()) {
+            auto layouts = BuildVSegmentLayoutTable(vsegments);
+            if (!layouts.empty()) {
+                response.vsegment_layouts = std::move(layouts);
+            }
+        }
     }
 
     // Create replication task for tracking.

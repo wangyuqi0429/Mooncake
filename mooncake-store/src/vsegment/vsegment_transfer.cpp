@@ -1,159 +1,115 @@
 #include "vsegment/vsegment_transfer.h"
 
+#include <algorithm>
 #include <limits>
+#include <string>
 #include <unordered_map>
 
 namespace mooncake::vsegment {
 
-namespace {
-
-std::string ViewCacheKey(const std::string& partition_id,
-                         const std::string& vsegment_id) {
-    return partition_id + '\0' + vsegment_id;
-}
-
-bool SameImmutableView(const VSegmentView& left,
-                       const VSegmentView& right) {
-    if (left.vsegment_id != right.vsegment_id ||
-        left.partition_id != right.partition_id ||
-        left.mapping_algorithm != right.mapping_algorithm ||
-        left.stripe_size != right.stripe_size ||
-        left.logical_capacity != right.logical_capacity ||
-        left.members.size() != right.members.size()) {
-        return false;
-    }
-    for (size_t index = 0; index < left.members.size(); ++index) {
-        const auto& a = left.members[index];
-        const auto& b = right.members[index];
-        if (a.segment_id != b.segment_id || a.base_offset != b.base_offset ||
-            a.length != b.length) {
-            return false;
-        }
-    }
-    return true;
-}
-
-}  // namespace
-
-bool VSegmentViewCache::Find(const std::string& partition_id,
-                             const std::string& vsegment_id,
-                             VSegmentView* view) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto found = views_.find(ViewCacheKey(partition_id, vsegment_id));
-    if (found == views_.end()) return false;
-    if (view) *view = found->second;
-    return true;
-}
-
-ErrorCode VSegmentViewCache::Insert(const VSegmentView& view,
-                                    std::string* detail) {
-    auto validation = ValidateViewStructure(view, detail);
-    if (validation != ErrorCode::OK) return validation;
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto key = ViewCacheKey(view.partition_id, view.vsegment_id);
-    auto found = views_.find(key);
-    if (found != views_.end()) {
-        if (!SameImmutableView(found->second, view)) {
-            if (detail) {
-                *detail = "immutable view identity has another layout";
-            }
-            return ErrorCode::INVALID_VERSION;
-        }
-        return ErrorCode::OK;
-    }
-    while (views_.size() >= max_entries_ && !insertion_order_.empty()) {
-        const auto oldest = std::move(insertion_order_.front());
-        insertion_order_.pop_front();
-        views_.erase(oldest);
-    }
-    views_.emplace(key, view);
-    insertion_order_.push_back(key);
-    return ErrorCode::OK;
-}
-
-void VSegmentViewCache::Erase(const std::string& partition_id,
-                              const std::string& vsegment_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto key = ViewCacheKey(partition_id, vsegment_id);
-    views_.erase(key);
-    insertion_order_.erase(
-        std::remove(insertion_order_.begin(), insertion_order_.end(), key),
-        insertion_order_.end());
-}
-
-size_t VSegmentViewCache::Size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return views_.size();
-}
-
 VSegmentTransferPlan VSegmentTransferPlanner::Plan(
     const VSegmentDescriptor& replica,
-    const std::vector<ClientSlice>& slices) {
+    const std::vector<ClientSlice>& slices,
+    const std::vector<VSegmentLayoutEntry>* layouts) const {
     VSegmentTransferPlan plan;
-    if (!provider_ || !endpoint_resolver_ || !cache_ ||
-        replica.partition_id.empty() || replica.vsegment_id.empty() ||
+    if (replica.partition_id.empty() || replica.vsegment_id.empty() ||
         replica.length == 0) {
         plan.error = ErrorCode::INVALID_PARAMS;
         plan.detail = "invalid vsegment transfer planner input";
         return plan;
     }
-    VSegmentView view;
-    if (!cache_->Find(replica.partition_id, replica.vsegment_id, &view)) {
-        auto result = provider_->LoadView(replica.partition_id,
-                                          replica.vsegment_id, &view,
-                                          &plan.detail);
-        if (result != ErrorCode::OK) {
-            plan.error = result;
-            return plan;
-        }
-        result = cache_->Insert(view, &plan.detail);
-        if (result != ErrorCode::OK) {
-            plan.error = result;
-            return plan;
-        }
-    }
-    if (view.partition_id != replica.partition_id) {
-        plan.error = ErrorCode::INVALID_VERSION;
-        plan.detail = "cached view belongs to another Partition";
+    if (layouts == nullptr) {
+        // Hard C: no table, no transfer. The caller must pass the table that
+        // came with the descriptor response.
+        plan.error = ErrorCode::SEGMENT_NOT_FOUND;
+        plan.detail = "inline layout table is required but absent";
         return plan;
     }
+
+    auto it = std::find_if(
+        layouts->begin(), layouts->end(), [&](const VSegmentLayoutEntry& entry) {
+            return entry.vsegment_id == replica.vsegment_id;
+        });
+    if (it == layouts->end()) {
+        plan.error = ErrorCode::SEGMENT_NOT_FOUND;
+        plan.detail = "inline layout table has no entry for " +
+                      replica.vsegment_id;
+        return plan;
+    }
+    if (it->partition_id != replica.partition_id) {
+        plan.error = ErrorCode::INVALID_VERSION;
+        plan.detail = "inline layout entry belongs to another Partition";
+        return plan;
+    }
+
+    VSegmentView view;
+    view.vsegment_id = it->vsegment_id;
+    view.partition_id = it->partition_id;
+    view.mapping_algorithm =
+        static_cast<MappingAlgorithm>(it->mapping_algorithm);
+    view.stripe_size = it->stripe_size;
+    view.logical_capacity = it->logical_capacity;
+    view.checksum = it->checksum;
+    view.members.reserve(it->members.size());
+    std::unordered_map<std::string, std::pair<std::string, uint64_t>>
+        member_locations;
+    for (const auto& member : it->members) {
+        view.members.push_back(PSegmentExtent{member.segment_id,
+                                              member.base_offset,
+                                              member.length});
+        if (member.endpoint.empty()) {
+            // Unmounted segment (e.g. standby recovery): hard C has no
+            // endpoint RPC to fall back to.
+            plan.error = ErrorCode::SEGMENT_NOT_FOUND;
+            plan.detail = "inline layout member has no endpoint: " +
+                          member.segment_id;
+            return plan;
+        }
+        member_locations.emplace(member.segment_id,
+                                 std::make_pair(member.endpoint,
+                                                member.base_address));
+    }
+    std::string validation_detail;
+    if (ValidateViewStructure(view, &validation_detail) != ErrorCode::OK) {
+        plan.error = ErrorCode::CHECKSUM_MISMATCH;
+        plan.detail = "inline layout view is invalid: " + validation_detail;
+        return plan;
+    }
+
     auto resolved = ResolveTransfer(view, replica.logical_offset,
                                     replica.length, slices);
     if (!resolved) return {resolved.error, {}, std::move(resolved.detail)};
-    // Resolve each distinct psegment only once per Plan. The sub-request count
-    // grows with (length / stripe_size) while the number of distinct segments
-    // is bounded by member_count, so with a small stripe this loop used to
-    // issue dozens of identical GetPSegmentEndpoint RPCs for the same three
-    // answers (e.g. 128 calls for a 512 KiB object with member_count = 3).
-    // The cache is local to this call: no lifetime or invalidation concerns.
-    std::unordered_map<std::string, PSegmentLocation> endpoints;
+
+    // Resolve each distinct psegment only once per Plan: the sub-request count
+    // grows with (length / stripe_size) while distinct segments are bounded by
+    // member_count.
+    std::unordered_map<std::string, std::pair<std::string, uint64_t>>
+        endpoints;
     for (auto& request : resolved.requests) {
         auto [entry, inserted] = endpoints.try_emplace(request.segment_id);
         if (inserted) {
-            auto result = endpoint_resolver_->ResolveLocation(
-                request.segment_id, &entry->second);
-            if (result != ErrorCode::OK || entry->second.endpoint.empty()) {
-                plan.error = result == ErrorCode::OK
-                                 ? ErrorCode::SEGMENT_NOT_FOUND
-                                 : result;
+            auto found = member_locations.find(request.segment_id);
+            if (found == member_locations.end()) {
+                plan.error = ErrorCode::SEGMENT_NOT_FOUND;
                 plan.detail =
-                    "cannot resolve endpoint for " + request.segment_id;
+                    "inline layout missing endpoint for " + request.segment_id;
                 plan.requests.clear();
                 return plan;
             }
+            entry->second = found->second;
         }
-        const PSegmentLocation& location = entry->second;
+        const auto& [endpoint, base_address] = entry->second;
         if (request.physical_offset >
-            std::numeric_limits<uint64_t>::max() - location.base_address) {
+            std::numeric_limits<uint64_t>::max() - base_address) {
             plan.error = ErrorCode::INVALID_PARAMS;
             plan.detail = "psegment target address overflows";
             plan.requests.clear();
             return plan;
         }
-        request.physical_offset += location.base_address;
+        request.physical_offset += base_address;
         // NOTE: endpoint is shared by every sub-request of this segment, so it
         // must be copied rather than moved.
-        plan.requests.push_back({std::move(request), location.endpoint});
+        plan.requests.push_back({std::move(request), endpoint});
     }
     return plan;
 }

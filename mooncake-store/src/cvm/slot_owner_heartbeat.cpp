@@ -21,8 +21,8 @@ std::vector<uint16_t> ResolveOwnedSlots(const SlotOwnerHeartbeat::Config& cfg) {
         return cfg.owned_slots;
     }
     std::vector<uint16_t> slots;
-    slots.reserve(kSlotCount);
-    for (uint16_t slot = 0; slot < kSlotCount; ++slot) {
+    slots.reserve(SlotCount());
+    for (uint16_t slot = 0; slot < SlotCount(); ++slot) {
         slots.push_back(slot);
     }
     return slots;

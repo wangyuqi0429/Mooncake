@@ -243,7 +243,10 @@ class MasterServiceHATest : public ::testing::Test {
         service.cvm_last_primary_ids_ = {service.master_id()};
         service.cvm_alive_master_ids_ = {service.master_id()};
         service.cvm_ring_revision_ = 10;
-        return service.ImportSlotMetadata(slot);
+        // No prefetched export and no shared commit batch: derive the previous
+        // owner and pull the export over inter-master RPC (the old one-arg
+        // call predates the prefetch/range parameters).
+        return service.ImportSlotMetadata(slot, nullptr, nullptr);
     }
 
     class AcceptVSegmentCommitter : public vsegment::VSegmentStateCommitter {
@@ -668,9 +671,6 @@ TEST_F(MasterServiceHATest, GainedSlotsWaitForMetadataAndRemainPendingOnRetry) {
 TEST_F(MasterServiceHATest, VSegmentRpcRejectsUnreadyAndReleasedPartitions) {
     MasterService service(MasterServiceConfig{});
     ExpectSlots(service, {7});
-    auto view = service.GetVSegmentView("7", "vs-7");
-    ASSERT_FALSE(view);
-    EXPECT_EQ(view.error(), ErrorCode::SLOT_MIGRATING);
     auto start = service.VSegmentPutStart("7", 1, "put", 64, "default");
     EXPECT_EQ(start.error, ErrorCode::SLOT_MIGRATING);
     EXPECT_EQ(service.VSegmentPutRevoke("7", "vs-7", 1, "put"),

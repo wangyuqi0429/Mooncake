@@ -198,6 +198,16 @@ ErrorCode CvmController::Start() {
         return ErrorCode::OK;
     }
 
+    const uint32_t effective_group_count =
+        std::max<uint32_t>(1, config_.submaster_count);
+    if (effective_group_count > SlotCount()) {
+        LOG(ERROR) << "CvmController::Start invalid partition config: "
+                   << "submaster_count=" << config_.submaster_count
+                   << ", slot_count=" << SlotCount()
+                   << ". slot_count must be at least submaster_count.";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     LOG(INFO) << "CvmController::Start begin: cluster_namespace="
               << config_.cluster_namespace << ", master_id="
               << config_.master_id << ", address=" << config_.address
@@ -206,6 +216,7 @@ ErrorCode CvmController::Start() {
               << config_.registration_lease_ttl_sec << ", http_host="
               << config_.http_host << ", http_port=" << config_.http_port
               << ", submaster_count=" << config_.submaster_count
+              << ", slot_count=" << SlotCount()
               << ", sync_interval_ms=" << config_.sync_interval.count();
 
     // NOTE: the etcd client is a process-global singleton (EtcdHelper); the
@@ -258,6 +269,7 @@ ErrorCode CvmController::Start() {
     // submaster_count，也不能在未知旧 G 的情况下盲写覆盖。
     RingMeta ring_meta;
     ring_meta.submaster_count = config_.submaster_count;
+    ring_meta.slot_count = SlotCount();
     bool ring_meta_valid = true;
     {
         RingMeta existing;
@@ -265,6 +277,25 @@ ErrorCode CvmController::Start() {
         const ErrorCode meta_err = EtcdViewStore::LoadClusterMeta(
             config_.cluster_namespace, existing, meta_version);
         if (meta_err == ErrorCode::OK) {
+            if (existing.slot_count != SlotCount()) {
+                LOG(ERROR)
+                    << "CvmController::Start slot count mismatch: cluster="
+                    << existing.slot_count << ", local=" << SlotCount()
+                    << ", env=" << kSlotCountEnv
+                    << ". Use the same value on every master and client; "
+                       "changing it requires a fresh cluster namespace.";
+                (void)EtcdHelper::RevokeLease(lease_id_);
+                return ErrorCode::INVALID_PARAMS;
+            }
+            if (std::max<uint32_t>(1, existing.slot_group_count) >
+                SlotCount()) {
+                LOG(ERROR) << "CvmController::Start invalid cluster metadata: "
+                           << "slot_group_count="
+                           << existing.slot_group_count
+                           << ", slot_count=" << SlotCount();
+                (void)EtcdHelper::RevokeLease(lease_id_);
+                return ErrorCode::INVALID_PARAMS;
+            }
             ring_meta.slot_group_count = existing.slot_group_count;
         } else if (meta_err == ErrorCode::ETCD_KEY_NOT_EXIST) {
             // 新集群首启：meta 尚未创建，正常写入（G 默认 0，随后由
@@ -291,7 +322,8 @@ ErrorCode CvmController::Start() {
                      << " (clients may fall back to stale ring until retried)";
     } else {
         LOG(INFO) << "CvmController::Start SaveClusterMeta ok: submaster_count="
-                  << config_.submaster_count;
+                  << config_.submaster_count
+                  << ", slot_count=" << ring_meta.slot_count;
     }
 
     masters_watch_state_ = std::make_unique<WatchState>();
@@ -550,9 +582,23 @@ void CvmController::RefreshRingSlotsCache() {
         warn_stale_if_seen();
         return;
     }
+    if (meta.slot_count != SlotCount()) {
+        LOG(ERROR) << "CvmController ring metadata slot count mismatch: cluster="
+                   << meta.slot_count << ", local=" << SlotCount()
+                   << ", keeping the previous routing view";
+        warn_stale_if_seen();
+        return;
+    }
     uint32_t group_count = meta.slot_group_count;
     if (group_count == 0) {
         group_count = 1;  // 防御：G=0 非法，按退化单主处理
+    }
+    if (group_count > SlotCount()) {
+        LOG(ERROR) << "CvmController invalid ring metadata: groups="
+                   << group_count << ", slot_count=" << SlotCount()
+                   << ", keeping the previous routing view";
+        warn_stale_if_seen();
+        return;
     }
 
     std::vector<RingSlotAssign> assigns;
@@ -711,7 +757,8 @@ RingSlotsView CvmController::BuildRingSlotsView() {
         snapshot.push_back(assign);  // map 按序遍历 = rank 升序
     }
     // assigns 与 G 同锁拷入快照，消费方不会观测到两者错配。
-    return RingSlotsView(std::move(snapshot), ring_slot_group_count_);
+    return RingSlotsView(std::move(snapshot), ring_slot_group_count_,
+                         static_cast<uint64_t>(ring_slots_revision_));
 }
 
 void CvmController::KeepaliveLoop() {
@@ -947,10 +994,10 @@ std::vector<MasterRegistration> CvmController::GetBindingSources() {
     }
     const size_t standby_rank = my_index - primary_count;
 
-    // 本 standby 负责的 slot 区间 [start, end)，与其它 standby 均分 16384。
-    const uint16_t start = static_cast<uint16_t>(standby_rank * kSlotCount /
+    // 本 standby 负责的 slot 区间 [start, end)，与其它 standby 均分。
+    const uint16_t start = static_cast<uint16_t>(standby_rank * SlotCount() /
                                                  standby_count);
-    const uint16_t end = static_cast<uint16_t>((standby_rank + 1) * kSlotCount /
+    const uint16_t end = static_cast<uint16_t>((standby_rank + 1) * SlotCount() /
                                                standby_count);
 
     // 本地一致性哈希环：primary_ids = 排序去重后的前 submaster_count 个成员，
@@ -1267,7 +1314,7 @@ bool CvmController::TryPromoteDeadPrimaryRanks(
 bool CvmController::TryBootstrapRingSlots() {
     // 新集群冷启动 bootstrap（§16.15.3 关键段）：本机是唯一存活成员 →
     // 创建全 G 个 rank——rank0 原生持有，rank1..G-1 由本机兼管
-    // （primary_id 相同，§16.8.1 隐含判定），保证 16384 slot 自始有
+    // （primary_id 相同，§16.8.1 隐含判定），保证全部 slot 自始有
     // owner。G = submaster_count（部署常量，§16.8 前提）随 cluster_meta
     // 一并定型，此后恒不变（冷操作才能改）。
     const uint32_t group_count =
@@ -1276,6 +1323,7 @@ bool CvmController::TryBootstrapRingSlots() {
     RingMeta meta;
     meta.submaster_count = config_.submaster_count;
     meta.slot_group_count = group_count;
+    meta.slot_count = SlotCount();
     const ErrorCode meta_err = EtcdViewStore::SaveClusterMeta(
         config_.cluster_namespace, meta);
     if (meta_err != ErrorCode::OK) {
