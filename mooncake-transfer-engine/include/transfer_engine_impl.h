@@ -274,6 +274,11 @@ class TransferEngineImpl {
 
     int probePeerAliveByID(SegmentID target_id);
 
+    Status getSliceTimings(BatchID batch_id, size_t task_id,
+                          std::vector<Transport::SliceTiming>& timings) {
+        return multi_transports_->getSliceTimings(batch_id, task_id, timings);
+    }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus& status) {
         Status result =
