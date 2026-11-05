@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -276,6 +277,9 @@ class MasterServiceSupervisorConfig {
     uint64_t vsegment_auto_plan_stripe_size = 0;
     uint64_t vsegment_auto_plan_member_extent_size = 0;
     double vsegment_auto_plan_reserved_ratio = 0.0;
+    std::string vsegment_auto_plan_required_medium;
+    uint64_t vsegment_auto_plan_io_alignment = 1;
+    std::vector<NoFSegment> nof_startup_segments;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =

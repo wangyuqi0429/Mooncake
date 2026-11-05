@@ -6,6 +6,10 @@
 #include <string>
 
 namespace mooncake {
+std::string BuildNoFEndpoint(const std::string& nqn, size_t nsid,
+                             const std::string& traddr, size_t trsvcid,
+                             const std::string& trtype);
+
 #define OPERATION_OK 0
 #define OPERATION_FAILED -1
 

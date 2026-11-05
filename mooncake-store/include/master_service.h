@@ -2603,12 +2603,15 @@ class MasterService {
     // 下一次心跳的既有 Load 路径拉起 VSegmentService。etcd Create 原子首写
     // 保证多 submaster 并发重试 first-writer-wins。
     bool MaybeRetryVSegmentAutoPlan(const char* trigger);
+    bool AcceptsVSegmentStartupQuota(
+        const vsegment::PartitionPhysicalQuotaSnapshot& quota) const;
     // W6 静默期信号（集群级）：把最近一次 mount/remount 的墙钟毫秒写入
     // etcd 共享 key（cvm::VSegmentMountActivityKey），由
     // PlanAndPublishDiscoveredQuota 在发布前读取并等待静默——对全部触发
     // 方统一生效。
     void NoteVSegmentMountActivity();
     vsegment::VSegmentUserPolicy vsegment_auto_plan_policy_{};  // member_count==0 ⇒ 关闭
+    std::atomic<bool> require_nof_vsegment_{false};
     mutable std::mutex vsegment_auto_plan_mutex_;  // 叶子锁：仅保护下方状态
     bool vsegment_auto_plan_published_{false};     // 发布成功（含并发赢家）锁存
     bool vsegment_auto_plan_gave_up_{false};       // INVALID_PARAMS 终态锁存

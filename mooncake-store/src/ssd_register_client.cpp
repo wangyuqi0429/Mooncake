@@ -40,6 +40,14 @@ std::string BuildTeEndpoint(const std::string &traddr, size_t trsvcid,
 
 }  // namespace
 
+std::string BuildNoFEndpoint(const std::string& nqn, size_t nsid,
+                             const std::string& traddr, size_t trsvcid,
+                             const std::string& trtype) {
+    std::string normalized;
+    if (!NormalizeTrType(trtype, normalized)) return {};
+    return BuildTeEndpoint(traddr, trsvcid, nqn, normalized, nsid);
+}
+
 NoFRegisterClient::NoFRegisterClient()
     : master_client_(generate_uuid(), nullptr) {}
 
@@ -50,13 +58,11 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
                                     const std::string &trtype, uintptr_t base,
                                     size_t size,
                                     const std::string &master_server_addr) {
-    std::string normalized_trtype;
-    if (!NormalizeTrType(trtype, normalized_trtype)) {
-        return OPERATION_FAILED;
-    }
+    const auto te_endpoint = BuildNoFEndpoint(nqn, nsid, traddr, trsvcid, trtype);
+    if (te_endpoint.empty()) return OPERATION_FAILED;
     LOG(INFO) << "Registering SSD: nqn=" << nqn << ",nsid=" << nsid
               << ",traddr=" << traddr << ",trsvcid=" << trsvcid
-              << ",trtype=" << normalized_trtype
+              << ",trtype=" << trtype
               << ",master=" << master_server_addr << ",base=" << base
               << ",size=" << size;
 
@@ -65,9 +71,6 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
         LOG(ERROR) << "Failed to connect to master";
         return OPERATION_FAILED;
     }
-
-    std::string te_endpoint = BuildTeEndpoint(traddr, trsvcid, nqn,
-                                              normalized_trtype, nsid);
 
     NoFSegment segment;
     segment.base = base;

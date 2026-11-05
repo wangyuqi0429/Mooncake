@@ -997,13 +997,28 @@ void MasterService::SetVSegmentAutoPlanPolicy(
     const vsegment::VSegmentUserPolicy& policy) {
     std::lock_guard<std::mutex> lock(vsegment_auto_plan_mutex_);
     vsegment_auto_plan_policy_ = policy;
+    require_nof_vsegment_.store(policy.required_medium == "nof");
+}
+
+bool MasterService::AcceptsVSegmentStartupQuota(
+    const vsegment::PartitionPhysicalQuotaSnapshot& quota) const {
+    if (!require_nof_vsegment_.load()) return true;
+    return std::any_of(quota.profile_specs.begin(), quota.profile_specs.end(),
+                       [&](const auto& profile) {
+                           return profile.name == quota.default_profile &&
+                                  profile.required_medium == "nof";
+                       });
 }
 
 tl::expected<std::optional<PutStartResult>, ErrorCode>
 MasterService::TryVSegmentPutStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t slice_length, const ReplicateConfig& config) {
-    if (!vsegment_service_) return std::optional<PutStartResult>{};
+    if (!vsegment_service_) {
+        if (require_nof_vsegment_.load())
+            return tl::make_unexpected(ErrorCode::VSEGMENT_SERVICE_NOT_READY);
+        return std::optional<PutStartResult>{};
+    }
     if (config.replica_num == 0 || config.nof_replica_num != 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1481,6 +1496,10 @@ ErrorCode MasterService::RefreshVSegmentOwnership(
                     LOG(ERROR) << "Failed to load vsegment quota: " << detail;
                     return error;
                 }
+                if (!AcceptsVSegmentStartupQuota(quota)) {
+                    LOG(ERROR) << "vsegment quota default profile must use NOF";
+                    return ErrorCode::INVALID_PARAMS;
+                }
                 // 先在局部完成全部配置，最后一步原子发布：并发读者要么见
                 // null 要么见完整服务，绝不读到 provider 未注入的半成品。
                 ConstructVSegmentService(std::move(quota));
@@ -1812,6 +1831,12 @@ void MasterService::VSegmentInitThreadFunc() {
                          << " (will retry on next heartbeat)";
             // etcd 读取失败同样不阻塞 slot（slot 就绪不依赖 vsegment）：
             // 置 kNoQuota 放行 + 每心跳重探，绝不置 kIdle 挂起 slot。
+            vsegment_init_state_.store(VSegmentInitState::kNoQuota,
+                                       std::memory_order_release);
+            return;
+        }
+        if (!AcceptsVSegmentStartupQuota(quota)) {
+            LOG(ERROR) << "vsegment quota default profile must use NOF";
             vsegment_init_state_.store(VSegmentInitState::kNoQuota,
                                        std::memory_order_release);
             return;
@@ -8242,6 +8267,9 @@ auto MasterService::AllocateAndInsertMetadata(
     const ReplicateConfig& config, const std::string& group_id,
     const TenantId& tenant_id, const std::chrono::system_clock::time_point& now)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (require_nof_vsegment_.load() && !vsegment_service_) {
+        return tl::make_unexpected(ErrorCode::VSEGMENT_SERVICE_NOT_READY);
+    }
     auto& tenant_state = shard->tenants[tenant_id];
     if (tenant_state.metadata.contains(key)) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
