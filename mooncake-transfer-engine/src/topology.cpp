@@ -39,6 +39,7 @@
 #ifdef USE_UB
 #include <libgen.h>
 #include <urma_api.h>
+#include "transport/kunpeng_transport/urma/urma_endpoint.h"
 #endif
 
 namespace mooncake {
@@ -357,6 +358,9 @@ static std::vector<UBDevice> listUBDevices(
     std::vector<UBDevice> devices;
 
     urma_init_attr_t init_attr = {};
+    // Capture device-discovery-phase driver logs too (no-op unless
+    // MC_URMA_LOG_REDIRECT is set). Registered before urma_init; idempotent.
+    UrmaRegisterLogRedirectIfEnabled();
     auto ret = urma_init(&init_attr);
     if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {
         LOG(WARNING) << "Failed to urma init, ret=" << ret;
