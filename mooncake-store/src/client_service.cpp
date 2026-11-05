@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #ifdef USE_NOF
 #include <numa.h>
@@ -61,6 +62,14 @@
 #include "spdiag/auto_perf.h"
 
 namespace mooncake {
+
+bool Client::IsUbTransportSegment(const std::string& endpoint) {
+    if (!transfer_engine_) return false;
+    const auto metadata = transfer_engine_->getMetadata();
+    if (!metadata) return false;
+    const auto segment = metadata->getSegmentDescByName(endpoint);
+    return segment && segment->protocol == "ub";
+}
 
 namespace {
 
@@ -436,11 +445,111 @@ Client::~Client() {
     hot_cache_.reset();
 }
 
+static std::optional<size_t> parse_replica_count_env(const char* name) {
+    const char* raw = std::getenv(name);
+    if (!raw || !*raw) {
+        return std::nullopt;
+    }
+    // Strict non-negative decimal integer: reject sign, whitespace, and
+    // trailing characters before parsing. std::stoull alone would silently
+    // accept "-1" (wrapping to ULLONG_MAX) and "1abc" (prefix parse), turning
+    // a typo into an astronomic replica count with an unrelated allocation
+    // failure far from the misconfiguration.
+    for (const char* p = raw; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            LOG(ERROR) << "Invalid " << name << "='" << raw
+                       << "', expected a non-negative decimal integer "
+                          "without sign, whitespace, or trailing "
+                          "characters; the environment variable is ignored "
+                          "and the caller's ReplicateConfig wins";
+            return std::nullopt;
+        }
+    }
+    try {
+        return static_cast<size_t>(std::stoull(raw));
+    } catch (const std::exception&) {
+        // Only reachable on overflow now that the character set is checked.
+        LOG(ERROR) << "Invalid " << name << "='" << raw
+                   << "', value out of range for size_t; the environment "
+                      "variable is ignored and the caller's ReplicateConfig "
+                      "wins";
+        return std::nullopt;
+    }
+}
+
+// JD-Cases: 透明数据放置开关（上层应用不感知 NoF segment）。
+//
+// 部署侧通过环境变量选择写路径，应用侧 ReplicateConfig 无需任何改动：
+//   MC_NOF_REPLICA_NUM -> 覆盖 nof_replica_num（NoF SSD segment，
+//                         SPDK NoF 注册通道）
+//   MC_MEM_REPLICA_NUM -> 覆盖 replica_num（transfer engine 默认内存
+//                         segment）
+//
+// 未设置的环境变量不干预（保留调用方传入值；默认 replica_num=1/nof=0
+// 即纯内存语义）。常用组合：
+//   纯内存压测：MC_MEM_REPLICA_NUM=1（或两个都不设）
+//   纯 NoF 压测：MC_NOF_REPLICA_NUM=1 MC_MEM_REPLICA_NUM=0
+//     （mem=0 且 nof=1 为 strict 模式：NoF 段未注册时 put 显式失败
+//      NO_AVAILABLE_HANDLE，避免 1+1 FLEXIBLE 模式下的静默内存退化）
+//   1+1 双副本：MC_NOF_REPLICA_NUM=1 MC_MEM_REPLICA_NUM=1
+//
+// 两者解析结果均为 0 属配置错误：master 分配阶段会以 INVALID_PARAMS
+// 拒绝 PutStart（put 失败），客户端在此打一次 ERROR 便于定位。
+struct EnvReplicaPlacement {
+    std::optional<size_t> nof_replica_num;
+    std::optional<size_t> mem_replica_num;
+
+    EnvReplicaPlacement() {
+        nof_replica_num = parse_replica_count_env("MC_NOF_REPLICA_NUM");
+        mem_replica_num = parse_replica_count_env("MC_MEM_REPLICA_NUM");
+    }
+
+    bool active() const { return nof_replica_num || mem_replica_num; }
+};
+
+static void ApplyEnvReplicaPlacement(ReplicateConfig& config) {
+    static const EnvReplicaPlacement env_placement;
+    if (!env_placement.active()) {
+        return;
+    }
+    if (env_placement.nof_replica_num) {
+        config.nof_replica_num = *env_placement.nof_replica_num;
+    }
+    if (env_placement.mem_replica_num) {
+        config.replica_num = *env_placement.mem_replica_num;
+    }
+    static std::once_flag info_once;
+    // env_placement 具有静态存储期，lambda 无需捕获即可直接使用
+    std::call_once(info_once, [] {
+        LOG(INFO) << "Env replica placement override active:"
+                  << (env_placement.mem_replica_num
+                          ? " MC_MEM_REPLICA_NUM=" +
+                                std::to_string(*env_placement.mem_replica_num)
+                          : "")
+                  << (env_placement.nof_replica_num
+                          ? " MC_NOF_REPLICA_NUM=" +
+                                std::to_string(*env_placement.nof_replica_num)
+                          : "")
+                  << " (caller ReplicateConfig values are overridden on "
+                     "every write path)";
+    });
+    if (config.replica_num == 0 && config.nof_replica_num == 0) {
+        static std::once_flag zero_once;
+        std::call_once(zero_once, [] {
+            LOG(ERROR) << "Env replica placement resolved to 0 memory and 0 "
+                          "NoF replicas; master will reject every put with "
+                          "INVALID_PARAMS. Fix MC_MEM_REPLICA_NUM / "
+                          "MC_NOF_REPLICA_NUM";
+        });
+    }
+}
+
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
     if (!host_id_.empty()) {
         client_cfg.host_id = host_id_;
     }
+    ApplyEnvReplicaPlacement(client_cfg);
     return client_cfg;
 }
 
@@ -1532,7 +1641,9 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             results.emplace_back(tl::unexpected(response[i].error()));
         }
     }
-    pt.End(0);
+    pt.End(std::all_of(results.begin(), results.end(),
+                       [](const auto& result) { return result.has_value(); })
+               ? 0 : -1);
     return results;
 }
 
@@ -1661,6 +1772,12 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         pt_cache.End(cache_used ? 0 : -1);
     }
 
+    if (read_replica_validator_ &&
+        !read_replica_validator_(object_key, replica)) {
+        if (cache_used) hot_cache_->ReleaseHotKey(object_key);
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
     auto t0_get = std::chrono::steady_clock::now();
     err = TransferRead(replica, slices, query_result.vsegment_layouts.get());
 
@@ -1742,6 +1859,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    if (read_replica_validator_ &&
+        !read_replica_validator_(object_key, replica)) {
+        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    }
+
     auto t0_get = std::chrono::steady_clock::now();
     err = TransferReadRange(replica, slices, src_offset,
                             query_result.vsegment_layouts.get());
@@ -1807,6 +1929,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
             cache_used = RedirectToHotCache(key, replica);
+        }
+
+        if (read_replica_validator_ && !read_replica_validator_(key, replica)) {
+            if (cache_used) hot_cache_->ReleaseHotKey(key);
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
         }
 
         auto& memory_descriptor = replica.get_memory_descriptor();
@@ -1959,6 +2087,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return pref_results;
     }
 
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+#ifdef USE_NOF
+    const int64_t nof_slow_trace_threshold_us =
+        GetSpdkNofSlowTraceThresholdUs();
+#else
+    const int64_t nof_slow_trace_threshold_us = 0;
+#endif
+    const auto batch_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto elapsed_us = [](auto begin, auto end) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+            .count();
+    };
+
     // Collect all transfer operations for parallel execution
     // Tuple: (index, key, future, replica, cache_used)
     std::vector<std::tuple<size_t, std::string, TransferFuture,
@@ -1970,11 +2115,73 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
     // Collect cache hit statistics for the entire batch
     size_t total_cache_hits = 0;
+    size_t submitted_bytes = 0;
+    int64_t wait_blocked_us = 0;
+    int64_t checksum_us = 0;
+    size_t ready_before_wait = 0;
+    size_t blocked_futures = 0;
+    int64_t max_future_wait_us = 0;
+    size_t nof_timing_count = 0;
+    uint64_t nof_sub_io_count = 0;
+    uint32_t slowest_lane = 0;
+    size_t slowest_task_index = 0;
+    int64_t slowest_task_us = 0;
+    int64_t nof_dispatch_queue_sum_us = 0;
+    int64_t nof_dispatch_queue_max_us = 0;
+    int64_t nof_worker_setup_sum_us = 0;
+    int64_t nof_worker_setup_max_us = 0;
+    uint64_t nof_qos_tasks_ahead_sum = 0;
+    uint32_t nof_qos_tasks_ahead_max = 0;
+    int64_t nof_qos_fifo_wait_sum_us = 0;
+    int64_t nof_qos_fifo_wait_max_us = 0;
+    int64_t nof_qos_fifo_full_wait_sum_us = 0;
+    int64_t nof_qos_fifo_full_wait_max_us = 0;
+    int64_t nof_qos_fifo_partial_wait_sum_us = 0;
+    int64_t nof_qos_fifo_partial_wait_max_us = 0;
+    int64_t nof_qos_fifo_zero_wait_sum_us = 0;
+    int64_t nof_qos_fifo_zero_wait_max_us = 0;
+    int64_t nof_qos_fifo_unattributed_sum_us = 0;
+    int64_t nof_qos_fifo_unattributed_max_us = 0;
+    int64_t nof_head_to_submit_sum_us = 0;
+    int64_t nof_head_to_submit_max_us = 0;
+    int64_t nof_credit_wait_sum_us = 0;
+    int64_t nof_credit_wait_max_us = 0;
+    int64_t nof_first_credit_wait_sum_us = 0;
+    int64_t nof_first_credit_wait_max_us = 0;
+    int64_t nof_submit_credit_wait_sum_us = 0;
+    int64_t nof_submit_credit_wait_max_us = 0;
+    int64_t nof_qos_queue_sum_us = 0;
+    int64_t nof_qos_queue_max_us = 0;
+    int64_t nof_queue_to_submit_sum_us = 0;
+    int64_t nof_queue_to_submit_max_us = 0;
+    int64_t nof_submit_span_sum_us = 0;
+    int64_t nof_submit_span_max_us = 0;
+    int64_t nof_drain_sum_us = 0;
+    int64_t nof_drain_max_us = 0;
+    int64_t nof_first_completion_sum_us = 0;
+    int64_t nof_first_completion_max_us = 0;
+    int64_t nof_completion_submit_gap_sum_us = 0;
+    int64_t nof_completion_submit_gap_min_us =
+        std::numeric_limits<int64_t>::max();
+    int64_t nof_completion_submit_gap_max_us =
+        std::numeric_limits<int64_t>::min();
+    size_t nof_completion_before_last_submit = 0;
+    int64_t nof_completion_span_sum_us = 0;
+    int64_t nof_completion_span_max_us = 0;
+    int64_t nof_task_total_sum_us = 0;
+    int64_t nof_task_total_max_us = 0;
+    int64_t nof_observe_delay_sum_us = 0;
+    int64_t nof_observe_delay_max_us = 0;
+    NofTransferTiming slowest_task_timing;
 
+    // One submit sample per batch; wait samples below are per future.
+    SpDiag::PerfPoint submit_point(PerfKey::GET_BATCH_SUBMIT,
+                                   SpDiag::PerfLevel::MODULE);
+    submit_point.Start();
     // Submit all transfers in parallel
-    SpDiag::PerfPoint pt_submit(PerfKey::GET_BATCH_SUBMIT,
-                                SpDiag::PerfLevel::MODULE);
-    pt_submit.Start();
+    const auto submit_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
         const auto& query_result = query_results[i];
@@ -2015,6 +2222,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             if (cache_used) {
                 total_cache_hits++;
             }
+        }
+
+        if (read_replica_validator_ && !read_replica_validator_(key, replica)) {
+            if (cache_used) hot_cache_->ReleaseHotKey(key);
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
         }
 
         // Submit transfer operation asynchronously
@@ -2081,23 +2294,226 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+        if (breakdown_log) {
+            for (const auto& slice : slices_it->second) {
+                submitted_bytes += slice.size;
+            }
+        }
     }
-    pt_submit.End(0);
+    submit_point.End(pending_transfers.size() == object_keys.size() ? 0 : -1);
+    const auto submit_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     // Wait for all transfers to complete
-    SpDiag::PerfPoint pt_wait(PerfKey::GET_BATCH_WAIT,
-                              SpDiag::PerfLevel::MODULE);
-    pt_wait.Start();
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
         const bool is_vsegment = stored_replica.is_vsegment_replica();
         SpDiag::PerfPoint pt_vsegment_wait(
             PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
         if (is_vsegment) pt_vsegment_wait.Start();
+        const bool was_ready = breakdown_log && future.isReady();
+        if (was_ready) {
+            ++ready_before_wait;
+        } else if (breakdown_log) {
+            ++blocked_futures;
+        }
+        const auto wait_start =
+            breakdown_log ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+        SpDiag::PerfPoint wait_point(PerfKey::GET_BATCH_WAIT,
+                                     SpDiag::PerfLevel::MODULE);
+        wait_point.Start();
         ErrorCode result = future.get();
+        wait_point.End(result == ErrorCode::OK ? 0 : -1);
         if (is_vsegment) {
             pt_vsegment_wait.End(result == ErrorCode::OK ? 0 : -1);
         }
+        if (breakdown_log) {
+            const int64_t future_wait_us =
+                elapsed_us(wait_start, std::chrono::steady_clock::now());
+            wait_blocked_us += future_wait_us;
+            max_future_wait_us =
+                std::max(max_future_wait_us, future_wait_us);
+            if (auto timing = future.nofTiming(); timing.has_value()) {
+                ++nof_timing_count;
+                nof_sub_io_count += timing->sub_io_count;
+                nof_dispatch_queue_sum_us += timing->dispatch_queue_us;
+                nof_dispatch_queue_max_us = std::max(
+                    nof_dispatch_queue_max_us, timing->dispatch_queue_us);
+                nof_worker_setup_sum_us += timing->worker_setup_us;
+                nof_worker_setup_max_us = std::max(
+                    nof_worker_setup_max_us, timing->worker_setup_us);
+                nof_qos_tasks_ahead_sum +=
+                    timing->qos_tasks_ahead_at_enqueue;
+                nof_qos_tasks_ahead_max = std::max(
+                    nof_qos_tasks_ahead_max,
+                    timing->qos_tasks_ahead_at_enqueue);
+                nof_qos_fifo_wait_sum_us += timing->qos_fifo_wait_us;
+                nof_qos_fifo_wait_max_us = std::max(
+                    nof_qos_fifo_wait_max_us, timing->qos_fifo_wait_us);
+                nof_qos_fifo_full_wait_sum_us +=
+                    timing->qos_fifo_full_wait_us;
+                nof_qos_fifo_full_wait_max_us = std::max(
+                    nof_qos_fifo_full_wait_max_us,
+                    timing->qos_fifo_full_wait_us);
+                nof_qos_fifo_partial_wait_sum_us +=
+                    timing->qos_fifo_partial_wait_us;
+                nof_qos_fifo_partial_wait_max_us = std::max(
+                    nof_qos_fifo_partial_wait_max_us,
+                    timing->qos_fifo_partial_wait_us);
+                nof_qos_fifo_zero_wait_sum_us +=
+                    timing->qos_fifo_zero_wait_us;
+                nof_qos_fifo_zero_wait_max_us = std::max(
+                    nof_qos_fifo_zero_wait_max_us,
+                    timing->qos_fifo_zero_wait_us);
+                const int64_t qos_fifo_attributed_us =
+                    timing->qos_fifo_full_wait_us +
+                    timing->qos_fifo_partial_wait_us +
+                    timing->qos_fifo_zero_wait_us;
+                const int64_t qos_fifo_unattributed_us = std::max<int64_t>(
+                    0, timing->qos_fifo_wait_us - qos_fifo_attributed_us);
+                nof_qos_fifo_unattributed_sum_us +=
+                    qos_fifo_unattributed_us;
+                nof_qos_fifo_unattributed_max_us = std::max(
+                    nof_qos_fifo_unattributed_max_us,
+                    qos_fifo_unattributed_us);
+                nof_head_to_submit_sum_us +=
+                    timing->head_to_first_submit_us;
+                nof_head_to_submit_max_us = std::max(
+                    nof_head_to_submit_max_us,
+                    timing->head_to_first_submit_us);
+                nof_credit_wait_sum_us += timing->credit_wait_us;
+                nof_credit_wait_max_us =
+                    std::max(nof_credit_wait_max_us, timing->credit_wait_us);
+                nof_first_credit_wait_sum_us +=
+                    timing->first_credit_wait_us;
+                nof_first_credit_wait_max_us =
+                    std::max(nof_first_credit_wait_max_us,
+                             timing->first_credit_wait_us);
+                const int64_t submit_credit_wait_us =
+                    timing->credit_wait_us - timing->first_credit_wait_us;
+                nof_submit_credit_wait_sum_us += submit_credit_wait_us;
+                nof_submit_credit_wait_max_us = std::max(
+                    nof_submit_credit_wait_max_us, submit_credit_wait_us);
+                nof_qos_queue_sum_us += timing->qos_queue_us;
+                nof_qos_queue_max_us =
+                    std::max(nof_qos_queue_max_us, timing->qos_queue_us);
+                nof_queue_to_submit_sum_us +=
+                    timing->queue_to_first_submit_us;
+                nof_queue_to_submit_max_us = std::max(
+                    nof_queue_to_submit_max_us,
+                    timing->queue_to_first_submit_us);
+                nof_submit_span_sum_us += timing->first_to_last_submit_us;
+                nof_submit_span_max_us = std::max(
+                    nof_submit_span_max_us, timing->first_to_last_submit_us);
+                nof_drain_sum_us += timing->last_submit_to_complete_us;
+                nof_drain_max_us = std::max(
+                    nof_drain_max_us, timing->last_submit_to_complete_us);
+                nof_first_completion_sum_us +=
+                    timing->first_submit_to_first_completion_us;
+                nof_first_completion_max_us = std::max(
+                    nof_first_completion_max_us,
+                    timing->first_submit_to_first_completion_us);
+                nof_completion_submit_gap_sum_us +=
+                    timing->first_completion_minus_last_submit_us;
+                nof_completion_submit_gap_min_us = std::min(
+                    nof_completion_submit_gap_min_us,
+                    timing->first_completion_minus_last_submit_us);
+                nof_completion_submit_gap_max_us = std::max(
+                    nof_completion_submit_gap_max_us,
+                    timing->first_completion_minus_last_submit_us);
+                if (timing->first_completion_minus_last_submit_us < 0) {
+                    ++nof_completion_before_last_submit;
+                }
+                nof_completion_span_sum_us +=
+                    timing->first_completion_to_complete_us;
+                nof_completion_span_max_us = std::max(
+                    nof_completion_span_max_us,
+                    timing->first_completion_to_complete_us);
+                nof_task_total_sum_us += timing->total_us;
+                nof_task_total_max_us =
+                    std::max(nof_task_total_max_us, timing->total_us);
+                nof_observe_delay_sum_us += timing->complete_to_observe_us;
+                nof_observe_delay_max_us = std::max(
+                    nof_observe_delay_max_us,
+                    timing->complete_to_observe_us);
+                MC_LOG(INFO)
+                    << "batch_get_nof_task_breakdown trace_id=" << trace_id
+                    << " task_index=" << index << " lane=" << timing->lane
+                    << " sub_io_count=" << timing->sub_io_count
+                    << " tasks_ahead_at_enqueue="
+                    << timing->qos_tasks_ahead_at_enqueue
+                    << " dispatch_queue_us=" << timing->dispatch_queue_us
+                    << " worker_setup_us=" << timing->worker_setup_us
+                    << " qos_fifo_wait_us=" << timing->qos_fifo_wait_us
+                    << " qos_fifo_full_wait_us="
+                    << timing->qos_fifo_full_wait_us
+                    << " qos_fifo_partial_wait_us="
+                    << timing->qos_fifo_partial_wait_us
+                    << " qos_fifo_zero_wait_us="
+                    << timing->qos_fifo_zero_wait_us
+                    << " qos_fifo_unattributed_us="
+                    << qos_fifo_unattributed_us
+                    << " head_to_submit_us="
+                    << timing->head_to_first_submit_us
+                    << " first_credit_wait_us="
+                    << timing->first_credit_wait_us
+                    << " submit_credit_wait_us="
+                    << (timing->credit_wait_us -
+                        timing->first_credit_wait_us)
+                    << " submit_span_us="
+                    << timing->first_to_last_submit_us
+                    << " drain_us=" << timing->last_submit_to_complete_us
+                    << " first_completion_us="
+                    << timing->first_submit_to_first_completion_us
+                    << " completion_submit_gap_us="
+                    << timing->first_completion_minus_last_submit_us
+                    << " completion_span_us="
+                    << timing->first_completion_to_complete_us
+                    << " task_total_us=" << timing->total_us
+                    << " observe_delay_us="
+                    << timing->complete_to_observe_us
+                    << " worker_idx=" << timing->worker_index
+                    << " qpair_id=" << timing->qpair_id
+                    << " lane_task_seq=" << timing->lane_task_sequence
+                    << " lane_completion_seq="
+                    << timing->lane_completion_sequence
+                    << " max_subio_us=" << timing->max_sub_io_latency_us
+                    << " max_subio_idx=" << timing->max_sub_io_index
+                    << " max_subio_cid=" << timing->max_sub_io_cid
+                    << " max_completion_gap_us="
+                    << timing->max_completion_gap_us
+                    << " max_poll_return_gap_us="
+                    << timing->max_poll_return_gap_us
+                    << " poll_calls=" << timing->poll_calls_during_task
+                    << " empty_polls=" << timing->empty_polls_during_task
+                    << " polled_completions="
+                    << timing->polled_completions_during_task;
+                if (timing->total_us > slowest_task_us) {
+                    slowest_task_us = timing->total_us;
+                    slowest_lane = timing->lane;
+                    slowest_task_index = index;
+                    slowest_task_timing = *timing;
+                }
+            }
+        }
+#ifdef USE_NOF
+        if (!breakdown_log && nof_slow_trace_threshold_us > 0) {
+            if (auto timing = future.nofTiming();
+                timing.has_value() &&
+                timing->total_us >= nof_slow_trace_threshold_us) {
+                MC_LOG(INFO)
+                    << "batch_get_slow_task_observed trace_id=" << trace_id
+                    << " task_index=" << index << " lane=" << timing->lane
+                    << " qpair_id=" << timing->qpair_id
+                    << " lane_task_seq=" << timing->lane_task_sequence
+                    << " task_total_us=" << timing->total_us
+                    << " observe_delay_us="
+                    << timing->complete_to_observe_us;
+            }
+        }
+#endif
 
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
@@ -2119,9 +2535,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+            const auto checksum_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
             auto checksum_result = VerifyObjectChecksum(
                 key, slices_it->second, calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
+            if (breakdown_log) {
+                checksum_us += elapsed_us(checksum_start,
+                                          std::chrono::steady_clock::now());
+            }
             if (!checksum_result) {
                 results[index] = tl::unexpected(checksum_result.error());
                 continue;
@@ -2144,10 +2567,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
     }
-    pt_wait.End(0);
+    const auto wait_loop_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
     // As lease expired is a rare case, we check all the results with the same
     // time_point to avoid too many syscalls
+    const auto lease_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     for (size_t i = 0; i < object_keys.size(); ++i) {
@@ -2157,12 +2585,200 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
+    const auto batch_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
 
+    const auto t1_batch_get = std::chrono::steady_clock::now();
     auto us_batch_get = std::chrono::duration_cast<std::chrono::microseconds>(
-                            std::chrono::steady_clock::now() - t0_batch_get)
+                            t1_batch_get - t0_batch_get)
                             .count();
     if (metrics_) {
         metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
+    }
+
+    if (nof_slow_trace_threshold_us > 0 &&
+        us_batch_get >= nof_slow_trace_threshold_us) {
+        size_t success_count = 0;
+        for (const auto& result : results) {
+            if (result.has_value()) {
+                ++success_count;
+            }
+        }
+        const auto mono_ns = [](auto value) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       value.time_since_epoch())
+                .count();
+        };
+        MC_LOG(INFO) << "batch_get_slow_trace trace_id=" << trace_id
+                     << " keys=" << object_keys.size()
+                     << " pending=" << pending_transfers.size()
+                     << " start_mono_ns=" << mono_ns(t0_batch_get)
+                     << " end_mono_ns=" << mono_ns(t1_batch_get)
+                     << " total_us=" << us_batch_get
+                     << " success=" << success_count
+                     << " failed=" << (results.size() - success_count);
+    }
+
+    if (breakdown_log) {
+        const int64_t setup_us = elapsed_us(batch_start, submit_start);
+        const int64_t submit_us = elapsed_us(submit_start, submit_end);
+        const int64_t wait_loop_us = elapsed_us(submit_end, wait_loop_end);
+        const int64_t result_us =
+            std::max<int64_t>(0, wait_loop_us - wait_blocked_us - checksum_us);
+        const int64_t lease_us = elapsed_us(lease_start, batch_end);
+        const int64_t total_us = elapsed_us(batch_start, batch_end);
+        size_t success_count = 0;
+        for (const auto& result : results) {
+            if (result.has_value()) {
+                ++success_count;
+            }
+        }
+        MC_LOG(INFO) << "batch_get_data_breakdown trace_id=" << trace_id
+                     << " keys=" << object_keys.size()
+                     << " pending=" << pending_transfers.size()
+                     << " bytes=" << submitted_bytes
+                     << " setup_us=" << setup_us
+                     << " submit_us=" << submit_us
+                     << " wait_blocked_us=" << wait_blocked_us
+                     << " checksum_us=" << checksum_us
+                     << " result_us=" << result_us
+                     << " lease_us=" << lease_us
+                     << " total_us=" << total_us
+                     << " success=" << success_count
+                     << " failed=" << (results.size() - success_count);
+        if (nof_timing_count > 0) {
+            auto average = [nof_timing_count](int64_t sum) {
+                return sum / static_cast<int64_t>(nof_timing_count);
+            };
+            MC_LOG(INFO)
+                << "batch_get_nof_wait_breakdown trace_id=" << trace_id
+                << " nof_tasks=" << nof_timing_count
+                << " sub_ios=" << nof_sub_io_count
+                << " ready_before_wait=" << ready_before_wait
+                << " blocked_futures=" << blocked_futures
+                << " future_wait_sum_us=" << wait_blocked_us
+                << " future_wait_max_us=" << max_future_wait_us
+                << " dispatch_queue_avg_us="
+                << average(nof_dispatch_queue_sum_us)
+                << " dispatch_queue_max_us=" << nof_dispatch_queue_max_us
+                << " worker_setup_avg_us="
+                << average(nof_worker_setup_sum_us)
+                << " worker_setup_max_us=" << nof_worker_setup_max_us
+                << " tasks_ahead_avg="
+                << average(static_cast<int64_t>(nof_qos_tasks_ahead_sum))
+                << " tasks_ahead_max=" << nof_qos_tasks_ahead_max
+                << " qos_fifo_wait_avg_us="
+                << average(nof_qos_fifo_wait_sum_us)
+                << " qos_fifo_wait_max_us=" << nof_qos_fifo_wait_max_us
+                << " qos_fifo_full_wait_avg_us="
+                << average(nof_qos_fifo_full_wait_sum_us)
+                << " qos_fifo_full_wait_max_us="
+                << nof_qos_fifo_full_wait_max_us
+                << " qos_fifo_partial_wait_avg_us="
+                << average(nof_qos_fifo_partial_wait_sum_us)
+                << " qos_fifo_partial_wait_max_us="
+                << nof_qos_fifo_partial_wait_max_us
+                << " qos_fifo_zero_wait_avg_us="
+                << average(nof_qos_fifo_zero_wait_sum_us)
+                << " qos_fifo_zero_wait_max_us="
+                << nof_qos_fifo_zero_wait_max_us
+                << " qos_fifo_unattributed_avg_us="
+                << average(nof_qos_fifo_unattributed_sum_us)
+                << " qos_fifo_unattributed_max_us="
+                << nof_qos_fifo_unattributed_max_us
+                << " head_to_submit_avg_us="
+                << average(nof_head_to_submit_sum_us)
+                << " head_to_submit_max_us=" << nof_head_to_submit_max_us
+                << " credit_wait_avg_us=" << average(nof_credit_wait_sum_us)
+                << " credit_wait_max_us=" << nof_credit_wait_max_us
+                << " first_credit_wait_avg_us="
+                << average(nof_first_credit_wait_sum_us)
+                << " first_credit_wait_max_us="
+                << nof_first_credit_wait_max_us
+                << " submit_credit_wait_avg_us="
+                << average(nof_submit_credit_wait_sum_us)
+                << " submit_credit_wait_max_us="
+                << nof_submit_credit_wait_max_us
+                << " qos_queue_avg_us=" << average(nof_qos_queue_sum_us)
+                << " qos_queue_max_us=" << nof_qos_queue_max_us
+                << " queue_to_submit_avg_us="
+                << average(nof_queue_to_submit_sum_us)
+                << " queue_to_submit_max_us="
+                << nof_queue_to_submit_max_us
+                << " submit_span_avg_us="
+                << average(nof_submit_span_sum_us)
+                << " submit_span_max_us=" << nof_submit_span_max_us
+                << " drain_avg_us=" << average(nof_drain_sum_us)
+                << " drain_max_us=" << nof_drain_max_us
+                << " first_completion_avg_us="
+                << average(nof_first_completion_sum_us)
+                << " first_completion_max_us="
+                << nof_first_completion_max_us
+                << " completion_submit_gap_avg_us="
+                << average(nof_completion_submit_gap_sum_us)
+                << " completion_submit_gap_min_us="
+                << nof_completion_submit_gap_min_us
+                << " completion_submit_gap_max_us="
+                << nof_completion_submit_gap_max_us
+                << " completion_before_last_submit_tasks="
+                << nof_completion_before_last_submit
+                << " completion_span_avg_us="
+                << average(nof_completion_span_sum_us)
+                << " completion_span_max_us="
+                << nof_completion_span_max_us
+                << " task_total_avg_us=" << average(nof_task_total_sum_us)
+                << " task_total_max_us=" << nof_task_total_max_us
+                << " observe_delay_avg_us="
+                << average(nof_observe_delay_sum_us)
+                << " observe_delay_max_us=" << nof_observe_delay_max_us
+                << " slowest_lane=" << slowest_lane
+                << " slowest_task_index=" << slowest_task_index
+                << " slowest_task_us=" << slowest_task_us
+                << " slowest_qos_queue_us="
+                << slowest_task_timing.qos_queue_us
+                << " slowest_dispatch_queue_us="
+                << slowest_task_timing.dispatch_queue_us
+                << " slowest_worker_setup_us="
+                << slowest_task_timing.worker_setup_us
+                << " slowest_qos_fifo_wait_us="
+                << slowest_task_timing.qos_fifo_wait_us
+                << " slowest_tasks_ahead_at_enqueue="
+                << slowest_task_timing.qos_tasks_ahead_at_enqueue
+                << " slowest_qos_fifo_full_wait_us="
+                << slowest_task_timing.qos_fifo_full_wait_us
+                << " slowest_qos_fifo_partial_wait_us="
+                << slowest_task_timing.qos_fifo_partial_wait_us
+                << " slowest_qos_fifo_zero_wait_us="
+                << slowest_task_timing.qos_fifo_zero_wait_us
+                << " slowest_qos_fifo_unattributed_us="
+                << std::max<int64_t>(
+                       0, slowest_task_timing.qos_fifo_wait_us -
+                              slowest_task_timing.qos_fifo_full_wait_us -
+                              slowest_task_timing.qos_fifo_partial_wait_us -
+                              slowest_task_timing.qos_fifo_zero_wait_us)
+                << " slowest_head_to_submit_us="
+                << slowest_task_timing.head_to_first_submit_us
+                << " slowest_credit_wait_us="
+                << slowest_task_timing.credit_wait_us
+                << " slowest_first_credit_wait_us="
+                << slowest_task_timing.first_credit_wait_us
+                << " slowest_submit_credit_wait_us="
+                << (slowest_task_timing.credit_wait_us -
+                    slowest_task_timing.first_credit_wait_us)
+                << " slowest_submit_span_us="
+                << slowest_task_timing.first_to_last_submit_us
+                << " slowest_drain_us="
+                << slowest_task_timing.last_submit_to_complete_us
+                << " slowest_first_completion_us="
+                << slowest_task_timing.first_submit_to_first_completion_us
+                << " slowest_completion_submit_gap_us="
+                << slowest_task_timing.first_completion_minus_last_submit_us
+                << " slowest_completion_span_us="
+                << slowest_task_timing.first_completion_to_complete_us
+                << " slowest_observe_delay_us="
+                << slowest_task_timing.complete_to_observe_us;
+        }
     }
 
     // Log overall cache hit statistics for the entire batch
@@ -2245,6 +2861,19 @@ void Client::ReportFailedEndpointsToMasters(
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto checksum_end = breakdown_start;
+    auto prepare_end = breakdown_start;
+    auto put_start_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto put_end_end = breakdown_start;
+    auto revoke_end = breakdown_start;
+
     SpDiag::PerfPoint pt_full(PerfKey::PUT_SINGLE_FULL,
                               SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
@@ -2258,6 +2887,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
         object_checksum = *checksum_result;
     }
+    if (breakdown_log) checksum_end = std::chrono::steady_clock::now();
 
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
@@ -2273,9 +2903,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
 
     // Start put operation
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
+    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -2361,13 +2993,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     // 方案二被动层：上报坏端点（不改变写语义——FLEXIBLE 部分成功仍成功）。
     // 放在 put_latency 指标采集之后，避免上报 RPC 耗时污染写延迟统计。
     ReportFailedEndpointsToMasters(failed_endpoints);
 
     const auto finalize_decision =
-        DetermineFinalizeDecision(config, transfer_summary);
+        DetermineFinalizeDecision(client_cfg, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
         SpDiag::PerfPoint pt_end(PerfKey::PUT_SINGLE_PUT_END,
@@ -2384,6 +3017,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(err);
         }
     }
+    if (breakdown_log) put_end_end = std::chrono::steady_clock::now();
 
     if (finalize_decision.revoke_type.has_value()) {
         auto revoke_result = master_client_.PutRevoke(
@@ -2394,10 +3028,34 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(revoke_result.error());
         }
     }
+    if (breakdown_log) revoke_end = std::chrono::steady_clock::now();
 
     if (!finalize_decision.success) {
         pt_full.End(-1);
         return tl::unexpected(finalize_decision.error);
+    }
+
+    if (breakdown_log) {
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "client_put_breakdown trace_id=" << trace_id
+                     << " key=" << key << " slices=" << slices.size()
+                     << " replicas=" << start_result.value().replicas.size()
+                     << " checksum_us="
+                     << elapsed_us(breakdown_start, checksum_end)
+                     << " prepare_us=" << elapsed_us(checksum_end, prepare_end)
+                     << " put_start_us="
+                     << elapsed_us(prepare_end, put_start_end)
+                     << " transfer_us="
+                     << elapsed_us(put_start_end, transfer_end)
+                     << " put_end_us=" << elapsed_us(transfer_end, put_end_end)
+                     << " revoke_us=" << elapsed_us(put_end_end, revoke_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, revoke_end)
+                     << " status=ok";
     }
 
     pt_full.End(0);
@@ -3596,6 +4254,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto breakdown_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    auto prepare_end = breakdown_start;
+    auto put_start_end = breakdown_start;
+    auto transfer_end = breakdown_start;
+    auto put_end_end = breakdown_start;
+
     SpDiag::PerfPoint pt_full(PerfKey::PUT_BATCH_FULL,
                               SpDiag::PerfLevel::KEY_MODULE);
     pt_full.Start();
@@ -3605,6 +4274,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
+    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
@@ -3621,6 +4291,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         StartBatchPut(ops, client_cfg);
+        if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
         const bool contains_vsegment = std::any_of(
             ops.begin(), ops.end(), [](const PutOperation& op) {
                 return !op.IsResolved() &&
@@ -3649,6 +4320,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
             return results;
         }
         auto results = BatchPutWhenPreferSameNode(ops);
+        if (breakdown_log) {
+            transfer_end = std::chrono::steady_clock::now();
+            put_end_end = transfer_end;
+        }
         const bool any_succeeded =
             std::any_of(results.begin(), results.end(),
                         [](const auto& result) { return result.has_value(); });
@@ -3656,6 +4331,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return results;
     }
     StartBatchPut(ops, client_cfg);
+    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
@@ -3666,12 +4342,46 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
+    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
 
     FinalizeBatchPut(ops);
+    if (breakdown_log) put_end_end = std::chrono::steady_clock::now();
     auto results = CollectResults(ops);
     const bool any_succeeded =
         std::any_of(results.begin(), results.end(),
                     [](const auto& result) { return result.has_value(); });
+    if (breakdown_log) {
+        size_t total_bytes = 0;
+        size_t success_count = 0;
+        for (const auto& slices : batched_slices) {
+            for (const auto& slice : slices) total_bytes += slice.size;
+        }
+        for (const auto& result : results) {
+            if (result.has_value()) ++success_count;
+        }
+        const char* status = success_count == results.size() ? "ok"
+                             : success_count == 0            ? "err"
+                                                             : "partial";
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "client_batch_put_breakdown trace_id=" << trace_id
+                     << " keys=" << keys.size() << " bytes=" << total_bytes
+                     << " prepare_us="
+                     << elapsed_us(breakdown_start, prepare_end)
+                     << " put_start_us="
+                     << elapsed_us(prepare_end, put_start_end)
+                     << " transfer_us="
+                     << elapsed_us(put_start_end, transfer_end)
+                     << " put_end_us="
+                     << elapsed_us(transfer_end, put_end_end)
+                     << " total_us="
+                     << elapsed_us(breakdown_start, put_end_end)
+                     << " success=" << success_count
+                     << " status=" << status;
+    }
     pt_full.End(any_succeeded ? 0 : -1);
     // 方案二被动层：批次末尾统一上报失败端点（置于 pt_full.End 之后，
     // 避免上报 RPC 耗时污染 PUT_BATCH_FULL 指标）
@@ -5067,6 +5777,15 @@ ErrorCode Client::TransferData(
         PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
     if (is_read) pt_full.Start();
 
+    // merge(nof): 保留 nof 侧逐笔 breakdown 日志（replica/strategy 维度，
+    // hi-freq 采样，未采样时零开销），与上游 pt_* 埋点并存。
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto transfer_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         if (is_read) pt_full.End(-1);
@@ -5142,23 +5861,52 @@ ErrorCode Client::TransferData(
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    const auto submit_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    const TransferStrategy strategy = future->strategy();
+    VLOG(1) << "Using transfer strategy: " << strategy;
 
     if (is_read) pt_wait.Start();
     if (is_vsegment_read) pt_vsegment_wait.Start();
-    const ErrorCode transfer_result = future->get();
-    if (transfer_result != ErrorCode::OK && failed_endpoints) {
+    const ErrorCode result = future->get();
+    if (result != ErrorCode::OK && failed_endpoints) {
         for (const auto& endpoint : vsegment_plan_endpoints) {
             failed_endpoints->insert(endpoint);
         }
     }
     if (is_read) {
-        const int pt_status = (transfer_result == ErrorCode::OK) ? 0 : -1;
+        const int pt_status = (result == ErrorCode::OK) ? 0 : -1;
         if (is_vsegment_read) pt_vsegment_wait.End(pt_status);
         pt_wait.End(pt_status);
         pt_full.End(pt_status);
     }
-    return transfer_result;
+    if (breakdown_log) {
+        const auto wait_end = std::chrono::steady_clock::now();
+        size_t bytes = 0;
+        for (const auto& slice : slices) bytes += slice.size;
+        const char* replica_kind = replica_descriptor.is_memory_replica()
+                                       ? "memory"
+                                   : replica_descriptor.is_nof_replica()
+                                       ? "nof"
+                                       : "other";
+        auto elapsed_us = [](auto begin, auto end) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(end -
+                                                                         begin)
+                .count();
+        };
+        MC_LOG(INFO) << "transfer_data_breakdown trace_id=" << trace_id
+                     << " op="
+                     << (op_code == TransferRequest::WRITE ? "write" : "read")
+                     << " replica=" << replica_kind << " strategy=" << strategy
+                     << " slices=" << slices.size() << " bytes=" << bytes
+                     << " submit_us=" << elapsed_us(transfer_start, submit_end)
+                     << " wait_us=" << elapsed_us(submit_end, wait_end)
+                     << " total_us=" << elapsed_us(transfer_start, wait_end)
+                     << " status=" << static_cast<int>(result);
+    }
+
+    return result;
 }
 
 ErrorCode Client::TransferReadInternal(

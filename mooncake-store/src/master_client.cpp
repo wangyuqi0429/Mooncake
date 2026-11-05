@@ -5,13 +5,19 @@
 #include <async_simple/coro/SyncAwait.h>
 
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <csignal>
-#include <charconv>
+#include <cstdint>
 #include <future>
+#include <optional>
+#include <ostream>
 #include <string>
+#include <sys/syscall.h>
 #include <thread>
 #include <type_traits>
+#include <unistd.h>
+#include <utility>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -33,6 +39,11 @@
 
 #include <optional>
 #include "spdiag/auto_perf.h"
+
+#if defined(MOONCAKE_RPC_SUBMIT_DIAG_BUILD) && \
+    !defined(MOONCAKE_RPC_SUBMIT_TRACE_VERSION)
+#error "RPC diagnostics require the build-local instrumented coro_rpc headers"
+#endif
 
 namespace mooncake {
 
@@ -400,6 +411,158 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
 
+namespace {
+
+bool RpcSubmitDiagnosticsRequested() {
+    static const bool enabled = [] {
+        const bool requested =
+            Environ::GetBool("MC_STORE_RPC_SUBMIT_DIAG", false);
+#ifndef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+        if (requested) {
+            LOG(WARNING) << "MC_STORE_RPC_SUBMIT_DIAG requires rebuilding with "
+                            "-DMC_ENABLE_RPC_SUBMIT_DIAG=ON";
+        }
+#endif
+        return requested;
+    }();
+    return enabled;
+}
+
+// These boundaries deliberately surround the pool callback, not TCP packets.
+// The pool may await the response before returning, depending on reuse_limit.
+struct RpcPoolCallTiming {
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = Clock::time_point;
+
+    TimePoint begin{};
+    TimePoint callback_enter{};
+    TimePoint submit_return{};
+    TimePoint pool_return{};
+    uint64_t caller_tid = 0;
+    uint64_t callback_tid = 0;
+    uint64_t submit_tid = 0;
+    uint64_t pool_return_tid = 0;
+    uint32_t client_id = 0;
+    // get_client_id() is copied from pool configuration, not a connection ID.
+    // These identify live objects within this process, not socket generations.
+    uintptr_t client_object = 0;
+    uintptr_t executor_object = 0;
+    bool callback_entered = false;
+    bool submit_returned = false;
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+    std::optional<coro_rpc::mooncake_submit_trace_t> submit_trace;
+#endif
+
+    void Start() {
+        caller_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+        begin = Clock::now();
+    }
+
+    void Finish() {
+        pool_return = Clock::now();
+        pool_return_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+    }
+};
+
+std::ostream& operator<<(std::ostream& output, const RpcPoolCallTiming& timing) {
+    const auto us = [](auto begin, auto end) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+            .count();
+    };
+    const auto ns = [](auto time) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   time.time_since_epoch())
+            .count();
+    };
+    // -1 means the boundary was not reached (for example, connection failure).
+    // Successful phase durations add up to pool_call_us, modulo us rounding.
+    output << " phase_timing=pool_callback_v1"
+           << " pool_call_us=" << us(timing.begin, timing.pool_return)
+           << " pool_acquire_dispatch_us="
+           << (timing.callback_entered
+                   ? us(timing.begin, timing.callback_enter)
+                   : -1)
+           << " client_submit_us="
+           << (timing.submit_returned
+                   ? us(timing.callback_enter, timing.submit_return)
+                   : -1)
+           << " pool_after_submit_us="
+           << (timing.submit_returned
+                   ? us(timing.submit_return, timing.pool_return)
+                   : -1)
+           << " pool_callback_entered=" << timing.callback_entered
+           << " client_submit_returned=" << timing.submit_returned
+           << " rpc_client_id=" << timing.client_id
+           << " rpc_client_object=" << timing.client_object
+           << " rpc_executor_object=" << timing.executor_object
+           << " caller_tid=" << timing.caller_tid
+           << " callback_tid=" << timing.callback_tid
+           << " submit_tid=" << timing.submit_tid
+           << " pool_return_tid=" << timing.pool_return_tid
+           << " rpc_begin_steady_ns=" << ns(timing.begin)
+           << " rpc_end_steady_ns=" << ns(timing.pool_return);
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+    if (timing.submit_trace) {
+        const auto& trace = *timing.submit_trace;
+        output << " b_wrapper_us="
+               << (trace.Has(coro_rpc::mooncake_submit_trace_t::Begin)
+                       ? us(timing.callback_enter,
+                            trace.times[
+                                coro_rpc::mooncake_submit_trace_t::Begin])
+                       : -1)
+               << trace;
+    } else {
+        output << " b_diag=off";
+    }
+#else
+    output << " b_diag="
+           << (RpcSubmitDiagnosticsRequested() ? "not_built" : "off");
+#endif
+    return output;
+}
+
+template <auto ServiceMethod, typename... Args>
+auto MeasureRpcClientSubmit(coro_rpc::coro_rpc_client& client,
+                            RpcPoolCallTiming& timing, Args&&... args)
+    -> decltype(client.send_request<ServiceMethod>(
+        std::forward<Args>(args)...)) {
+    timing.callback_enter = RpcPoolCallTiming::Clock::now();
+    timing.callback_entered = true;
+    timing.callback_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+    timing.client_id = client.get_client_id();
+    timing.client_object = reinterpret_cast<uintptr_t>(&client);
+    timing.executor_object = reinterpret_cast<uintptr_t>(&client.get_executor());
+
+    // Await only the outer submission coroutine. Return its response Lazy
+    // unchanged so the pool retains its existing response/connection lifetime.
+    // This interval includes preparation, write serialization and recv startup;
+    // it is not a measurement of async_write alone or of network RTT.
+    auto submission = [&] {
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+        if (RpcSubmitDiagnosticsRequested()) {
+            coro_rpc::request_config_t config;
+            config.mooncake_submit_trace = &timing.submit_trace.emplace();
+            return client.send_request<ServiceMethod>(
+                std::move(config), std::forward<Args>(args)...);
+        }
+#endif
+        return client.send_request<ServiceMethod>(std::forward<Args>(args)...);
+    }();
+    auto response = co_await std::move(submission);
+    timing.submit_return = RpcPoolCallTiming::Clock::now();
+#ifdef MOONCAKE_RPC_SUBMIT_TRACE_VERSION
+    if (timing.submit_trace) {
+        timing.submit_trace->Mark(coro_rpc::mooncake_submit_trace_t::Done,
+                                  timing.submit_return);
+    }
+#endif
+    timing.submit_returned = true;
+    timing.submit_tid = static_cast<uint64_t>(::syscall(SYS_gettid));
+    co_return std::move(response);
+}
+
+}  // namespace
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
@@ -415,6 +578,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     uint64_t rpc_call_us = 0;
     uint64_t result_get_us = 0;
     uint64_t result_parse_us = 0;
+    RpcPoolCallTiming pool_timing;
 
     // Increment RPC counter
     if (metrics_) {
@@ -424,16 +588,22 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto start_time = std::chrono::steady_clock::now();
     auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
+            if (breakdown_log) pool_timing.Start();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    if (breakdown_log) {
+                        return MeasureRpcClientSubmit<ServiceMethod>(
+                            client, pool_timing, std::forward<Args>(args)...);
+                    }
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
             if (breakdown_log) {
+                pool_timing.Finish();
                 rpc_call_us =
                     std::chrono::duration_cast<std::chrono::microseconds>(
-                        std::chrono::steady_clock::now() - pool_end)
+                        pool_timing.pool_return - pool_end)
                         .count();
             }
             if (!ret.has_value()) {
@@ -507,6 +677,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
                      << " rpc_call_us=" << rpc_call_us
                      << " result_get_us=" << result_get_us
                      << " result_parse_us=" << result_parse_us
+                     << pool_timing
                      << " client_overhead_us=" << (total_us - rpc_call_us)
                      << " total_us=" << total_us
                      << " status=" << (rpc_result ? "ok" : "rpc_fail");
@@ -556,7 +727,21 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_to(
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool breakdown_log =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const auto total_start =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
     auto pool = client_accessor_.GetClientPool();
+    const auto pool_end =
+        breakdown_log ? std::chrono::steady_clock::now()
+                      : std::chrono::steady_clock::time_point{};
+    uint64_t rpc_call_us = 0;
+    uint64_t result_get_us = 0;
+    uint64_t result_parse_us = 0;
+    RpcPoolCallTiming pool_timing;
+    bool rpc_transport_ok = false;
 
     // Increment RPC counter
     if (metrics_) {
@@ -564,7 +749,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    return async_simple::coro::syncAwait(
+    auto rpc_result = async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
             // 巨尾归因（二）：连接池取用（含首连/重连）+ 请求提交。
@@ -572,13 +757,25 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             SpDiag::PerfPoint pt_send(PerfKey::CVM_RPC_BATCH_SEND,
                                       SpDiag::PerfLevel::MODULE);
             pt_send.Start();
+            if (breakdown_log) pool_timing.Start();
             auto ret = co_await pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
+                    if (breakdown_log) {
+                        return MeasureRpcClientSubmit<ServiceMethod>(
+                            client, pool_timing, std::forward<Args>(args)...);
+                    }
                     return client.send_request<ServiceMethod>(
                         std::forward<Args>(args)...);
                 });
             pt_send.End(ret.has_value() ? 0 : -1);
+            if (breakdown_log) {
+                pool_timing.Finish();
+                rpc_call_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        pool_timing.pool_return - pool_end)
+                        .count();
+            }
             if (!ret.has_value()) {
                 LOG(ERROR) << "Client not available";
                 co_return std::vector<tl::expected<ResultType, ErrorCode>>(
@@ -588,8 +785,17 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
             SpDiag::PerfPoint pt_result(PerfKey::CVM_RPC_BATCH_RESULT_GET,
                                         SpDiag::PerfLevel::MODULE);
             pt_result.Start();
+            const auto result_get_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
             auto result = co_await std::move(ret.value());
             pt_result.End(result ? 0 : -1);
+            if (breakdown_log) {
+                result_get_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_get_start)
+                        .count();
+            }
             if (!result) {
                 const ErrorCode err_code =
                     (result.error().code == coro_rpc::errc::timed_out)
@@ -603,6 +809,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                 }
                 co_return error_results;
             }
+            rpc_transport_ok = true;
             if (metrics_) {
                 auto end_time = std::chrono::steady_clock::now();
                 auto latency =
@@ -611,8 +818,37 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
                 metrics_->rpc_latency.observe(
                     {RpcNameTraits<ServiceMethod>::value}, latency.count());
             }
-            co_return result->result();
+            const auto result_parse_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+            auto response = result->result();
+            if (breakdown_log) {
+                result_parse_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - result_parse_start)
+                        .count();
+            }
+            co_return std::move(response);
         }());
+    if (breakdown_log) {
+        MC_LOG(INFO) << "master_rpc_client_breakdown method="
+                     << RpcNameTraits<ServiceMethod>::value
+                     << " pool_lookup_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            pool_end - total_start)
+                            .count()
+                     << " rpc_call_us=" << rpc_call_us
+                     << " result_get_us=" << result_get_us
+                     << " result_parse_us=" << result_parse_us
+                     << pool_timing
+                     << " total_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - total_start)
+                            .count()
+                     << " status="
+                     << (rpc_transport_ok ? "ok" : "rpc_fail");
+    }
+    return rpc_result;
 }
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>

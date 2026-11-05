@@ -14,6 +14,7 @@
 #include <chrono>
 #include <set>
 #include <unordered_set>
+#include <utility>
 
 #include "client_metric.h"
 #include "client_buffer.h"
@@ -74,6 +75,15 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    // Optional diagnostic guard. Configure before starting reads; the callable
+    // must support concurrent invocation. It sees the descriptor actually used
+    // for transfer, including a possible local hot-cache redirection.
+    using ReadReplicaValidator =
+        std::function<bool(const std::string&, const Replica::Descriptor&)>;
+    void SetReadReplicaValidator(ReadReplicaValidator validator) {
+        read_replica_validator_ = std::move(validator);
+    }
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
@@ -722,6 +732,10 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    // Inspect the actual remote transport; allocation descriptors carry a
+    // storage tag rather than the Transfer Engine segment's protocol.
+    [[nodiscard]] bool IsUbTransportSegment(const std::string& endpoint);
+
     /**
      * @brief Warmup transport-level connections to all segments
      * currently registered with the master.
@@ -845,6 +859,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    ReadReplicaValidator read_replica_validator_;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */

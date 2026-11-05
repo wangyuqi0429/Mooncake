@@ -2013,25 +2013,29 @@ PYBIND11_MODULE(store, m) {
     py::class_<MooncakeDistributedNoFRegisterPyWrapper>(
         m, "MooncakeDistributedNoFRegister")
         .def(py::init<>())
+        // Modified By Yida (v3): trtype 显式作为参数传递（RDMA/TCP/URMA），
+        // 避免依赖 MC_NOF_TRTYPE 环境变量造成 register/unregister 不一致。
         .def("real_register",
              [](MooncakeDistributedNoFRegisterPyWrapper &self,
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
+                const std::string &trtype = "",
                 uintptr_t base = 0x0, size_t size = 1024,
                 const std::string &master_server_addr = "127.0.0.1:50051") {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_register(nqn, nsid, traddr, trsvcid,
-                                                     base, size,
+                                                     trtype, base, size,
                                                      master_server_addr);
              })
         .def("real_unregister_by_endpoint",
              [](MooncakeDistributedNoFRegisterPyWrapper &self,
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
+                const std::string &trtype = "",
                 const std::string &master_server_addr = "127.0.0.1:50051") {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_unregister_by_endpoint(
-                     nqn, nsid, traddr, trsvcid, master_server_addr);
+                     nqn, nsid, traddr, trsvcid, trtype, master_server_addr);
              });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods

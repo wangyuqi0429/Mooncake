@@ -250,30 +250,46 @@ if(USE_NOF)
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
 
+  # Modified By Yida (v3): SPDK 版本兼容链接清单（v23.01 上游基线 / 26.x 本项目 fork）。
+  # - 核心库 event/nvme 任何版本都必须存在，缺失 = make install 没跑完，直接报错
+  # - 版本差异库按存在与否静默引入：26.x 将 lib/rdma 拆为 rdma_cm/rdma_provider/
+  #   rdma_utils（未开 --with-rdma 则无）、sock_posix 并入 libspdk_sock.a、
+  #   blobfs 已移除；v23.01 为单库 rdma
+  # - 其余库任何版本都应存在，缺失给 WARNING（多半是 install 不完整）
+  foreach(_lib event nvme)
+    if(NOT EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      message(FATAL_ERROR
+        "SPDK lib missing: ${SPDK_LIB_DIR}/libspdk_${_lib}.a — "
+        "回 SPDK 目录执行 sudo make install（部署文档阶段 2）")
+    endif()
+  endforeach()
+
+  set(SPDK_CORE_LIBS)
+  foreach(_lib event nvme sock_posix rdma rdma_cm rdma_provider rdma_utils)
+    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      list(APPEND SPDK_CORE_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
+    endif()
+  endforeach()
+
+  set(SPDK_OPTIONAL_LIBS)
+  foreach(_lib vfio_user dma init env_dpdk log util blob bdev conf json jsonrpc sock thread trace vmd rpc keyring keyring_file keyring_linux fuse_dispatcher)
+    if(EXISTS "${SPDK_LIB_DIR}/libspdk_${_lib}.a")
+      list(APPEND SPDK_OPTIONAL_LIBS ${SPDK_LIB_DIR}/libspdk_${_lib}.a)
+    else()
+      message(WARNING "SPDK lib not found (skipped): libspdk_${_lib}.a in ${SPDK_LIB_DIR}")
+    endif()
+  endforeach()
+
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/SpdkLinkDependencies.cmake)
+  mooncake_spdk_check_core_dpdk("${DPDK_LIB_DIR}")
+  mooncake_spdk_split_dpdk_libs(SPDK_SPLIT_DPDK_LIBS "${DPDK_LIB_DIR}")
+  mooncake_spdk_fuse_lib(SPDK_FUSE_LIB "${SPDK_LIB_DIR}")
+
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
-      ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_LIB_DIR}/libspdk_rdma.a
-      ${SPDK_LIB_DIR}/libspdk_nvme.a
-      ${SPDK_LIB_DIR}/libspdk_sock_posix.a
+      ${SPDK_CORE_LIBS}
       -Wl,--no-whole-archive
-      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
-      ${SPDK_LIB_DIR}/libspdk_dma.a
-      ${SPDK_LIB_DIR}/libspdk_init.a
-      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
-      ${SPDK_LIB_DIR}/libspdk_log.a
-      ${SPDK_LIB_DIR}/libspdk_util.a
-      ${SPDK_LIB_DIR}/libspdk_blob.a
-      ${SPDK_LIB_DIR}/libspdk_blobfs.a
-      ${SPDK_LIB_DIR}/libspdk_bdev.a
-      ${SPDK_LIB_DIR}/libspdk_conf.a
-      ${SPDK_LIB_DIR}/libspdk_json.a
-      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
-      ${SPDK_LIB_DIR}/libspdk_sock.a
-      ${SPDK_LIB_DIR}/libspdk_thread.a
-      ${SPDK_LIB_DIR}/libspdk_trace.a
-      ${SPDK_LIB_DIR}/libspdk_vmd.a
-      ${SPDK_LIB_DIR}/libspdk_rpc.a
+      ${SPDK_OPTIONAL_LIBS}
       ${DPDK_LIB_DIR}/librte_eal.a
       ${DPDK_LIB_DIR}/librte_mempool.a
       ${DPDK_LIB_DIR}/librte_ring.a
@@ -293,6 +309,7 @@ if(USE_NOF)
       ${DPDK_LIB_DIR}/librte_cryptodev.a
       ${DPDK_LIB_DIR}/librte_hash.a
       ${DPDK_LIB_DIR}/librte_rcu.a
+      ${SPDK_SPLIT_DPDK_LIBS}
       pthread
       dl
       numa
@@ -307,7 +324,70 @@ if(USE_NOF)
       ibverbs
       rdmacm
       ssl
-      bsd)
+      bsd
+      ${SPDK_FUSE_LIB})
+
+  # Modified By Yida (v3): URMA transport (UMDK)。libspdk_nvme.a 中的 URMA
+  # object 引用 liburma 符号，必须出现在链接列表（此处 SPDK_STATIC_LIBS 整体
+  # 挂到 mooncake_store 的 PUBLIC libs，位置在 nvme 之后满足符号解析）。
+  # 通过 -DUMDK_ROOT=/path/to/umdk-prefix 指定 UMDK 安装前缀。
+  if(USE_NOF_URMA)
+    # Modified By Yida (v6): /usr/local 装的是不含 URMA transport 的 SPDK
+    # （如上游 v23.01 残留）时，缺符号/缺声明会拖到编译或链接期且难定位
+    # （系统遮蔽——报错路径含 /usr/local/include 即旧版遮蔽的指纹）。
+    # nvme_urma.h 是本项目 fork SPDK 的标志头文件，在此提前校验。
+    if(NOT EXISTS "${SPDK_INCLUDE_DIR}/spdk/nvme_urma.h")
+      message(
+        FATAL_ERROR
+          "USE_NOF_URMA=ON but ${SPDK_INCLUDE_DIR}/spdk/nvme_urma.h not found — "
+          "installed SPDK has no URMA transport. 确认 urma_modified_v6 分支产物"
+          "已 make install 到 /usr/local（部署文档阶段 2），或用 -DSPDK_INCLUDE_DIR="
+          "指向正确前缀")
+    endif()
+    set(UMDK_ROOT
+        ""
+        CACHE PATH "UMDK install prefix for the SPDK URMA transport")
+    find_path(
+      URMA_INCLUDE_DIR
+      NAMES urma_api.h
+      HINTS ${UMDK_ROOT}
+      PATHS /usr /usr/local
+      PATH_SUFFIXES include/ub/umdk/urma include/ub/umdk include)
+    find_library(
+      URMA_LIBRARY
+      NAMES urma
+      HINTS ${UMDK_ROOT}
+      PATHS /usr /usr/local
+      PATH_SUFFIXES lib64 lib build/lib lib)
+    if(NOT URMA_INCLUDE_DIR OR NOT URMA_LIBRARY)
+      message(
+        FATAL_ERROR
+          "USE_NOF_URMA=ON but UMDK (urma_api.h / liburma) not found; \
+pass -DUMDK_ROOT=/path/to/umdk-prefix")
+    endif()
+    message(STATUS "NoF URMA: include=${URMA_INCLUDE_DIR} lib=${URMA_LIBRARY}")
+    include(CheckCXXSourceCompiles)
+    set(_NOF_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+    set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR}
+                                ${URMA_INCLUDE_DIR})
+    check_cxx_source_compiles("
+#include <spdk/nvme_urma.h>
+static_assert(sizeof(decltype(&spdk_nvme_urma_register_memory_for_qpair)) > 0);
+int main() { return 0; }
+" HAVE_SPDK_URMA_WHOLE_POOL)
+    set(CMAKE_REQUIRED_INCLUDES ${_NOF_REQUIRED_INCLUDES})
+    unset(_NOF_REQUIRED_INCLUDES)
+    list(APPEND SPDK_STATIC_LIBS ${URMA_LIBRARY})
+  endif()
+
+  # Modified By Yida (v3): NoF GPU Direct —— provider 使用 CUDA driver API
+  # (cuMemGetAddressRange / DMA-BUF export)。提前探测 CUDAToolkit，供后段
+  # USE_CUDA 块复用（后续会统一加 USE_CUDA 宏、cudart 与 include 目录）。
+  if(USE_NOF_GPU_DIRECT)
+    find_package(CUDAToolkit REQUIRED)
+    message(STATUS "NoF GPU Direct: CUDA driver library required for provider")
+    list(APPEND SPDK_STATIC_LIBS CUDA::cuda_driver)
+  endif()
 endif()
 
 # The cache_allocator library
@@ -324,6 +404,12 @@ target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
 if(USE_NOF)
   target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
                                                     ${DPDK_INCLUDE_DIR})
+  if(USE_NOF_URMA)
+    target_include_directories(mooncake_store PRIVATE ${URMA_INCLUDE_DIR})
+    if(HAVE_SPDK_URMA_WHOLE_POOL)
+      target_compile_definitions(mooncake_store PRIVATE HAVE_SPDK_URMA_WHOLE_POOL=1)
+    endif()
+  endif()
 endif()
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 if(STORE_USE_REDIS)
@@ -550,3 +636,12 @@ if(WITH_STORE_C_SHARED)
     "$<$<CONFIG:Release>:-Wl,-s>")
   install(TARGETS mooncake_store_c DESTINATION lib)
 endif()
+
+# NoF segment register/unregister tools (local helper binaries)
+add_executable(nof_register nof_register.cpp)
+target_link_libraries(nof_register PRIVATE mooncake_store mooncake_common pthread asio_shared SpDiag::spdiag_lib)
+target_link_options(nof_register PRIVATE "LINKER:--as-needed")
+
+add_executable(nof_unregister nof_unregister.cpp)
+target_link_libraries(nof_unregister PRIVATE mooncake_store mooncake_common pthread asio_shared SpDiag::spdiag_lib)
+target_link_options(nof_unregister PRIVATE "LINKER:--as-needed")

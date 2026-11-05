@@ -19,11 +19,17 @@ class MooncakeNoFUnregister:
     Unregisters SSDs from Mooncake master server by endpoint information.
     """
 
-    def __init__(self, cli_config: dict = None, spdk_targets: List[str] = None):
+    def __init__(self, cli_config: dict = None, spdk_targets: List[str] = None,
+                 transport_type: str = "RDMA"):
         self.register = None
         self.config_list: List[Dict[str, Any]] = []
         self.cli_config = cli_config or {}
         self.spdk_targets = spdk_targets or []
+        # Modified By Yida (v3): transport 显式指定（RDMA/TCP/URMA）——
+        # segment 名即完整 endpoint 字符串，trtype 必须与注册时一致
+        self.transport_type = (transport_type or "RDMA").upper()
+        if self.transport_type not in ("RDMA", "TCP", "URMA"):
+            raise ValueError(f"Unsupported transport type: {transport_type}")
         self._setup_logging()
 
         try:
@@ -149,8 +155,9 @@ class MooncakeNoFUnregister:
             nqn = target.get('nqn', default_nqn)
 
             # Default transport parameters
+            # Modified By Yida (v3): target 显式指定 trtype 优先，否则用全局 --transport-type
             trsvcid = int(target.get('port', '4420'))
-            trtype = target.get('trtype', 'RDMA')
+            trtype = (target.get('trtype') or self.transport_type).upper()
 
             # Create SSD config for each namespace (or specified ns only)
             if specified_ns is not None:
@@ -160,6 +167,7 @@ class MooncakeNoFUnregister:
                     'nsid': specified_ns,
                     'traddr': ip,
                     'trsvcid': trsvcid,
+                    'trtype': trtype,
                     'base': 0,
                     'size': 0,  # Size is not needed for unregister
                     'master_server_address': master_server_address,
@@ -187,9 +195,20 @@ class MooncakeNoFUnregister:
                         if not subsystem_nqn or not listen_addresses:
                             continue
 
-                        # Get transport info from first listen address
-                        traddr = listen_addresses[0].get('traddr')
-                        target_trsvcid = listen_addresses[0].get('trsvcid')
+                        # Modified By Yida (v3): 按 transport 类型选择 listener，
+                        # 不再固定取 listen_addresses[0]
+                        listener = next(
+                            (item for item in listen_addresses
+                             if item.get('trtype', '').upper() == trtype),
+                            None)
+                        if listener is None:
+                            logging.warning(
+                                "No %s listener found on nqn=%s (available: %s), skipping",
+                                trtype, subsystem_nqn,
+                                [item.get('trtype') for item in listen_addresses])
+                            continue
+                        traddr = listener.get('traddr')
+                        target_trsvcid = listener.get('trsvcid')
 
                         if not traddr or not target_trsvcid:
                             continue
@@ -212,6 +231,7 @@ class MooncakeNoFUnregister:
                                 'nsid': nsid,
                                 'traddr': traddr,
                                 'trsvcid': current_trsvcid,
+                                'trtype': trtype,
                                 'base': 0,
                                 'size': 0,  # Size is not needed for unregister
                                 'master_server_address': master_server_address,
@@ -229,6 +249,7 @@ class MooncakeNoFUnregister:
                         'nsid': 1,
                         'traddr': ip,
                         'trsvcid': trsvcid,
+                        'trtype': trtype,
                         'base': 0,
                         'size': 0,
                         'master_server_address': master_server_address,
@@ -245,6 +266,7 @@ class MooncakeNoFUnregister:
                     'nsid': 1,
                     'traddr': ip,
                     'trsvcid': trsvcid,
+                    'trtype': trtype,
                     'base': 0,
                     'size': 0,
                     'master_server_address': master_server_address,
@@ -275,11 +297,13 @@ class MooncakeNoFUnregister:
 
                 # Create register instance and unregister SSD
                 self.register = MooncakeDistributedNoFRegister()
+                # Modified By Yida (v3): trtype 作为显式参数传入，必须与注册时一致
                 ret = self.register.real_unregister_by_endpoint(
                     cfg["nqn"],
                     cfg["nsid"],
                     cfg["traddr"],
                     cfg["trsvcid"],
+                    cfg.get("trtype", self.transport_type),
                     cfg["master_server_address"]
                 )
 
@@ -319,6 +343,11 @@ def parse_arguments():
                         help='SSH password for target nodes')
     parser.add_argument('--key-file', type=str,
                         help='SSH private key file path')
+    # Modified By Yida (v3): 显式指定 transport 类型，按 trtype 选择 listener
+    parser.add_argument('--transport-type', type=str, default='RDMA',
+                        choices=['RDMA', 'TCP', 'URMA'],
+                        help='Transport type for NoF listeners (default: RDMA; '
+                             'must match the value used at registration)')
     parser.add_argument('-D', '--define', action='append',
                         help='Override configuration fields globally (e.g., -Dtrsvcid=4420)',
                         default=[])
@@ -352,7 +381,8 @@ def main():
     if args.key_file:
         cli_config['key_file'] = args.key_file
 
-    unregister = MooncakeNoFUnregister(cli_config, args.spdk_target_info)
+    unregister = MooncakeNoFUnregister(cli_config, args.spdk_target_info,
+                                       transport_type=args.transport_type)
     success = unregister.start_ssd_unregister_service()
     if not success:
         exit(1)

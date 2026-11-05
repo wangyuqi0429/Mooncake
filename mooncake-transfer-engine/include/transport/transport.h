@@ -140,6 +140,10 @@ class Transport {
         using CleanupCallback = void (*)(Slice *);
         CleanupCallback cleanup_callback = nullptr;
 
+        // Transport instrumentation runs before completion becomes visible.
+        using CompletionCallback = void (*)(Slice *, bool);
+        CompletionCallback completion_callback = nullptr;
+
         union {
             struct {
                 uint64_t dest_addr;
@@ -200,6 +204,7 @@ class Transport {
 
        public:
         void markSuccess() {
+            notifyCompletion(true);
             status = Slice::SUCCESS;
             // Completion timestamp (CLOCK_REALTIME ns, same clock as Slice::ts)
             // for per-member latency observability. Stamped before publishing
@@ -221,6 +226,7 @@ class Transport {
         }
 
         void markFailed() {
+            notifyCompletion(false);
             status = Slice::FAILED;
             {
                 struct timespec now;
@@ -242,6 +248,12 @@ class Transport {
         volatile int64_t done_ts = 0;
 
        private:
+        void notifyCompletion(bool success) {
+            auto callback = completion_callback;
+            completion_callback = nullptr;
+            if (callback) callback(this, success);
+        }
+
         inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto &batch_desc = toBatchDesc(task->batch_id);
@@ -331,6 +343,7 @@ class Transport {
             // transport-specific cleanup callback into its next use.
             auto cleanup = slice->cleanup_callback;
             slice->cleanup_callback = nullptr;
+            slice->completion_callback = nullptr;
             if (cleanup) cleanup(slice);
 
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {

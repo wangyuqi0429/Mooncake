@@ -125,6 +125,8 @@ PERF_KEY_DEF(GET_SSD_OWNER_RPC_RESUME,       "real_client.cpp::batch_get_offload
 PERF_KEY_DEF(GET_SSD_OWNER_RELEASE,          "file_storage.cpp::ReleaseBuffer",                          "OwnerReleaseBuffer")
 
 // === UB / URMA endpoint first connection path ===
+PERF_KEY_DEF(UB_WORKER_POST_SEND,            "ub_context.cpp::performPostSend",                          "PostSendCall")
+PERF_KEY_DEF(UB_WORKER_POLL,                 "ub_context.cpp::performPoll",                              "PollCall")
 PERF_KEY_DEF(UB_HANDSHAKE_ENCODE,            "transfer_metadata.cpp::TransferHandshakeUtil::encode",     "Encode")
 PERF_KEY_DEF(UB_HANDSHAKE_DECODE,            "transfer_metadata.cpp::TransferHandshakeUtil::decode",     "Decode")
 PERF_KEY_DEF(UB_ENDPOINT_CONSTRUCT,          "urma_endpoint.cpp::construct",                            "Construct")

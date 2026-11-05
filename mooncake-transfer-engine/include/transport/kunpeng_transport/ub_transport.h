@@ -52,6 +52,15 @@ class UbTransport : public Transport {
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
 
+    // GPU memory access path selected per-process via MC_UB_GPU_MODE.
+    enum class UbGpuMode {
+        kHost,        // host (default): CPU memory only, no GPU involvement
+        kStaging,     // staging: GPU buffer + host staging buffer (NIC only
+                      //         sees host memory, cudaMemcpy does H2D/D2H)
+        kGdrPeermem,  // gdr-peermem: NIC directly DMA GPU HBM via peermem
+                      //              (seg_cfg.is_gpu_seg = 1)
+    };
+
    public:
     UbTransport(UB_ENDPOINT_TYPE endpoint_type = URMA_ENDPOINT);
 
@@ -121,6 +130,8 @@ class UbTransport : public Transport {
     };
 
     bool stagingEnabled() const;
+    UbGpuMode gpuMode() const;
+    const char* gpuModeName() const;
     bool isDevicePointer(const void* ptr) const;
     bool isLogicalDeviceRange(const void* ptr, size_t length) const;
     int registerLogicalDeviceRegion(void* addr, size_t length,
@@ -183,6 +194,8 @@ class UbTransport : public Transport {
 
     mutable std::once_flag staging_config_once_;
     mutable bool staging_enabled_ = false;
+    mutable std::once_flag gpu_mode_once_;
+    mutable UbGpuMode gpu_mode_ = UbGpuMode::kStaging;
     mutable std::mutex device_region_mutex_;
     std::vector<DeviceRegion> device_regions_;
     std::mutex staging_pool_mutex_;

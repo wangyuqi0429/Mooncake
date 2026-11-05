@@ -659,6 +659,21 @@ void loadGlobalConfig(GlobalConfig& config) {
         config.urma_bonding_balance = true;
     }
 
+    const char* eid_index_env = std::getenv("MC_EID_INDEX");
+    if (eid_index_env) {
+        int value = -1;
+        const char* end = eid_index_env + std::strlen(eid_index_env);
+        auto parsed = std::from_chars(eid_index_env, end, value);
+        if (parsed.ec != std::errc() || parsed.ptr != end || value < 0) {
+            config.eid_index = -1;
+            LOG(ERROR) << "Invalid MC_EID_INDEX='" << eid_index_env
+                       << "': expected a non-negative decimal int; "
+                          "UB context creation will fail";
+        } else {
+            config.eid_index = value;
+        }
+    }
+
     const char* urma_trans_mode_env = std::getenv("MC_URMA_TRANS_MODE");
     if (urma_trans_mode_env && *urma_trans_mode_env) {
         std::string val(urma_trans_mode_env);
@@ -809,6 +824,7 @@ void dumpGlobalConfig() {
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "
               << (config.track_rdma_posted_slices ? "true" : "false");
+    LOG(INFO) << "eid_index = " << config.eid_index;
     LOG(INFO) << "urma_trans_mode = " << config.urma_trans_mode;
     LOG(INFO) << "urma_bonding_balance = "
               << (config.urma_bonding_balance ? "true" : "false");

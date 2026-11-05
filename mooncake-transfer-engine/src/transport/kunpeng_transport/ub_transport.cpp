@@ -25,6 +25,7 @@
 #include "memory_location.h"
 #include <cassert>
 #include "ub_allocator.h"
+#include "ub_gpu_direct_stats.h"
 #include "transport/kunpeng_transport/ub_context.h"
 #include "transport/kunpeng_transport/ub_transport.h"
 #include "transport/kunpeng_transport/ub_endpoint.h"
@@ -93,6 +94,50 @@ bool UbTransport::stagingEnabled() const {
                   << (staging_enabled_ ? "enabled" : "disabled");
     });
     return staging_enabled_;
+}
+
+UbTransport::UbGpuMode UbTransport::gpuMode() const {
+    std::call_once(gpu_mode_once_, [this] {
+        const char* env = std::getenv("MC_UB_GPU_MODE");
+        if (env) {
+            std::string mode(env);
+            if (mode == "host") {
+                gpu_mode_ = UbGpuMode::kHost;
+            } else if (mode == "staging") {
+                gpu_mode_ = UbGpuMode::kStaging;
+            } else if (mode == "gdr-peermem") {
+                gpu_mode_ = UbGpuMode::kGdrPeermem;
+            } else {
+                LOG(WARNING) << "Unknown MC_UB_GPU_MODE=\"" << mode
+                             << "\", fallback to staging";
+                gpu_mode_ = UbGpuMode::kStaging;
+            }
+            LOG(INFO) << "UbTransport GPU mode: " << gpuModeName();
+            return;
+        }
+        // Legacy: derive from MC_UB_TRANSPORT_CPU_STAGING. Staging enabled
+        // (default) maps to kStaging; disabled maps to kHost. This preserves
+        // the original CPU-staging behavior when MC_UB_GPU_MODE is unset.
+        const char* env_legacy = std::getenv("MC_UB_TRANSPORT_CPU_STAGING");
+        gpu_mode_ = (!env_legacy || std::string(env_legacy) != "0")
+                        ? UbGpuMode::kStaging
+                        : UbGpuMode::kHost;
+        LOG(INFO) << "UbTransport GPU mode: " << gpuModeName()
+                  << " (derived from MC_UB_TRANSPORT_CPU_STAGING)";
+    });
+    return gpu_mode_;
+}
+
+const char* UbTransport::gpuModeName() const {
+    switch (gpu_mode_) {
+        case UbGpuMode::kHost:
+            return "host";
+        case UbGpuMode::kStaging:
+            return "staging";
+        case UbGpuMode::kGdrPeermem:
+            return "gdr-peermem";
+    }
+    return "unknown";
 }
 
 bool UbTransport::isDevicePointer(const void* ptr) const {
@@ -441,20 +486,34 @@ int UbTransport::registerLocalMemory(void* addr, size_t length,
                                      const std::string& name,
                                      bool remote_accessible,
                                      bool update_metadata) {
-    if (isDevicePointer(addr)) {
-        if (!stagingEnabled()) {
-            LOG(ERROR) << "UbTransport: refusing to register device memory "
-                          "while CPU staging is disabled, addr="
+    const bool is_device_ptr = isDevicePointer(addr);
+    UbMemoryRegionType region_type = UbMemoryRegionType::kHost;
+
+    if (is_device_ptr) {
+        const auto mode = gpuMode();
+        if (mode == UbGpuMode::kGdrPeermem) {
+            // gdr-peermem: register the GPU region directly so URMA uses the
+            // peermem DMA path on the receiver (seg_cfg.is_gpu_seg = 1). The
+            // GPU VA is posted to the NIC as-is; no host staging buffer.
+            region_type = UbMemoryRegionType::kGpu;
+            VLOG(1) << "[ub_gdr] registering GPU region addr=" << addr
+                    << " length=" << length;
+            // fall through to the common registration body below.
+        } else if (mode == UbGpuMode::kStaging) {
+            return registerLogicalDeviceRegion(addr, length, name,
+                                               remote_accessible);
+        } else {
+            LOG(ERROR) << "UbTransport: refusing to register device memory in "
+                          "host mode, addr="
                        << addr << " length=" << length;
             return ERR_INVALID_ARGUMENT;
         }
-        return registerLogicalDeviceRegion(addr, length, name,
-                                           remote_accessible);
     }
 
     BufferDesc buffer_desc;
     for (auto& context : context_list_) {
-        int ret = context->registerMemoryRegion((uint64_t)addr, length);
+        int ret = context->registerMemoryRegion((uint64_t)addr, length,
+                                                 region_type);
         if (ret) {
             LOG(ERROR) << "UbTransport: cannot register LocalMemory";
             return ret;
@@ -605,47 +664,62 @@ Status UbTransport::submitTransferTask(
         std::shared_ptr<StagingState> staging_state;
         StagingLease staging_lease;
         bool staged_request = false;
+        bool direct_gpu_request = false;
 
         if (isDevicePointer(request.source)) {
-            if (!stagingEnabled()) {
+            const auto mode = gpuMode();
+            if (mode == UbGpuMode::kGdrPeermem) {
+                direct_gpu_request = true;
+                // Direct DMA: NIC reads/writes GPU HBM via peermem. The GPU VA
+                // (request.source) was registered with is_gpu_seg=1, so post it
+                // as-is -- no staging copy, effective_source unchanged.
+                VLOG(1) << "[ub_gdr] direct transfer gpu_va=" << request.source
+                        << " length=" << request.length << " opcode="
+                        << (request.opcode == TransferRequest::WRITE ? "WRITE"
+                                                                      : "READ");
+            } else if (mode == UbGpuMode::kStaging) {
+                if (!isLogicalDeviceRange(request.source, request.length)) {
+                    return Status::AddressNotRegistered(
+                        "UbTransport: device pointer is not registered as a "
+                        "logical UB device region, address: " +
+                        std::to_string(
+                            reinterpret_cast<uintptr_t>(request.source)));
+                }
+                auto staging_status =
+                    acquireStaging(request.length, staging_lease);
+                if (!staging_status.ok()) return staging_status;
+
+                staging_state = std::make_shared<StagingState>();
+                if (!staging_state) {
+                    releaseStaging(staging_lease);
+                    return Status::Memory("UbTransport: allocate staging state");
+                }
+                staging_state->original_device_ptr = request.source;
+                staging_state->staging_ptr = staging_lease.host_ptr;
+                staging_state->size = request.length;
+                staging_state->lease_size = staging_lease.size;
+                staging_state->opcode = request.opcode;
+                staging_state->total_slices =
+                    countUbSlices(request.length, kBlockSize, kFragmentSize);
+                effective_source = staging_state->staging_ptr;
+                staged_request = true;
+                GetUbGpuDirectCounters().Stage(request.length);
+
+                if (request.opcode == TransferRequest::WRITE &&
+                    !copyDeviceToHost(staging_state->staging_ptr,
+                                      request.source, request.length)) {
+                    LOG(ERROR)
+                        << "UbTransport: D2H staging copy failed for WRITE, "
+                           "size="
+                        << request.length << " src=" << request.source;
+                    releaseStaging(staging_lease);
+                    return Status::Memory("UbTransport: D2H staging copy failed");
+                }
+                attachStaging(&task, staging_state);
+            } else {
                 return Status::InvalidArgument(
-                    "UbTransport: device pointer requires CPU staging");
+                    "UbTransport: device pointer not allowed in host mode");
             }
-            if (!isLogicalDeviceRange(request.source, request.length)) {
-                return Status::AddressNotRegistered(
-                    "UbTransport: device pointer is not registered as a "
-                    "logical UB device region, address: " +
-                    std::to_string(
-                        reinterpret_cast<uintptr_t>(request.source)));
-            }
-            auto staging_status = acquireStaging(request.length, staging_lease);
-            if (!staging_status.ok()) return staging_status;
-
-            staging_state = std::make_shared<StagingState>();
-            if (!staging_state) {
-                releaseStaging(staging_lease);
-                return Status::Memory("UbTransport: allocate staging state");
-            }
-            staging_state->original_device_ptr = request.source;
-            staging_state->staging_ptr = staging_lease.host_ptr;
-            staging_state->size = request.length;
-            staging_state->lease_size = staging_lease.size;
-            staging_state->opcode = request.opcode;
-            staging_state->total_slices =
-                countUbSlices(request.length, kBlockSize, kFragmentSize);
-            effective_source = staging_state->staging_ptr;
-            staged_request = true;
-
-            if (request.opcode == TransferRequest::WRITE &&
-                !copyDeviceToHost(staging_state->staging_ptr, request.source,
-                                  request.length)) {
-                LOG(ERROR)
-                    << "UbTransport: D2H staging copy failed for WRITE, size="
-                    << request.length << " src=" << request.source;
-                releaseStaging(staging_lease);
-                return Status::Memory("UbTransport: D2H staging copy failed");
-            }
-            attachStaging(&task, staging_state);
         }
 
         auto local_segment_desc =
@@ -684,6 +758,16 @@ Status UbTransport::submitTransferTask(
             slice->target_id = request.target_id;
             slice->ts = 0;
             slice->status = Slice::PENDING;
+            slice->completion_callback = nullptr;
+            if (direct_gpu_request) {
+                GetUbGpuDirectCounters().Submit(
+                    request.opcode == TransferRequest::WRITE, slice->length);
+                slice->completion_callback = [](Slice* completed, bool success) {
+                    GetUbGpuDirectCounters().Complete(
+                        completed->opcode == TransferRequest::WRITE,
+                        success, completed->length);
+                };
+            }
             slice->ub.src_chip_id = INVALID_CHIP_ID;
             slice->ub.dst_chip_id = INVALID_CHIP_ID;
             task.slice_list.push_back(slice);

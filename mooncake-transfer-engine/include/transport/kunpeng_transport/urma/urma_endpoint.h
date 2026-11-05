@@ -57,7 +57,9 @@ class UrmaContext : public UbContext {
     UrmaContext(UbTransport& engine, std::string device_name,
                 int max_endpoints);
     ~UrmaContext();
-    int registerMemoryRegion(uint64_t va, size_t length) override;
+    int registerMemoryRegion(
+        uint64_t va, size_t length,
+        UbMemoryRegionType type = UbMemoryRegionType::kHost) override;
     int unregisterMemoryRegion(uint64_t va) override;
     int doProcessContextEvents() override;
     void* retrieveRemoteSeg(const std::string& value) override;

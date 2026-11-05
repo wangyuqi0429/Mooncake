@@ -8193,7 +8193,13 @@ auto MasterService::AllocateAndInsertMetadata(
             pt_alloc_mem.End(allocation_result.has_value() ? 0 : -1);
         }  // allocator_access 在此释放；远程转发在锁外执行，避免分布式死锁
 
-        if (!allocation_result.has_value()) {
+        if (config.replica_num == 0) {
+            // Pure NoF mode (MC_MEM_REPLICA_NUM=0): memory allocation was not
+            // attempted. allocation_result stays at initial NO_AVAILABLE_HANDLE.
+            // Skip the memory failure handler so we fall through to the NoF
+            // allocation block below instead of returning early.
+            VLOG(1) << "Skipping memory allocation, proceeding to NoF for key=" << key;
+        } else if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas locally for key=" << key
                     << ", error: " << allocation_result.error();
             // CVM 多 submaster（方案 B 第二阶段）：本机本地分配失败（未挂载

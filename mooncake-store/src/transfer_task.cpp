@@ -11,6 +11,8 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <vector>
 #include "device/accelerator_registry.h"
 #include "mooncake_logging.h"
@@ -19,6 +21,35 @@
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
+
+namespace {
+#ifndef USE_EVENT_DRIVEN_COMPLETION
+// UB has dedicated posting/polling workers. Long Store-side busy waits can
+// compete with those workers; retain a short spin for fast completions first.
+int ReadUbPollDelayUs(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (!value) return default_value;
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno || end == value || *end || parsed < 0 || parsed > 1000000) {
+        LOG(WARNING) << "Invalid " << name << "; using " << default_value;
+        return default_value;
+    }
+    return static_cast<int>(parsed);
+}
+
+int UbPollSpinUs() {
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SPIN_US", 50);
+    return value;
+}
+
+int UbPollSleepUs() {
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SLEEP_US", 50);
+    return value;
+}
+#endif
+}  // namespace
 
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
@@ -54,6 +85,31 @@ static int GetSpdkNofDebugIntervalMs() {
     }();
     return interval_ms;
 }
+
+namespace mooncake {
+int64_t GetSpdkNofSlowTraceThresholdUs() {
+    static const int64_t threshold_us = []() -> int64_t {
+        const char* raw_value =
+            std::getenv("MC_NOF_SLOW_TRACE_THRESHOLD_US");
+        if (!raw_value || raw_value[0] == '\0') {
+            return 0;
+        }
+        errno = 0;
+        char* end_ptr = nullptr;
+        const long long parsed = std::strtoll(raw_value, &end_ptr, 10);
+        if (errno != 0 || end_ptr == raw_value ||
+            (end_ptr != nullptr && *end_ptr != '\0') || parsed < 0 ||
+            parsed > 60000000) {
+            LOG(WARNING) << "Invalid value for "
+                         << "MC_NOF_SLOW_TRACE_THRESHOLD_US: " << raw_value
+                         << ", disabling slow trace";
+            return 0;
+        }
+        return static_cast<int64_t>(parsed);
+    }();
+    return threshold_us;
+}
+}  // namespace mooncake
 
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
@@ -104,14 +160,275 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
     return count;
 }
 
-static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
-    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
-        task->state->set_completed(task->failed
-                                       ? mooncake::ErrorCode::TRANSFER_FAIL
-                                       : mooncake::ErrorCode::OK);
-        if (!task->on_chain) {
-            delete task;
+static inline int64_t ElapsedMicros(
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(end - begin)
+        .count();
+}
+
+static inline int64_t SteadyNanos(
+    std::chrono::steady_clock::time_point value) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               value.time_since_epoch())
+        .count();
+}
+
+static inline void MarkNofTaskAsQosHead(
+    mooncake::SpdkNofQos* nof_qos, mooncake::SpdkNofTask* task,
+    std::chrono::steady_clock::time_point now) {
+    if (task && task->timing &&
+        task->timing->qos_head_at ==
+            std::chrono::steady_clock::time_point{}) {
+        task->timing->qos_head_at = now;
+        const auto counter_delta = [](uint64_t current, uint64_t start) {
+            return static_cast<int64_t>(current >= start ? current - start : 0);
+        };
+        task->timing->qos_fifo_full_wait_us = counter_delta(
+            nof_qos->inflight_full_with_pending_us,
+            task->timing->qos_full_pending_at_enqueue_us);
+        task->timing->qos_fifo_partial_wait_us = counter_delta(
+            nof_qos->inflight_partial_with_pending_us,
+            task->timing->qos_partial_pending_at_enqueue_us);
+        task->timing->qos_fifo_zero_wait_us = counter_delta(
+            nof_qos->inflight_zero_with_pending_us,
+            task->timing->qos_zero_pending_at_enqueue_us);
+    }
+}
+
+static inline void StartNofCreditWait(
+    mooncake::SpdkNofTask* task,
+    std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && !task->timing->credit_wait_active) {
+        task->timing->credit_wait_active = true;
+        task->timing->credit_wait_started_at = now;
+    }
+}
+
+static inline void StopNofCreditWait(
+    mooncake::SpdkNofTask* task,
+    std::chrono::steady_clock::time_point now) {
+    if (task && task->timing && task->timing->credit_wait_active) {
+        task->timing->credit_wait_us +=
+            ElapsedMicros(task->timing->credit_wait_started_at, now);
+        task->timing->credit_wait_active = false;
+    }
+}
+
+static inline void UpdateNofOccupancy(
+    mooncake::SpdkNofQos* nof_qos,
+    std::chrono::steady_clock::time_point now) {
+    const auto elapsed_us = static_cast<uint64_t>(
+        std::max<int64_t>(0, ElapsedMicros(nof_qos->last_occupancy_update,
+                                           now)));
+    nof_qos->last_occupancy_update = now;
+
+    const int inflight = nof_qos->inflight_blocks[0] +
+                         nof_qos->inflight_blocks[1];
+    const bool pending = !nof_qos->Empty();
+    nof_qos->occupancy_total_us += elapsed_us;
+    if (inflight == 0) {
+        if (pending) {
+            nof_qos->occupancy_active_us += elapsed_us;
+            nof_qos->inflight_zero_with_pending_us += elapsed_us;
+        } else {
+            nof_qos->inflight_idle_us += elapsed_us;
         }
+        return;
+    }
+
+    nof_qos->occupancy_active_us += elapsed_us;
+    if (inflight >= nof_qos->inflight_blocks_limit) {
+        nof_qos->inflight_full_us += elapsed_us;
+        if (pending) nof_qos->inflight_full_with_pending_us += elapsed_us;
+    } else {
+        nof_qos->inflight_partial_us += elapsed_us;
+        if (pending) nof_qos->inflight_partial_with_pending_us += elapsed_us;
+    }
+}
+
+static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
+    // A failed completion may leave a task on the QoS queue. Publish only
+    // after it is popped, so the queue and callback cannot complete it twice.
+    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0 &&
+        !task->on_chain) {
+        const uint64_t lane_completion_sequence =
+            task->nof_qos ? ++task->nof_qos->completed_task_sequence : 0;
+        std::optional<mooncake::NofTransferTiming> timing;
+        if (task->timing && task->first_sub_io_submitted &&
+            task->timing->submitted_sub_io_count > 0 &&
+            task->timing->completed_sub_io_count > 0 &&
+            task->timing->worker_dequeued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_enqueued_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->qos_head_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->last_submit_at !=
+                std::chrono::steady_clock::time_point{} &&
+            task->timing->first_completion_at !=
+                std::chrono::steady_clock::time_point{}) {
+            const auto completed_at = std::chrono::steady_clock::now();
+            auto elapsed_us = [](auto begin, auto end) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(
+                           end - begin)
+                    .count();
+            };
+            timing.emplace();
+            timing->worker_index = task->worker_index;
+            timing->lane = task->io_lane_index;
+            timing->qpair_id =
+                mooncake::SpdkWrapper::GetInstance().GetIoLaneQpairId(
+                    task->io_lane);
+            timing->sub_io_count = task->timing->submitted_sub_io_count;
+            timing->lane_task_sequence = task->timing->lane_task_sequence;
+            timing->lane_completion_sequence = lane_completion_sequence;
+            timing->qos_tasks_ahead_at_enqueue =
+                task->timing->qos_tasks_ahead_at_enqueue;
+            timing->dispatch_queue_us =
+                elapsed_us(task->queued_at, task->timing->worker_dequeued_at);
+            timing->worker_setup_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->qos_enqueued_at);
+            timing->qos_fifo_wait_us =
+                elapsed_us(task->timing->qos_enqueued_at,
+                           task->timing->qos_head_at);
+            timing->qos_fifo_full_wait_us =
+                task->timing->qos_fifo_full_wait_us;
+            timing->qos_fifo_partial_wait_us =
+                task->timing->qos_fifo_partial_wait_us;
+            timing->qos_fifo_zero_wait_us =
+                task->timing->qos_fifo_zero_wait_us;
+            timing->head_to_first_submit_us =
+                elapsed_us(task->timing->qos_head_at,
+                           task->timing->first_submit_at);
+            timing->credit_wait_us = task->timing->credit_wait_us;
+            timing->first_credit_wait_us =
+                task->timing->first_credit_wait_us;
+            timing->qos_queue_us =
+                elapsed_us(task->timing->worker_dequeued_at,
+                           task->timing->first_submit_at);
+            timing->queue_to_first_submit_us =
+                elapsed_us(task->queued_at, task->timing->first_submit_at);
+            timing->first_to_last_submit_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->last_submit_at);
+            timing->last_submit_to_complete_us =
+                elapsed_us(task->timing->last_submit_at, completed_at);
+            timing->first_submit_to_first_completion_us =
+                elapsed_us(task->timing->first_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_minus_last_submit_us =
+                elapsed_us(task->timing->last_submit_at,
+                           task->timing->first_completion_at);
+            timing->first_completion_to_complete_us =
+                elapsed_us(task->timing->first_completion_at, completed_at);
+            timing->total_us = elapsed_us(task->queued_at, completed_at);
+            timing->queued_mono_ns = SteadyNanos(task->queued_at);
+            timing->first_submit_mono_ns =
+                SteadyNanos(task->timing->first_submit_at);
+            timing->last_submit_mono_ns =
+                SteadyNanos(task->timing->last_submit_at);
+            timing->completed_mono_ns = SteadyNanos(completed_at);
+            timing->max_sub_io_latency_us =
+                task->timing->max_sub_io_latency_us;
+            timing->max_sub_io_index = task->timing->max_sub_io_index;
+            timing->max_sub_io_cid = task->timing->max_sub_io_cid;
+            timing->max_sub_io_lba = task->timing->max_sub_io_lba;
+            timing->max_sub_io_blocks = task->timing->max_sub_io_blocks;
+            timing->max_sub_io_submit_mono_ns =
+                task->timing->max_sub_io_submit_mono_ns;
+            timing->max_sub_io_complete_mono_ns =
+                task->timing->max_sub_io_complete_mono_ns;
+            timing->max_completion_gap_us =
+                task->timing->max_completion_gap_us;
+            timing->max_completion_gap_begin_mono_ns =
+                task->timing->max_completion_gap_begin_mono_ns;
+            timing->max_completion_gap_end_mono_ns =
+                task->timing->max_completion_gap_end_mono_ns;
+            timing->max_poll_return_gap_us =
+                task->timing->max_poll_return_gap_us;
+            timing->max_poll_return_gap_begin_mono_ns =
+                task->timing->max_poll_return_gap_begin_mono_ns;
+            timing->max_poll_return_gap_end_mono_ns =
+                task->timing->max_poll_return_gap_end_mono_ns;
+            if (task->nof_qos) {
+                const auto counter_delta = [](uint64_t current,
+                                              uint64_t start) {
+                    return current >= start ? current - start : 0;
+                };
+                timing->poll_calls_during_task = counter_delta(
+                    task->nof_qos->poll_calls,
+                    task->timing->poll_calls_at_first_submit);
+                timing->empty_polls_during_task = counter_delta(
+                    task->nof_qos->empty_polls,
+                    task->timing->empty_polls_at_first_submit);
+                timing->polled_completions_during_task = counter_delta(
+                    task->nof_qos->polled_completions,
+                    task->timing->polled_completions_at_first_submit);
+            }
+        }
+        if (timing.has_value() &&
+            mooncake::GetSpdkNofSlowTraceThresholdUs() > 0 &&
+            timing->total_us >=
+                mooncake::GetSpdkNofSlowTraceThresholdUs()) {
+            MC_LOG(INFO)
+                << "nof_slow_task trace_id=" << task->state->trace_id()
+                << " worker_idx=" << timing->worker_index
+                << " lane=" << timing->lane
+                << " qpair_id=" << timing->qpair_id
+                << " lane_task_seq=" << timing->lane_task_sequence
+                << " lane_completion_seq="
+                << timing->lane_completion_sequence
+                << " lba=" << task->lba
+                << " blocks=" << task->lba_count
+                << " sub_ios=" << timing->sub_io_count
+                << " queued_mono_ns=" << timing->queued_mono_ns
+                << " first_submit_mono_ns="
+                << timing->first_submit_mono_ns
+                << " last_submit_mono_ns="
+                << timing->last_submit_mono_ns
+                << " completed_mono_ns=" << timing->completed_mono_ns
+                << " total_us=" << timing->total_us
+                << " fifo_us=" << timing->qos_fifo_wait_us
+                << " fifo_full_us=" << timing->qos_fifo_full_wait_us
+                << " fifo_partial_us=" << timing->qos_fifo_partial_wait_us
+                << " fifo_zero_us=" << timing->qos_fifo_zero_wait_us
+                << " credit_us=" << timing->credit_wait_us
+                << " submit_span_us=" << timing->first_to_last_submit_us
+                << " drain_us=" << timing->last_submit_to_complete_us
+                << " max_subio_us=" << timing->max_sub_io_latency_us
+                << " max_subio_idx=" << timing->max_sub_io_index
+                << " max_subio_cid=" << timing->max_sub_io_cid
+                << " max_subio_lba=" << timing->max_sub_io_lba
+                << " max_subio_blocks=" << timing->max_sub_io_blocks
+                << " max_subio_submit_mono_ns="
+                << timing->max_sub_io_submit_mono_ns
+                << " max_subio_complete_mono_ns="
+                << timing->max_sub_io_complete_mono_ns
+                << " max_completion_gap_us="
+                << timing->max_completion_gap_us
+                << " max_completion_gap_begin_mono_ns="
+                << timing->max_completion_gap_begin_mono_ns
+                << " max_completion_gap_end_mono_ns="
+                << timing->max_completion_gap_end_mono_ns
+                << " max_poll_return_gap_us="
+                << timing->max_poll_return_gap_us
+                << " max_poll_return_gap_begin_mono_ns="
+                << timing->max_poll_return_gap_begin_mono_ns
+                << " max_poll_return_gap_end_mono_ns="
+                << timing->max_poll_return_gap_end_mono_ns
+                << " poll_calls=" << timing->poll_calls_during_task
+                << " empty_polls=" << timing->empty_polls_during_task
+                << " polled_completions="
+                << timing->polled_completions_during_task;
+        }
+        task->state->set_completed(
+            task->failed ? mooncake::ErrorCode::TRANSFER_FAIL
+                         : mooncake::ErrorCode::OK,
+            std::move(timing));
+        if (task->live_registry) task->live_registry->erase(task);
+        delete task;
     }
 }
 
@@ -126,6 +443,81 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     mooncake::SpdkNofTask* task = sub_task->task;
     mooncake::SpdkNofQos* nof_qos = task->nof_qos;
     int op = task->op;
+    const bool debug_timing = sub_task->track_latency;
+    bool releases_sampled_credit = false;
+    if (nof_qos->sampled_timing_tasks > 0) {
+        for (int pending_op = 0; pending_op < mooncake::kSpdkNofOpNum;
+             ++pending_op) {
+            releases_sampled_credit =
+                releases_sampled_credit ||
+                (nof_qos->head[pending_op] &&
+                 nof_qos->head[pending_op]->timing &&
+                 nof_qos->head[pending_op]->timing->credit_wait_active);
+        }
+    }
+    const bool track_occupancy =
+        debug_timing || nof_qos->sampled_timing_tasks > 0;
+    const auto completion_now =
+        (task->timing || track_occupancy || releases_sampled_credit)
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+    if (task->timing) {
+        const int64_t sub_io_latency_us =
+            ElapsedMicros(sub_task->submitted_at, completion_now);
+        if (sub_io_latency_us > task->timing->max_sub_io_latency_us) {
+            task->timing->max_sub_io_latency_us = sub_io_latency_us;
+            task->timing->max_sub_io_index = sub_task->sub_io_index;
+            task->timing->max_sub_io_cid = cpl->cid;
+            task->timing->max_sub_io_lba = sub_task->submit_lba;
+            task->timing->max_sub_io_blocks =
+                static_cast<uint32_t>(sub_task->submit_lba_count);
+            task->timing->max_sub_io_submit_mono_ns =
+                SteadyNanos(sub_task->submitted_at);
+            task->timing->max_sub_io_complete_mono_ns =
+                SteadyNanos(completion_now);
+        }
+        if (task->timing->previous_completion_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t completion_gap_us = ElapsedMicros(
+                task->timing->previous_completion_at, completion_now);
+            if (completion_gap_us > task->timing->max_completion_gap_us) {
+                task->timing->max_completion_gap_us = completion_gap_us;
+                task->timing->max_completion_gap_begin_mono_ns =
+                    SteadyNanos(task->timing->previous_completion_at);
+                task->timing->max_completion_gap_end_mono_ns =
+                    SteadyNanos(completion_now);
+            }
+        }
+        task->timing->previous_completion_at = completion_now;
+        if (nof_qos->last_poll_return_at !=
+            std::chrono::steady_clock::time_point{}) {
+            const int64_t poll_return_gap_us =
+                ElapsedMicros(nof_qos->last_poll_return_at, completion_now);
+            if (poll_return_gap_us >
+                task->timing->max_poll_return_gap_us) {
+                task->timing->max_poll_return_gap_us = poll_return_gap_us;
+                task->timing->max_poll_return_gap_begin_mono_ns =
+                    SteadyNanos(nof_qos->last_poll_return_at);
+                task->timing->max_poll_return_gap_end_mono_ns =
+                    SteadyNanos(completion_now);
+            }
+        }
+        if (task->timing->completed_sub_io_count == 0) {
+            task->timing->first_completion_at = completion_now;
+        }
+        ++task->timing->completed_sub_io_count;
+    }
+    if (debug_timing) {
+        const auto latency_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                completion_now - sub_task->submitted_at)
+                .count());
+        ++nof_qos->completion_latency_samples;
+        nof_qos->completion_latency_us += latency_us;
+        nof_qos->max_completion_latency_us =
+            std::max(nof_qos->max_completion_latency_us, latency_us);
+        sub_task->track_latency = false;
+    }
     if (--(*task->io_count) < 0) {
         LOG(ERROR) << "total outstanding io < 0";
     }
@@ -134,19 +526,53 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
         LOG(ERROR) << "task outstanding io < 0";
     }
 
+    if (track_occupancy) {
+        UpdateNofOccupancy(nof_qos, completion_now);
+    }
     nof_qos->inflight_blocks[op] -= sub_task->submit_lba_count;
+    if (nof_qos->inflight_blocks[0] + nof_qos->inflight_blocks[1] <
+        nof_qos->inflight_blocks_limit) {
+        for (int pending_op = 0; pending_op < mooncake::kSpdkNofOpNum;
+             ++pending_op) {
+            if (nof_qos->head[pending_op] &&
+                nof_qos->head[pending_op]->timing &&
+                nof_qos->head[pending_op]
+                    ->timing->credit_wait_active) {
+                StopNofCreditWait(nof_qos->head[pending_op], completion_now);
+            }
+        }
+    }
     if (nof_qos->inflight_blocks[op] < 0) {
         LOG(ERROR) << "task outstanding io < 0";
     }
 
     if (spdk_nvme_cpl_is_error(cpl)) {
-        LOG(ERROR) << "task_complete: I/O failed"
-                   << spdk_nvme_cpl_get_status_string(&cpl->status);
+        ++nof_qos->completion_errors;
+        LOG(ERROR) << "task_complete: I/O failed "
+                   << mooncake::NofCplStatusString(
+                          cpl, op == mooncake::kSpdkNofOpRead
+                                   ? SPDK_NVME_OPC_READ
+                                   : SPDK_NVME_OPC_WRITE);
         task->remaining_lba = 0;
         task->failed = true;
+    } else {
+        ++nof_qos->completion_successes;
     }
 
-    SpdkNofTaskCompletion(task);
+#ifdef USE_NOF_URMA
+    // Modified By Yida (v3): 验收指标——完成口径（外部审阅 #3 复审）。
+    // OnIoSubmitted 只证明 GPU I/O 提交成功；CUDA I/O 的最终成功在此
+    // completion 无错误处另计（cuda_io_success），两者不可混用。
+    mooncake::NofMemoryDomainManager::GetInstance().OnIoCompleted(
+        task->buffer_info, !spdk_nvme_cpl_is_error(cpl),
+        op == mooncake::kSpdkNofOpWrite,
+        static_cast<uint64_t>(sub_task->submit_lba_count) *
+            mooncake::SpdkWrapper::GetInstance().GetBlockSize(task->seg_handle));
+#endif
+
+    // During explicit qpair teardown, abort callbacks reclaim sub-tasks but
+    // do not publish completion until SPDK has quiesced the DMA resources.
+    if (!nof_qos->poisoned) SpdkNofTaskCompletion(task);
 
     sub_task->sub_task_pool->push(sub_task);
 }
@@ -154,7 +580,7 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 namespace mooncake {
 
 #ifdef USE_NOF
-SpdkNofQos::SpdkNofQos(uint32_t block_size) {
+SpdkNofQos::SpdkNofQos(uint32_t block_size, size_t lane_count) {
     int block_size_int = static_cast<int>(block_size);
     if (block_size_int <= 0) {
         block_size_int = 1;
@@ -162,8 +588,14 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 
     blocks_per_chunk =
         std::max(1, GetSpdkNofSubmitChunkBytes() / block_size_int);
-    inflight_blocks_limit =
+    // MC_NOF_INFLIGHT_BYTES_LIMIT is the aggregate budget for one segment.
+    // R4 showed that aggregate QD above 256 only increases completion latency,
+    // so divide the existing 32 MiB default across the I/O lanes.
+    const auto effective_lane_count = std::max<size_t>(1, lane_count);
+    const int segment_inflight_blocks =
         std::max(1, GetSpdkNofInflightBytesLimit() / block_size_int);
+    inflight_blocks_limit = std::max(
+        1, static_cast<int>(segment_inflight_blocks / effective_lane_count));
     for (int i = 0; i < kSpdkNofOpNum; ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
@@ -299,6 +731,26 @@ void FilereadWorkerPool::workerThread() {
 // threads.
 
 #ifdef USE_NOF
+std::shared_ptr<SpdkNofWorkerPool> SpdkNofWorkerPool::Acquire(
+    int numa_socket_id) {
+    // Construct the wrapper before the factory so it outlives every pool.
+    (void)SpdkWrapper::GetInstance();
+    static std::mutex mutex;
+    static std::weak_ptr<SpdkNofWorkerPool> shared_pool;
+    std::lock_guard<std::mutex> lock(mutex);
+    auto pool = shared_pool.lock();
+    if (!pool) {
+        pool = std::make_shared<SpdkNofWorkerPool>(numa_socket_id);
+        shared_pool = pool;
+    } else if (pool->numa_socket_id_ != numa_socket_id) {
+        LOG_FIRST_N(WARNING, 1)
+            << "Sharing NoF dispatcher on NUMA node " << pool->numa_socket_id_
+            << "; requested node " << numa_socket_id
+            << " differs from the first client's selection";
+    }
+    return pool;
+}
+
 SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
     : worker_count_(GetSpdkNofWorkerCount()),
       numa_socket_id_(numa_socket_id),
@@ -331,6 +783,11 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
         }
     }
 
+    for (const auto& [seg, binding] : seg_to_workers_) {
+        (void)binding;
+        SpdkWrapper::GetInstance().ReleaseIoLanes(seg, this);
+    }
+
     VLOG(1) << "SpdkNofWorkerPool destroyed";
 }
 
@@ -351,17 +808,71 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
     {
         std::lock_guard<std::mutex> lock(seg_mutex_);
         nof_seg_handle* seg = task.seg_handle;
+        auto& wrapper = SpdkWrapper::GetInstance();
+        const size_t lane_count = wrapper.GetIoLaneCount(seg);
+        if (lane_count == 0) {
+            LOG(ERROR) << "No NoF I/O lanes available for seg=" << seg;
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
         bool new_binding = false;
-        if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
-            worker_idx = seg_to_worker_[seg];
-        } else {
-            worker_idx = (seg_num++ % worker_count_);
-            seg_to_worker_[seg] = worker_idx;
+        auto binding_it = seg_to_workers_.find(seg);
+        if (binding_it == seg_to_workers_.end()) {
+            if (!wrapper.ClaimIoLanes(seg, this)) {
+                LOG(ERROR) << "NoF segment is owned by another dispatcher";
+                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            SegmentLaneBinding binding;
+            binding.worker_indices.reserve(lane_count);
+            for (size_t lane_index = 0; lane_index < lane_count;
+                 ++lane_index) {
+                binding.worker_indices.push_back(seg_num++ % worker_count_);
+            }
+            binding_it =
+                seg_to_workers_.emplace(seg, std::move(binding)).first;
             new_binding = true;
         }
-        if (new_binding && IsSpdkNofDebugEnabled()) {
+        auto& binding = binding_it->second;
+        if (binding.worker_indices.size() != lane_count) {
+            LOG(ERROR) << "NoF lane count changed after dispatcher binding";
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
+        // Only dispatch new operations to healthy lanes. In-flight operations
+        // on a failed lane are completed as errors, never replayed here.
+        for (size_t attempt = 0; attempt < lane_count; ++attempt) {
+            const size_t lane_index = binding.next_lane++ % lane_count;
+            auto* lane = wrapper.GetIoLane(seg, lane_index);
+            if (!wrapper.IsIoLaneHealthy(lane)) continue;
+            task.io_lane = lane;
+            task.io_lane_index = static_cast<uint32_t>(lane_index);
+            worker_idx = binding.worker_indices[lane_index];
+            break;
+        }
+        if (worker_idx < 0) {
+            task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return;
+        }
+        if (new_binding &&
+            (IsSpdkNofDebugEnabled() ||
+             GetSpdkNofSlowTraceThresholdUs() > 0)) {
             LOG(INFO) << "nof_worker_bind seg_handle=" << seg
-                      << " worker_idx=" << worker_idx;
+                      << " lanes=" << lane_count;
+            for (size_t lane_index = 0; lane_index < lane_count;
+                 ++lane_index) {
+                auto* lane = wrapper.GetIoLane(seg, lane_index);
+                LOG(INFO) << "nof_lane_bind seg_handle=" << seg
+                          << " lane=" << lane_index << " worker_idx="
+                          << binding.worker_indices[lane_index]
+                          << " qpair_id="
+                          << wrapper.GetIoLaneQpairId(lane);
+            }
+        }
+        if (new_binding && lane_count > static_cast<size_t>(worker_count_)) {
+            LOG(WARNING) << "NoF segment has " << lane_count
+                         << " I/O lanes but only " << worker_count_
+                         << " workers; some qpairs share a polling worker";
         }
     }
     if (worker_idx < 0 || worker_idx >= worker_count_) {
@@ -372,14 +883,15 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_[worker_idx]);
+        task.queued_at = std::chrono::steady_clock::now();
         task_queue_[worker_idx].push(std::move(task));
     }
     queue_cv_[worker_idx].notify_one();
 }
 
 static bool HasBufferedTask(
-    const std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>>& seg_to_qos) {
-    for (const auto& [_, nof_qos] : seg_to_qos) {
+    const std::map<nof_io_lane*, std::unique_ptr<SpdkNofQos>>& lane_to_qos) {
+    for (const auto& [_, nof_qos] : lane_to_qos) {
         if (!nof_qos->Empty()) {
             return true;
         }
@@ -414,68 +926,100 @@ static inline bool CheckSubTaskPool(
 void SpdkNofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "SpdkNofWorkerPool worker thread started";
+    if (IsSpdkNofDebugEnabled() ||
+        GetSpdkNofSlowTraceThresholdUs() > 0) {
+        LOG(INFO) << "nof_worker_thread worker_idx=" << work_idx
+                  << " tid=" << syscall(SYS_gettid);
+    }
 
     int64_t total_outstanding_io = 0;
     // std::set<nof_seg_handle *> seg_set;
-    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
+    std::map<nof_io_lane*, std::unique_ptr<SpdkNofQos>> lane_to_qos;
     std::stack<SpdkNofSubTask*> sub_task_pool;
     std::vector<SpdkNofSubTask*> sub_task_chunks;
+    std::set<SpdkNofTask*> live_tasks;
+    const auto io_timeout = std::chrono::milliseconds(
+        GetPositiveEnvOrDefault("MC_NOF_IO_TIMEOUT_MS", 60000));
+    const bool debug_enabled = IsSpdkNofDebugEnabled();
     auto& task_queue = task_queue_[work_idx];
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
     auto last_debug_snapshot = std::chrono::steady_clock::now();
-
-    if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
-        return;
-    }
 
     while (true) {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             queue_cv.wait(
-                lock, [this, &task_queue, &total_outstanding_io, &seg_to_qos] {
+                lock, [this, &task_queue, &total_outstanding_io, &lane_to_qos] {
                     return shutdown_.load() || !task_queue.empty() ||
-                           total_outstanding_io || HasBufferedTask(seg_to_qos);
+                           total_outstanding_io || HasBufferedTask(lane_to_qos);
                 });
 
             if (shutdown_.load() && task_queue.empty() &&
-                (total_outstanding_io == 0) && !HasBufferedTask(seg_to_qos)) {
+                (total_outstanding_io == 0) && !HasBufferedTask(lane_to_qos)) {
                 break;
             }
 
             while (!task_queue.empty()) {
+                if (!SpdkWrapper::GetInstance().IsIoLaneHealthy(
+                        task_queue.front().io_lane)) {
+                    task_queue.front().state->set_completed(
+                        ErrorCode::TRANSFER_FAIL);
+                    task_queue.pop();
+                    continue;
+                }
                 SpdkNofTask* task = new (std::nothrow)
                     SpdkNofTask(std::move(task_queue.front()));
                 if (task == nullptr) {
                     LOG(ERROR)
                         << "alloc SpdkNofTask failed, worker " << work_idx;
+                    task_queue.front().state->set_completed(
+                        ErrorCode::TRANSFER_FAIL);
+                    task_queue.pop();
                     continue;
                 }
+                if (task->timing) {
+                    task->timing->worker_dequeued_at =
+                        std::chrono::steady_clock::now();
+                }
+                task->worker_index = work_idx;
 
                 SpdkNofQos* nof_qos = nullptr;
-                auto it = seg_to_qos.find(task->seg_handle);
-                if (it == seg_to_qos.end()) {
-                    auto qos = std::make_unique<SpdkNofQos>(
-                        SpdkWrapper::GetInstance().GetBlockSize(
-                            task->seg_handle));
+                auto it = lane_to_qos.find(task->io_lane);
+                if (it == lane_to_qos.end()) {
+                    const size_t lane_count =
+                        SpdkWrapper::GetInstance().GetIoLaneCount(
+                            task->seg_handle);
+                    auto qos = std::unique_ptr<SpdkNofQos>(
+                        new (std::nothrow) SpdkNofQos(
+                            SpdkWrapper::GetInstance().GetBlockSize(
+                                task->seg_handle),
+                            lane_count));
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc SpdkNofQos failed, worker " << work_idx;
+                        task->state->set_completed(ErrorCode::TRANSFER_FAIL);
                         delete task;
+                        task_queue.pop();
                         continue;
                     }
                     nof_qos = qos.get();
-                    seg_to_qos[task->seg_handle] = std::move(qos);
-                    if (IsSpdkNofDebugEnabled()) {
+                    lane_to_qos[task->io_lane] = std::move(qos);
+                    if (debug_enabled) {
                         LOG(INFO)
                             << "nof_qos_create worker_idx=" << work_idx
                             << " seg_handle=" << task->seg_handle
+                            << " lane=" << task->io_lane_index
                             << " blocks_per_chunk="
-                            << seg_to_qos[task->seg_handle]->blocks_per_chunk
-                            << " inflight_blocks_limit="
-                            << seg_to_qos[task->seg_handle]
-                                   ->inflight_blocks_limit;
+                            << lane_to_qos[task->io_lane]->blocks_per_chunk
+                            << " lane_inflight_blocks_limit="
+                            << lane_to_qos[task->io_lane]
+                                   ->inflight_blocks_limit
+                            << " segment_inflight_blocks_limit="
+                            << lane_to_qos[task->io_lane]
+                                   ->inflight_blocks_limit *
+                                   static_cast<int>(lane_count);
                     }
                 } else {
                     nof_qos = it->second.get();
@@ -483,19 +1027,99 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 task->io_count = &total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
+                task->live_registry = &live_tasks;
+                live_tasks.insert(task);
+#ifdef USE_NOF_URMA
+                // Modified By Yida (v3): 入队前识别 buffer 类型并解析 memory
+                // domain（每个 task 一次）。kError/kNotSupported 直接标记失败
+                // 走完成路径——严格错误策略，不静默回退 host staging。
+                {
+                    uint32_t blk = SpdkWrapper::GetInstance().GetBlockSize(
+                        task->seg_handle);
+                    task->buffer_info =
+                        NofMemoryDomainManager::GetInstance().ResolveBuffer(
+                            task->ptr,
+                            static_cast<uint64_t>(task->lba_count) * blk);
+                    if (task->buffer_info.type == NofMemoryType::kError ||
+                        task->buffer_info.type ==
+                            NofMemoryType::kNotSupported) {
+                        LOG(ERROR) << "NoF buffer resolve failed type="
+                                   << static_cast<int>(task->buffer_info.type)
+                                   << " ptr=" << task->ptr;
+                        task->failed = true;
+                        task->remaining_lba = 0;
+                    }
+                }
+#endif
+                const bool lane_was_empty = nof_qos->head[task->op] == nullptr;
+                const uint32_t tasks_ahead =
+                    task->timing
+                        ? static_cast<uint32_t>(CountSpdkNofQueuedTasks(
+                              nof_qos->head[task->op]))
+                        : 0;
+                const bool track_occupancy =
+                    debug_enabled || task->timing ||
+                    nof_qos->sampled_timing_tasks > 0;
+                const auto qos_enqueue_now =
+                    track_occupancy
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                if (track_occupancy) {
+                    UpdateNofOccupancy(nof_qos, qos_enqueue_now);
+                }
+                if (task->timing) {
+                    task->timing->qos_enqueued_at = qos_enqueue_now;
+                    task->timing->lane_task_sequence =
+                        nof_qos->enqueued_task_sequence + 1;
+                    task->timing->qos_tasks_ahead_at_enqueue = tasks_ahead;
+                    task->timing->qos_full_pending_at_enqueue_us =
+                        nof_qos->inflight_full_with_pending_us;
+                    task->timing->qos_partial_pending_at_enqueue_us =
+                        nof_qos->inflight_partial_with_pending_us;
+                    task->timing->qos_zero_pending_at_enqueue_us =
+                        nof_qos->inflight_zero_with_pending_us;
+                    ++nof_qos->sampled_timing_tasks;
+                }
+                ++nof_qos->enqueued_task_sequence;
                 nof_qos->PushTask(task);
+                if (lane_was_empty) {
+                    MarkNofTaskAsQosHead(nof_qos, task, qos_enqueue_now);
+                }
                 task_queue.pop();
             }
         }
 
-        for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+        for (auto& [io_lane, nof_qos] : lane_to_qos) {
             uint32_t block_size =
-                SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-            for (int i = 0; i < kSpdkNofOpNum; ++i) {
+                SpdkWrapper::GetInstance().GetBlockSize(io_lane);
+            bool qpair_backpressured = false;
+            const int first_op = nof_qos->next_op;
+            for (int op_offset = 0;
+                 op_offset < kSpdkNofOpNum && !qpair_backpressured;
+                 ++op_offset) {
+                const int i = (first_op + op_offset) % kSpdkNofOpNum;
                 int avail_blocks = nof_qos->inflight_blocks_limit -
-                                   nof_qos->inflight_blocks[i];
+                                   nof_qos->inflight_blocks[0] -
+                                   nof_qos->inflight_blocks[1];
+                if (nof_qos->head[i]) {
+                    const auto credit_state_now =
+                        nof_qos->head[i]->timing
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                    if (avail_blocks <= 0) {
+                        StartNofCreditWait(nof_qos->head[i],
+                                           credit_state_now);
+                    } else {
+                        StopNofCreditWait(nof_qos->head[i], credit_state_now);
+                    }
+                }
+                bool submitted_for_op = false;
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     SpdkNofTask* task = nof_qos->head[i];
+                    if (nof_qos->poisoned) {
+                        task->failed = true;
+                        task->remaining_lba = 0;
+                    }
                     SpdkNofSubTask* sub_task;
                     while (task->remaining_lba > 0 && avail_blocks > 0) {
                         uint32_t submit_lba_count = std::min(
@@ -517,63 +1141,448 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         sub_task_pool.pop();
                         sub_task->task = task;
                         sub_task->submit_lba_count = submit_lba_count;
+                        sub_task->sub_io_index =
+                            static_cast<uint32_t>(task->idx);
+                        sub_task->submit_lba = submit_lba;
+                        const auto sub_io_submit_at =
+                            (debug_enabled || task->timing)
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
 
-                        int ret = SpdkWrapper::GetInstance().SubmitRequest(
-                            task->seg_handle, submit_ptr, submit_lba,
+#ifdef USE_NOF_URMA
+                        // Modified By Yida (v3): GPU Direct——CUDA buffer 走
+                        // ext I/O 携带 memory domain（domain 指向 cuda:
+                        // mooncake:<id>，SPDK URMA 侧据此做设备内存注册）；
+                        // host buffer 保持 io_opts=nullptr（经典 read/write，
+                        // 按 HOST 注册，行为与改造前一致）。
+                        const bool is_cuda_io =
+                            task->buffer_info.type == NofMemoryType::kCuda;
+                        if (is_cuda_io) {
+                            sub_task->io_opts = {};
+                            sub_task->io_opts.size =
+                                sizeof(sub_task->io_opts);
+                            sub_task->io_opts.memory_domain =
+                                task->buffer_info.domain;
+                        }
+                        int ret = SpdkWrapper::GetInstance().SubmitRequestOnLane(
+                            task->io_lane, submit_ptr, submit_lba,
+                            submit_lba_count, task->op, nvmf_io_complete,
+                            sub_task, is_cuda_io ? &sub_task->io_opts : nullptr);
+#else
+                        int ret = SpdkWrapper::GetInstance().SubmitRequestOnLane(
+                            task->io_lane, submit_ptr, submit_lba,
                             submit_lba_count, task->op, nvmf_io_complete,
                             sub_task);
+#endif
+                        ++nof_qos->submit_attempts;
                         if (ret != 0) {
+                            const bool retryable =
+                                ret == -EAGAIN || ret == -ENOMEM;
+                            const bool has_inflight =
+                                nof_qos->inflight_blocks[0] > 0 ||
+                                nof_qos->inflight_blocks[1] > 0;
+                            if (ret == -EAGAIN) {
+                                ++nof_qos->submit_eagain;
+                            } else if (ret == -ENOMEM) {
+                                ++nof_qos->submit_enomem;
+                            } else {
+                                ++nof_qos->submit_other_errors;
+                            }
+                            sub_task_pool.push(sub_task);
+                            if (retryable && has_inflight) {
+                                // SPDK uses EAGAIN/ENOMEM as queue-pressure
+                                // signals. Keep the task at the head, poll
+                                // completions to return credits, then retry it
+                                // on the next worker iteration.
+                                ++nof_qos->submit_backpressure_retries;
+                                if (!nof_qos->submit_backpressured) {
+                                    nof_qos->submit_backpressured = true;
+                                    ++nof_qos->submit_backpressure_events;
+                                    nof_qos->submit_backpressure_started =
+                                        std::chrono::steady_clock::now();
+                                }
+                                qpair_backpressured = true;
+                                break;
+                            }
+                            ++nof_qos->submit_fatal_errors;
+                            if (ret == -ENXIO || ret == -ENODEV) {
+                                SpdkWrapper::GetInstance().MarkIoLaneFailed(
+                                    task->io_lane);
+                                qpair_backpressured = true;
+                            }
                             LOG(ERROR) << "work " << work_idx << ", seg "
-                                       << task->seg_handle << " submit io fail";
+                                       << task->seg_handle
+                                       << " lane=" << task->io_lane_index
+                                       << " submit io fail ret=" << ret
+                                       << " chunk_blocks=" << submit_lba_count
+                                       << " inflight_blocks="
+                                       << nof_qos->inflight_blocks[i]
+                                       << " inflight_limit="
+                                       << nof_qos->inflight_blocks_limit;
                             task->failed = true;
                             task->remaining_lba = 0;
                         } else {
+                            ++nof_qos->submit_successes;
+                            if (nof_qos->submit_backpressured) {
+                                nof_qos->submit_backpressured = false;
+                                ++nof_qos->submit_backpressure_recoveries;
+                                nof_qos->submit_backpressure_wait_us +=
+                                    static_cast<uint64_t>(
+                                        std::chrono::duration_cast<
+                                            std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() -
+                                            nof_qos
+                                                ->submit_backpressure_started)
+                                            .count());
+                            }
+                            const bool track_occupancy =
+                                debug_enabled ||
+                                nof_qos->sampled_timing_tasks > 0;
+                            if (track_occupancy) {
+                                const auto occupancy_now =
+                                    std::chrono::steady_clock::now();
+                                UpdateNofOccupancy(nof_qos.get(),
+                                                   occupancy_now);
+                            }
+                            if (debug_enabled || task->timing) {
+                                sub_task->submitted_at = sub_io_submit_at;
+                            }
+                            if (debug_enabled) {
+                                sub_task->track_latency = true;
+                            }
+                            if (!task->first_sub_io_submitted) {
+                                task->first_sub_io_submitted = true;
+                                if (task->timing) {
+                                    task->timing->first_submit_at =
+                                        sub_io_submit_at;
+                                    task->timing->poll_calls_at_first_submit =
+                                        nof_qos->poll_calls;
+                                    task->timing->empty_polls_at_first_submit =
+                                        nof_qos->empty_polls;
+                                    task->timing
+                                        ->polled_completions_at_first_submit =
+                                        nof_qos->polled_completions;
+                                    // Credit waited while at the head before
+                                    // this first successful submit.  Submits
+                                    // only run with avail_blocks > 0, so any
+                                    // active wait was already stopped.
+                                    task->timing->first_credit_wait_us =
+                                        task->timing->credit_wait_us;
+                                }
+                                ++nof_qos->first_submit_count;
+                                nof_qos->first_submit_wait_us +=
+                                    static_cast<uint64_t>(
+                                        std::chrono::duration_cast<
+                                            std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now() -
+                                            task->queued_at)
+                                            .count());
+                            }
+                            if (nof_qos->inflight_blocks[0] == 0 &&
+                                nof_qos->inflight_blocks[1] == 0) {
+                                nof_qos->last_progress =
+                                    std::chrono::steady_clock::now();
+                            }
                             task->idx++;
+#ifdef USE_NOF_URMA
+                            // Modified By Yida (v3): 验收指标（host/cuda
+                            // 分开计数）。提交口径：SubmitRequest 返回成功
+                            // 即计数，完成成功在 nvmf_io_complete 另计。
+                            NofMemoryDomainManager::GetInstance().OnIoSubmitted(
+                                task->buffer_info,
+                                task->op == kSpdkNofOpWrite,
+                                static_cast<uint64_t>(submit_lba_count) *
+                                    block_size);
+#endif
                             task->remaining_lba -= submit_lba_count;
+                            if (task->timing) {
+                                ++task->timing->submitted_sub_io_count;
+                                if (task->remaining_lba == 0) {
+                                    task->timing->last_submit_at =
+                                        std::chrono::steady_clock::now();
+                                }
+                            }
                             nof_qos->inflight_blocks[i] += submit_lba_count;
+                            submitted_for_op = true;
+                            nof_qos->max_inflight_blocks = std::max(
+                                nof_qos->max_inflight_blocks,
+                                nof_qos->inflight_blocks[0] +
+                                    nof_qos->inflight_blocks[1]);
                             avail_blocks -= submit_lba_count;
                             task->outstanding_sub_io++;
                             total_outstanding_io++;
+                            if (task->timing && task->remaining_lba > 0 &&
+                                avail_blocks <= 0) {
+                                StartNofCreditWait(
+                                    task, std::chrono::steady_clock::now());
+                            }
                         }
                     }
+                    if (qpair_backpressured) {
+                        break;
+                    }
                     if (task->remaining_lba == 0) {
+                        const bool track_occupancy =
+                            debug_enabled || nof_qos->sampled_timing_tasks > 0;
+                        const bool capture_pop_time =
+                            track_occupancy ||
+                            (task->nxt != nullptr && task->nxt->timing);
+                        const auto pop_now =
+                            capture_pop_time
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+                        if (track_occupancy) {
+                            UpdateNofOccupancy(nof_qos.get(), pop_now);
+                        }
                         nof_qos->PopTask(i);
+                        if (task->timing) {
+                            --nof_qos->sampled_timing_tasks;
+                        }
                         task->on_chain = false;
+                        MarkNofTaskAsQosHead(nof_qos.get(), nof_qos->head[i],
+                                             pop_now);
+                        if (nof_qos->head[i] && avail_blocks <= 0) {
+                            StartNofCreditWait(nof_qos->head[i], pop_now);
+                        }
                         SpdkNofTaskCompletion(task);
                     }
                 }
-            }
-        }
-
-        if (total_outstanding_io > 0) {
-            int64_t ret = 0;
-            for (auto& it : seg_to_qos) {
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
-                    it.first, 0);
-                if (ret < 0) {
-                    LOG(ERROR) << "poll completion error: ret " << ret;
+                if (submitted_for_op) {
+                    // Alternate the first direction considered after progress
+                    // so a sustained read stream cannot starve queued writes,
+                    // or vice versa, under the shared lane budget.
+                    nof_qos->next_op = (i + 1) % kSpdkNofOpNum;
                 }
             }
         }
 
-        if (IsSpdkNofDebugEnabled()) {
+        {
+            int64_t ret = 0;
+            for (auto& it : lane_to_qos) {
+                if (it.second->poisoned) continue;
+                const bool healthy =
+                    SpdkWrapper::GetInstance().IsIoLaneHealthy(it.first);
+                if (healthy && it.second->inflight_blocks[0] == 0 &&
+                    it.second->inflight_blocks[1] == 0) {
+                    continue;
+                }
+                ret = healthy ? SpdkWrapper::GetInstance().PollIoLane(
+                                    it.first, 0)
+                              : -ENXIO;
+                auto& qos = *it.second;
+                ++qos.poll_calls;
+                if (ret == 0) {
+                    ++qos.empty_polls;
+                } else if (ret > 0) {
+                    qos.polled_completions += static_cast<uint64_t>(ret);
+                }
+                const auto now = std::chrono::steady_clock::now();
+                qos.last_poll_return_at = now;
+                if (ret > 0) qos.last_progress = now;
+                const bool timed_out =
+                    (qos.inflight_blocks[0] > 0 || qos.inflight_blocks[1] > 0) &&
+                    now - qos.last_progress >= io_timeout;
+                if (ret < 0 || timed_out) {
+                    LOG(ERROR) << "NoF qpair failed ret=" << ret
+                               << " timeout=" << timed_out
+                               << " lane="
+                               << SpdkWrapper::GetInstance().GetIoLaneIndex(
+                                      it.first);
+                    qos.poisoned = true;
+                    SpdkWrapper::GetInstance().MarkIoLaneFailed(it.first);
+                    // Keep queued tasks alive while SPDK invokes abort callbacks.
+                    for (auto* task : live_tasks) {
+                        if (task->io_lane == it.first) {
+                            task->failed = true;
+                            task->remaining_lba = 0;
+                        }
+                    }
+                    SpdkWrapper::GetInstance().DrainFailedIoLane(it.first);
+                    // DMA is quiesced and SPDK no longer owns callback contexts.
+                    // Complete any tasks the transport did not callback itself.
+                    for (auto pos = live_tasks.begin(); pos != live_tasks.end();) {
+                        auto* task = *pos++;
+                        if (task->io_lane != it.first) continue;
+#ifdef USE_NOF_URMA
+                        NofMemoryDomainManager::GetInstance().OnIoAborted(
+                            task->buffer_info, task->op == kSpdkNofOpWrite,
+                            task->outstanding_sub_io);
+#endif
+                        total_outstanding_io -= task->outstanding_sub_io;
+                        task->outstanding_sub_io = 0;
+                        if (task->timing && task->on_chain) {
+                            // Still queued on the dead lane's chain, so its
+                            // push-time sample count has not been released.
+                            --qos.sampled_timing_tasks;
+                        }
+                        task->on_chain = false;
+                        SpdkNofTaskCompletion(task);
+                    }
+                    if (debug_enabled) {
+                        // Close the occupancy window with the pre-reset state
+                        // so the failed lane's inflight time is attributed.
+                        UpdateNofOccupancy(&qos, now);
+                    }
+                    for (int op = 0; op < kSpdkNofOpNum; ++op) {
+                        qos.head[op] = qos.tail[op] = nullptr;
+                        qos.inflight_blocks[op] = 0;
+                    }
+                }
+            }
+        }
+
+        if (debug_enabled) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
             if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
-                for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
+                for (const auto& [io_lane, nof_qos] : lane_to_qos) {
+                    UpdateNofOccupancy(nof_qos.get(), now);
+                    const double empty_poll_ratio =
+                        nof_qos->poll_calls == 0
+                            ? 0.0
+                            : static_cast<double>(nof_qos->empty_polls) /
+                                  static_cast<double>(nof_qos->poll_calls);
+                    const uint64_t nonempty_polls =
+                        nof_qos->poll_calls - nof_qos->empty_polls;
+                    const double completions_per_nonempty_poll =
+                        nonempty_polls == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->polled_completions) /
+                                  static_cast<double>(nonempty_polls);
+                    const uint64_t first_submit_wait_avg_us =
+                        nof_qos->first_submit_count == 0
+                            ? 0
+                            : nof_qos->first_submit_wait_us /
+                                  nof_qos->first_submit_count;
+                    const uint64_t completion_latency_avg_us =
+                        nof_qos->completion_latency_samples == 0
+                            ? 0
+                            : nof_qos->completion_latency_us /
+                                  nof_qos->completion_latency_samples;
+                    const uint64_t backpressure_wait_avg_us =
+                        nof_qos->submit_backpressure_recoveries == 0
+                            ? 0
+                            : nof_qos->submit_backpressure_wait_us /
+                                  nof_qos->submit_backpressure_recoveries;
+                    const double inflight_idle_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(nof_qos->inflight_idle_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double inflight_partial_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->inflight_partial_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double inflight_full_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(nof_qos->inflight_full_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double inflight_zero_pending_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->inflight_zero_with_pending_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
+                    const double pending_no_credit_ratio =
+                        nof_qos->occupancy_total_us == 0
+                            ? 0.0
+                            : static_cast<double>(
+                                  nof_qos->inflight_full_with_pending_us) /
+                                  static_cast<double>(
+                                      nof_qos->occupancy_total_us);
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
-                        << " seg_handle=" << seg_handle
+                        << " io_lane=" << io_lane
+                        << " lane="
+                        << SpdkWrapper::GetInstance().GetIoLaneIndex(io_lane)
                         << " inflight_read=" << nof_qos->inflight_blocks[0]
                         << " inflight_write=" << nof_qos->inflight_blocks[1]
-                        << " inflight_limit=" << nof_qos->inflight_blocks_limit
+                        << " lane_inflight_limit="
+                        << nof_qos->inflight_blocks_limit
                         << " queued_read="
                         << CountSpdkNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
                         << CountSpdkNofQueuedTasks(nof_qos->head[1])
-                        << " total_outstanding_io=" << total_outstanding_io;
+                        << " total_outstanding_io=" << total_outstanding_io
+                        << " max_inflight_blocks="
+                        << nof_qos->max_inflight_blocks
+                        << " occupancy_total_us="
+                        << nof_qos->occupancy_total_us
+                        << " occupancy_active_us="
+                        << nof_qos->occupancy_active_us
+                        << " inflight_idle_us=" << nof_qos->inflight_idle_us
+                        << " inflight_partial_us="
+                        << nof_qos->inflight_partial_us
+                        << " inflight_full_us=" << nof_qos->inflight_full_us
+                        << " inflight_zero_with_pending_us="
+                        << nof_qos->inflight_zero_with_pending_us
+                        << " inflight_partial_with_pending_us="
+                        << nof_qos->inflight_partial_with_pending_us
+                        << " inflight_full_with_pending_us="
+                        << nof_qos->inflight_full_with_pending_us
+                        << " inflight_partial_ratio="
+                        << inflight_partial_ratio
+                        << " inflight_full_ratio=" << inflight_full_ratio
+                        << " inflight_idle_ratio=" << inflight_idle_ratio
+                        << " inflight_zero_pending_ratio="
+                        << inflight_zero_pending_ratio
+                        << " pending_no_credit_ratio="
+                        << pending_no_credit_ratio
+                        << " submit_attempts=" << nof_qos->submit_attempts
+                        << " submit_successes=" << nof_qos->submit_successes
+                        << " submit_eagain=" << nof_qos->submit_eagain
+                        << " submit_enomem=" << nof_qos->submit_enomem
+                        << " submit_backpressure_retries="
+                        << nof_qos->submit_backpressure_retries
+                        << " submit_backpressure_events="
+                        << nof_qos->submit_backpressure_events
+                        << " submit_backpressure_recoveries="
+                        << nof_qos->submit_backpressure_recoveries
+                        << " submit_backpressure_active="
+                        << nof_qos->submit_backpressured
+                        << " submit_backpressure_wait_us="
+                        << nof_qos->submit_backpressure_wait_us
+                        << " submit_backpressure_wait_avg_us="
+                        << backpressure_wait_avg_us
+                        << " submit_fatal_errors="
+                        << nof_qos->submit_fatal_errors
+                        << " submit_other_errors="
+                        << nof_qos->submit_other_errors
+                        << " completion_successes="
+                        << nof_qos->completion_successes
+                        << " completion_errors="
+                        << nof_qos->completion_errors
+                        << " poll_calls=" << nof_qos->poll_calls
+                        << " empty_polls=" << nof_qos->empty_polls
+                        << " empty_poll_ratio=" << empty_poll_ratio
+                        << " polled_completions="
+                        << nof_qos->polled_completions
+                        << " completions_per_nonempty_poll="
+                        << completions_per_nonempty_poll
+                        << " first_submit_count="
+                        << nof_qos->first_submit_count
+                        << " first_submit_wait_us="
+                        << nof_qos->first_submit_wait_us
+                        << " first_submit_wait_avg_us="
+                        << first_submit_wait_avg_us
+                        << " completion_latency_samples="
+                        << nof_qos->completion_latency_samples
+                        << " completion_latency_us="
+                        << nof_qos->completion_latency_us
+                        << " completion_latency_avg_us="
+                        << completion_latency_avg_us
+                        << " max_completion_latency_us="
+                        << nof_qos->max_completion_latency_us;
                 }
                 last_debug_snapshot = now;
             }
@@ -583,7 +1592,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     for (auto* sub_tasks : sub_task_chunks) {
         delete[] sub_tasks;
     }
-    // seg_to_qos will automatically clean up SpdkNofQos objects using
+    // lane_to_qos will automatically clean up SpdkNofQos objects using
     // unique_ptr
 
     VLOG(2) << "SpdkNofWorkerPool worker thread exiting";
@@ -593,16 +1602,73 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 // ============================================================================
 // MemcpyWorkerPool Implementation
 // ============================================================================
-// Since memcpy is bound by memory bandwidth, we only need one worker thread.
-constexpr int kDefaultMemcpyWorkers = 1;
+// A single worker serializes otherwise independent local-memory puts. Four
+// workers are enough to expose several cores of memcpy bandwidth without
+// creating an unbounded number of background threads. Deployments can tune
+// this with MC_STORE_MEMCPY_WORKERS.
+constexpr int kDefaultMemcpyWorkers = 4;
+constexpr int kMaxMemcpyWorkers = 64;
+
+static int GetMemcpyWorkerCount() {
+    static const int worker_count = [] {
+        const unsigned int hardware_threads =
+            std::thread::hardware_concurrency();
+        const int automatic_default =
+            hardware_threads == 0
+                ? kDefaultMemcpyWorkers
+                : std::max(1, std::min(kDefaultMemcpyWorkers,
+                                       static_cast<int>(hardware_threads)));
+
+        const char* raw_value = std::getenv("MC_STORE_MEMCPY_WORKERS");
+        if (!raw_value || raw_value[0] == '\0') return automatic_default;
+
+        errno = 0;
+        char* end_ptr = nullptr;
+        const long parsed = std::strtol(raw_value, &end_ptr, 10);
+        if (errno != 0 || end_ptr == raw_value ||
+            (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0 ||
+            parsed > kMaxMemcpyWorkers) {
+            LOG(WARNING) << "Invalid MC_STORE_MEMCPY_WORKERS=" << raw_value
+                         << ", using " << automatic_default;
+            return automatic_default;
+        }
+        return static_cast<int>(parsed);
+    }();
+    return worker_count;
+}
+
+static bool IsInlineHostMemcpyEnabled() {
+    static const bool enabled = [] {
+        const char* raw_value = std::getenv("MC_STORE_MEMCPY_INLINE");
+        if (!raw_value || raw_value[0] == '\0') return true;
+
+        std::string normalized(raw_value);
+        std::transform(
+            normalized.begin(), normalized.end(), normalized.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (normalized == "1" || normalized == "true" ||
+            normalized == "yes" || normalized == "on") {
+            return true;
+        }
+        if (normalized == "0" || normalized == "false" ||
+            normalized == "no" || normalized == "off") {
+            return false;
+        }
+        LOG(WARNING) << "Invalid MC_STORE_MEMCPY_INLINE=" << raw_value
+                     << ", defaulting to enabled";
+        return true;
+    }();
+    return enabled;
+}
 
 MemcpyWorkerPool::MemcpyWorkerPool() : shutdown_(false) {
-    VLOG(1) << "Creating MemcpyWorkerPool with " << kDefaultMemcpyWorkers
-            << " workers";
+    const int worker_count = GetMemcpyWorkerCount();
+    LOG(INFO) << "Creating MemcpyWorkerPool with " << worker_count
+              << " workers; tune with MC_STORE_MEMCPY_WORKERS";
 
     // Start worker threads
-    workers_.reserve(kDefaultMemcpyWorkers);
-    for (int i = 0; i < kDefaultMemcpyWorkers; ++i) {
+    workers_.reserve(worker_count);
+    for (int i = 0; i < worker_count; ++i) {
         workers_.emplace_back(&MemcpyWorkerPool::workerThread, this);
     }
 }
@@ -634,6 +1700,7 @@ void MemcpyWorkerPool::submitTask(MemcpyTask task) {
             task.state->set_completed(ErrorCode::TRANSFER_FAIL);
             return;
         }
+        task.queued_ahead = task_queue_.size();
         task_queue_.push(std::move(task));
     }
     queue_cv_.notify_one();
@@ -665,18 +1732,45 @@ void MemcpyWorkerPool::workerThread() {
         // Execute the task if we have one
         if (task.state) {
             mooncake::logging::ScopedTraceId trace(task.trace_id);
+            const bool breakdown_log =
+                mooncake::logging::ShouldSampleHiFreqLog(task.trace_id);
+            const auto worker_start =
+                breakdown_log ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{};
+            auto registry_end = worker_start;
+            int64_t pointer_lookup_us = 0;
+            int64_t copy_us = 0;
+            size_t copied_bytes = 0;
+            ErrorCode result = ErrorCode::TRANSFER_FAIL;
             try {
                 bool ok = true;
                 auto runtime_accelerator =
                     device::GetAcceleratorRegistry().RuntimeAccelerators();
+                if (breakdown_log) {
+                    registry_end = std::chrono::steady_clock::now();
+                }
                 for (const auto& op : task.operations) {
                     device::PointerInfo src_info;
                     device::PointerInfo dst_info;
+                    const auto lookup_start =
+                        breakdown_log ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
                     auto* src_device = runtime_accelerator.FindDeviceForPointer(
                         op.src, &src_info);
                     auto* dst_device = runtime_accelerator.FindDeviceForPointer(
                         op.dest, &dst_info);
+                    if (breakdown_log) {
+                        const auto lookup_end =
+                            std::chrono::steady_clock::now();
+                        pointer_lookup_us +=
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                lookup_end - lookup_start)
+                                .count();
+                    }
 
+                    const auto copy_start =
+                        breakdown_log ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
                     if (!src_device && !dst_device) {
                         std::memcpy(op.dest, op.src, op.size);
                     } else {
@@ -718,16 +1812,47 @@ void MemcpyWorkerPool::workerThread() {
                             break;
                         }
                     }
+                    copied_bytes += op.size;
+                    if (breakdown_log) {
+                        const auto copy_end = std::chrono::steady_clock::now();
+                        copy_us +=
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                copy_end - copy_start)
+                                .count();
+                    }
                 }
 
                 VLOG(2) << "Memcpy task completed with "
                         << task.operations.size() << " operations"
                         << (ok ? "" : " (with GPU copy failure)");
-                task.state->set_completed(ok ? ErrorCode::OK
-                                             : ErrorCode::TRANSFER_FAIL);
+                result = ok ? ErrorCode::OK : ErrorCode::TRANSFER_FAIL;
+                task.state->set_completed(result);
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async memcpy: " << e.what();
                 task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+            }
+            if (breakdown_log) {
+                const auto worker_end = std::chrono::steady_clock::now();
+                auto elapsed_us = [](auto begin, auto end) {
+                    return std::chrono::duration_cast<std::chrono::microseconds>(
+                               end - begin)
+                        .count();
+                };
+                MC_LOG(INFO)
+                    << "memcpy_worker_breakdown trace_id=" << task.trace_id
+                    << " operations=" << task.operations.size()
+                    << " bytes=" << copied_bytes
+                    << " queued_ahead=" << task.queued_ahead
+                    << " queue_wait_us="
+                    << elapsed_us(task.submitted_at, worker_start)
+                    << " registry_us="
+                    << elapsed_us(worker_start, registry_end)
+                    << " pointer_lookup_us=" << pointer_lookup_us
+                    << " copy_us=" << copy_us
+                    << " execute_us=" << elapsed_us(worker_start, worker_end)
+                    << " total_us="
+                    << elapsed_us(task.submitted_at, worker_end)
+                    << " status=" << static_cast<int>(result);
             }
         }
     }
@@ -922,26 +2047,46 @@ void TransferEngineOperationState::wait_for_completion() {
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
-    while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
-        }
+    const bool ub_transport = engine_.getTransport("ub") != nullptr;
+    const auto sleep_time = std::chrono::microseconds(
+        ub_transport ? UbPollSleepUs() : 0);
+    const auto spin_time = std::chrono::microseconds(
+        ub_transport ? UbPollSpinUs() : 0);
+    auto spin_until = std::chrono::steady_clock::now() + spin_time;
+    if (ub_transport) {
+        LOG_FIRST_N(INFO, 1) << "UB completion polling: spin_us="
+                             << spin_time.count()
+                             << " sleep_us=" << sleep_time.count()
+                             << " (MC_STORE_UB_POLL_SLEEP_US=0 restores "
+                                "busy polling)";
+    }
 
-        std::unique_lock<std::mutex> lock(mutex_);
-        check_task_status();
-        if (result_.has_value()) {
-            VLOG(1) << "Transfer engine operation completed for batch "
-                    << batch_id_
-                    << " with result: " << static_cast<int>(result_.value());
-            break;
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (result_.has_value()) return;
+            if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
+                LOG(ERROR) << "Failed to complete transfers after "
+                           << timeout_milliseconds << " milliseconds for batch "
+                           << batch_id_;
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            check_task_status();
+            if (result_.has_value()) {
+                VLOG(1) << "Transfer engine operation completed for batch "
+                        << batch_id_
+                        << " with result: " << static_cast<int>(result_.value());
+                break;
+            }
         }
-        // Continue polling
-        VLOG(1) << "Transfer engine operation still pending for batch "
-                << batch_id_;
+        // Release mutex_ before sleeping so another observer can see progress.
+        // This only observes completion; it never resubmits or caches metadata.
+        if (sleep_time.count() > 0 &&
+            std::chrono::steady_clock::now() >= spin_until) {
+            std::this_thread::sleep_for(sleep_time);
+            spin_until = std::chrono::steady_clock::now() + spin_time;
+        }
     }
 #endif
 }
@@ -970,6 +2115,10 @@ ErrorCode TransferFuture::wait() {
 
 ErrorCode TransferFuture::get() { return wait(); }
 
+std::optional<NofTransferTiming> TransferFuture::nofTiming() const {
+    return state_->nof_timing();
+}
+
 TransferStrategy TransferFuture::strategy() const {
     return state_->get_strategy();
 }
@@ -985,9 +2134,9 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      int numa_socket_id)
     : engine_(engine),
       local_endpoint_(engine.getLocalIpAndPort()),
-      memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
+      memcpy_pool_(nullptr),
 #ifdef USE_NOF
-      spdk_nvmf_pool_(std::make_unique<SpdkNofWorkerPool>(numa_socket_id)),
+      spdk_nvmf_pool_(SpdkNofWorkerPool::Acquire(numa_socket_id)),
 #endif
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),
@@ -1021,8 +2170,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
         }
     }
 
+    // Keep workers for accelerator copies and for deployments that explicitly
+    // disable inline host copies.
+    if (memcpy_enabled_) {
+        memcpy_pool_ = std::make_unique<MemcpyWorkerPool>();
+    }
+
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
-            << memcpy_enabled_;
+            << memcpy_enabled_
+            << " inline_host_memcpy=" << IsInlineHostMemcpyEnabled();
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -1123,44 +2279,109 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
     TransferRequest::OpCode op_code, const OperationOptions& options) {
-    std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
+    if (replicas.empty() || replicas.size() != all_slices.size()) {
+        LOG(ERROR) << "Invalid batch transfer: replicas=" << replicas.size()
+                   << " slice_groups=" << all_slices.size();
+        return std::nullopt;
+    }
+
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    bool use_local_memcpy = memcpy_enabled_ && memcpy_pool_ != nullptr;
+    size_t total_slices = 0;
+    size_t total_bytes = 0;
     for (size_t i = 0; i < replicas.size(); ++i) {
-        auto& replica = replicas[i];
-        auto& slices = all_slices[i];
+        const auto& replica = replicas[i];
+        const auto& slices = all_slices[i];
         if (!replica.is_memory_replica()) {
             LOG(ERROR) << "Batch transfer only supports memory replicas";
             return std::nullopt;
         }
-        auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
+        const auto& handle =
+            replica.get_memory_descriptor().buffer_descriptor;
+        for (const auto& slice : slices) {
+            if (slice.ptr == nullptr) {
+                LOG(ERROR) << "Batch transfer contains a null slice pointer";
+                return std::nullopt;
+            }
+        }
+        if (!validateTransferParams(handle, slices)) {
             return std::nullopt;
         }
-        auto& handle = mem_desc.buffer_descriptor;
-        uint64_t offset = 0;
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
-        }
-        for (auto slice : slices) {
-            TransferRequest request;
-            request.opcode = op_code;
-            request.source = static_cast<char*>(slice.ptr);
-            request.target_id = seg;
-            request.target_offset = handle.buffer_address_ + offset;
-            request.length = slice.size;
-            requests.emplace_back(request);
-            offset += slice.size;
-        }
+        use_local_memcpy =
+            use_local_memcpy &&
+            selectStrategy(handle, slices) == TransferStrategy::LOCAL_MEMCPY;
+        total_slices += slices.size();
+        for (const auto& slice : slices) total_bytes += slice.size;
     }
-    auto hint = options.scheduling.value_or(SchedulingHint{});
-    if (!options.scheduling)
-        hint.intent = op_code == TransferRequest::READ
-                          ? TaskIntent::FOREGROUND_GET
-                          : TaskIntent::BACKGROUND_PUT;
-    future = submitTransfer(requests, hint);
+
+    std::optional<TransferFuture> future;
+    if (use_local_memcpy) {
+        std::vector<MemcpyOperation> operations;
+        operations.reserve(total_slices);
+        for (size_t i = 0; i < replicas.size(); ++i) {
+            const auto& handle =
+                replicas[i].get_memory_descriptor().buffer_descriptor;
+            uint64_t offset = 0;
+            for (const auto& slice : all_slices[i]) {
+                void* dest = nullptr;
+                const void* src = nullptr;
+                if (op_code == TransferRequest::READ) {
+                    dest = slice.ptr;
+                    src = reinterpret_cast<const void*>(
+                        handle.buffer_address_ + offset);
+                } else {
+                    dest = reinterpret_cast<void*>(handle.buffer_address_ +
+                                                   offset);
+                    src = slice.ptr;
+                }
+                operations.emplace_back(dest, src, slice.size);
+                offset += slice.size;
+            }
+        }
+        future = submitMemcpyOperations(std::move(operations), trace_id);
+    } else {
+        std::vector<TransferRequest> requests;
+        requests.reserve(total_slices);
+        for (size_t i = 0; i < replicas.size(); ++i) {
+            const auto& handle =
+                replicas[i].get_memory_descriptor().buffer_descriptor;
+            uint64_t offset = 0;
+            SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
+            for (const auto& slice : all_slices[i]) {
+                TransferRequest request;
+                request.opcode = op_code;
+                request.source = static_cast<char*>(slice.ptr);
+                request.target_id = seg;
+                request.target_offset = handle.buffer_address_ + offset;
+                request.length = slice.size;
+                requests.emplace_back(request);
+                offset += slice.size;
+            }
+        }
+        auto hint = options.scheduling.value_or(SchedulingHint{});
+        if (!options.scheduling) {
+            hint.intent = op_code == TransferRequest::READ
+                              ? TaskIntent::FOREGROUND_GET
+                              : TaskIntent::BACKGROUND_PUT;
+        }
+        future = submitTransfer(requests, hint);
+    }
+
+    if (mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+        MC_LOG(INFO) << "batch_transfer_strategy trace_id=" << trace_id
+                     << " strategy="
+                     << (use_local_memcpy ? TransferStrategy::LOCAL_MEMCPY
+                                          : TransferStrategy::TRANSFER_ENGINE)
+                     << " objects=" << replicas.size()
+                     << " slices=" << total_slices << " bytes=" << total_bytes
+                     << " op="
+                     << (op_code == TransferRequest::READ ? "read" : "write");
+    }
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1253,9 +2474,11 @@ TransferSubmitter::submit_batch_push_offload_object(
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    if (!memcpy_pool_) {
+        LOG(ERROR) << "Memcpy operation selected while memcpy is disabled";
+        return std::nullopt;
+    }
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    auto state = std::make_shared<MemcpyOperationState>(trace_id);
-
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
@@ -1284,13 +2507,110 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         operations.emplace_back(dest, src, slice.size);
     }
 
-    // Submit memcpy operations to worker pool for async execution
+    return submitMemcpyOperations(std::move(operations), trace_id);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
+    std::vector<MemcpyOperation> operations, uint64_t trace_id) {
+    if (!memcpy_pool_) {
+        LOG(ERROR) << "Memcpy operation selected while memcpy is disabled";
+        return std::nullopt;
+    }
+
+    auto state = std::make_shared<MemcpyOperationState>(trace_id);
+    if (IsInlineHostMemcpyEnabled()) {
+        const bool breakdown_log =
+            mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+        const auto inline_start =
+            breakdown_log ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
+        auto registry_end = inline_start;
+        int64_t pointer_lookup_us = 0;
+        int64_t copy_us = 0;
+        size_t copied_bytes = 0;
+        bool host_only = true;
+
+        try {
+            auto runtime_accelerator =
+                device::GetAcceleratorRegistry().RuntimeAccelerators();
+            if (breakdown_log) {
+                registry_end = std::chrono::steady_clock::now();
+            }
+            if (!runtime_accelerator.Devices().empty()) {
+                for (const auto& op : operations) {
+                    const auto lookup_start =
+                        breakdown_log
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                    auto* src_device =
+                        runtime_accelerator.FindDeviceForPointer(op.src);
+                    auto* dst_device =
+                        runtime_accelerator.FindDeviceForPointer(op.dest);
+                    if (breakdown_log) {
+                        pointer_lookup_us += std::chrono::duration_cast<
+                                                 std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() -
+                                                 lookup_start)
+                                                 .count();
+                    }
+                    if (src_device || dst_device) {
+                        host_only = false;
+                        break;
+                    }
+                }
+            }
+
+            if (host_only) {
+                const auto copy_start =
+                    breakdown_log
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                for (const auto& op : operations) {
+                    std::memcpy(op.dest, op.src, op.size);
+                    copied_bytes += op.size;
+                }
+                const auto inline_end =
+                    breakdown_log
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                if (breakdown_log) {
+                    copy_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            inline_end - copy_start)
+                            .count();
+                }
+                state->set_completed(ErrorCode::OK);
+                if (breakdown_log) {
+                    auto elapsed_us = [](auto begin, auto end) {
+                        return std::chrono::duration_cast<
+                                   std::chrono::microseconds>(end - begin)
+                            .count();
+                    };
+                    MC_LOG(INFO)
+                        << "memcpy_inline_breakdown trace_id=" << trace_id
+                        << " operations=" << operations.size()
+                        << " bytes=" << copied_bytes
+                        << " registry_us="
+                        << elapsed_us(inline_start, registry_end)
+                        << " pointer_lookup_us=" << pointer_lookup_us
+                        << " copy_us=" << copy_us
+                        << " total_us="
+                        << elapsed_us(inline_start, inline_end)
+                        << " status=" << static_cast<int>(ErrorCode::OK);
+                }
+                return TransferFuture(state);
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Exception while classifying memcpy pointers: "
+                       << e.what();
+            state->set_completed(ErrorCode::TRANSFER_FAIL);
+            return TransferFuture(state);
+        }
+    }
+
     MemcpyTask task(std::move(operations), state, trace_id);
     memcpy_pool_->submitTask(std::move(task));
-
-    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
-            << " operations";
-
+    VLOG(1) << "Memcpy transfer submitted to worker pool";
     return TransferFuture(state);
 }
 
@@ -1461,7 +2781,12 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
-    auto state = std::make_shared<SpdkNofOperationState>();
+    const uint64_t trace_id = mooncake::logging::CurrentTraceId();
+    const bool track_timing =
+        mooncake::logging::ShouldSampleHiFreqLog(trace_id) ||
+        GetSpdkNofSlowTraceThresholdUs() > 0;
+    auto state =
+        std::make_shared<SpdkNofOperationState>(trace_id, track_timing);
     SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
                      size / block_size, op_code, state);
     spdk_nvmf_pool_->submitTask(std::move(task));

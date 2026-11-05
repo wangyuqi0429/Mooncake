@@ -71,6 +71,15 @@ if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
                                                        gflags::gflags)
+  # Modified By Yida (v3): --memory=cuda GPU Direct 验证需要 CUDA 驱动 API
+  # （dmabuf provider 经 mooncake_store 链接；这里补 cuda.h 与运行时 API）
+  if(USE_NOF_GPU_DIRECT)
+    find_package(CUDAToolkit REQUIRED)
+    target_include_directories(nof_worker_pool_bench
+                               PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(nof_worker_pool_bench PRIVATE CUDA::cuda_driver
+                                                        CUDA::cudart)
+  endif()
 endif()
 
 # Add BatchEvict benchmark executable

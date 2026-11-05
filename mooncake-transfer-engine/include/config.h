@@ -128,6 +128,8 @@ struct GlobalConfig {
     // ub config parameters
     size_t num_jfc_per_ctx = 2;
     size_t num_jfce_per_ctx = 2;
+    // URMA EID index (not a physical port or list offset); MC_EID_INDEX.
+    // A malformed override sets -1 so UB initialization fails explicitly.
     int eid_index = 0;
     uint64_t max_seg_size = 0x10000000000;
     size_t max_jfc_e = 4096;  // urma is temporarily using this default value.

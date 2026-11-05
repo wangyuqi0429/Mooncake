@@ -26,6 +26,32 @@ target_include_directories(ub_transport
         PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../mooncake-integration/store
 )
+
+# Probe whether the URMA headers expose urma_seg_cfg_t::is_gpu_seg, required
+# for the gdr-peermem GPU-Direct path. When absent (older UMDK), the build
+# still succeeds; gdr-peermem is simply unavailable and the transport falls
+# back to host/staging modes only.
+include(CheckCXXSourceCompiles)
+set(_UB_SAVED_CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+set(CMAKE_REQUIRED_INCLUDES ${urma_INCLUDE_DIR})
+check_cxx_source_compiles("
+#include <urma_api.h>
+int main() {
+    urma_seg_cfg_t cfg = {};
+    cfg.is_gpu_seg = 1;
+    return 0;
+}
+" HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+set(CMAKE_REQUIRED_INCLUDES ${_UB_SAVED_CMAKE_REQUIRED_INCLUDES})
+unset(_UB_SAVED_CMAKE_REQUIRED_INCLUDES)
+if(HAVE_URMA_SEG_CFG_IS_GPU_SEG)
+    target_compile_definitions(ub_transport
+            PRIVATE HAVE_URMA_SEG_CFG_IS_GPU_SEG=1)
+    message(STATUS "URMA headers expose urma_seg_cfg_t::is_gpu_seg; gdr-peermem enabled")
+else()
+    message(STATUS "URMA headers lack urma_seg_cfg_t::is_gpu_seg; gdr-peermem disabled (host/staging only)")
+endif()
+
 target_link_libraries(ub_transport
         PRIVATE
         JsonCpp::JsonCpp

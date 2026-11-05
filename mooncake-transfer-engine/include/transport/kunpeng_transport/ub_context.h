@@ -30,6 +30,7 @@
 
 #include "config.h"
 #include "ub_transport.h"
+#include "ub_worker_signal.h"
 
 namespace mooncake {
 class UbContext;
@@ -61,6 +62,10 @@ class UbWorkerPool {
 
     void transferWorker(int thread_id);
 
+    bool hasWorkerWork(int thread_id);
+
+    void wakePollingWorkers(int posting_thread_id);
+
     void monitorWorker();
 
     int doProcessContextEvents();
@@ -71,8 +76,7 @@ class UbWorkerPool {
     std::vector<std::thread> worker_thread_;
     std::atomic<bool> workers_running_;
     std::atomic<int> redispatch_counter_;
-    std::mutex cond_mutex_;
-    std::condition_variable cond_var_;
+    std::unique_ptr<UbWorkerSignal[]> worker_signals_;
     using SliceList = std::vector<Transport::Slice*>;
     const static int kShardCount = 8;
     std::unordered_map<std::string, SliceList> slice_queue_[kShardCount];
@@ -138,6 +142,13 @@ class UbSIEVEEndpointStore : public UbEndpointStore {
     size_t max_size_;
 };
 
+// Type of a locally registered memory region. kGpu marks a GPU segment
+// (seg_cfg.is_gpu_seg = 1) so URMA uses the peermem path on the receiver.
+enum class UbMemoryRegionType {
+    kHost,  // ordinary host memory, is_gpu_seg = 0
+    kGpu,   // GPU segment, is_gpu_seg = 1 (gdr-peermem)
+};
+
 // UbContext class
 class UbContext {
    public:
@@ -183,7 +194,9 @@ class UbContext {
     virtual int deconstruct() = 0;
 
    public:
-    virtual int registerMemoryRegion(uint64_t va, size_t length) = 0;
+    virtual int registerMemoryRegion(
+        uint64_t va, size_t length,
+        UbMemoryRegionType type = UbMemoryRegionType::kHost) = 0;
 
     virtual int unregisterMemoryRegion(uint64_t va) = 0;
 

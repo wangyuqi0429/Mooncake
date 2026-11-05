@@ -15,6 +15,25 @@ function(add_store_test name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# Acceptance policy checks do not need hardware, SPDK, or the Store runtime.
+add_executable(stress_bench_validation_test stress_bench_validation_test.cpp)
+target_include_directories(stress_bench_validation_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME stress_bench_validation_test COMMAND stress_bench_validation_test)
+add_executable(ub_allocator_lifecycle_test
+               ub_allocator_lifecycle_test.cpp
+               ../../mooncake-transfer-engine/src/transport/kunpeng_transport/ub_allocator.cpp)
+target_include_directories(ub_allocator_lifecycle_test BEFORE PRIVATE
+                           ${CMAKE_CURRENT_SOURCE_DIR}/ub_allocator_stubs
+                           ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
+target_compile_definitions(ub_allocator_lifecycle_test PRIVATE USE_CUDA)
+target_link_libraries(ub_allocator_lifecycle_test PRIVATE pthread)
+add_test(NAME ub_allocator_lifecycle_test COMMAND ub_allocator_lifecycle_test)
+add_test(NAME spdk_link_dependencies_test
+         COMMAND ${CMAKE_COMMAND}
+                 -DTEST_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/spdk_link_test
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/spdk_link_dependencies_test.cmake)
+
 function(add_ha_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -109,6 +128,10 @@ add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
+# Modified By Yida (v3): USE_NOF_URMA 下 512B/4KiB/128KiB/1MiB 对齐矩阵测试
+if(USE_NOF)
+  add_store_test(nof_buffer_alignment_test nof_buffer_alignment_test.cpp)
+endif()
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)

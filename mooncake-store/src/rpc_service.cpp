@@ -402,6 +402,9 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
+    const auto metadata_query_start =
+        sample ? std::chrono::steady_clock::now()
+               : std::chrono::steady_clock::time_point{};
     {
         // 服务调用整窗归因：WithRequestTenantBatch 配额包装 +
         // BatchGetReplicaList 的 slot 归属拆分（逐 key KeySlot 哈希 +
@@ -419,6 +422,9 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             });
         pt_convert.End(0);
     }
+    const auto metadata_query_end =
+        sample ? std::chrono::steady_clock::now()
+               : std::chrono::steady_clock::time_point{};
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -448,15 +454,24 @@ WrappedMasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                       ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     if (sample) {
+        const auto result_scan_end = std::chrono::steady_clock::now();
         const auto latency_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0)
+                result_scan_end - t0)
                 .count();
         MC_LOG(INFO) << "BatchGetReplicaList host="
                      << ResolveClientHost(master_service_, client_id)
                      << " tenant=" << tenant_id << " keys_count=" << total_keys
                      << " success=" << (results.size() - failure_count)
                      << " failures=" << failure_count
+                     << " metadata_query_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            metadata_query_end - metadata_query_start)
+                            .count()
+                     << " result_scan_us="
+                     << std::chrono::duration_cast<std::chrono::microseconds>(
+                            result_scan_end - metadata_query_end)
+                            .count()
                      << " latency_us=" << latency_us;
     }
     pt.End(failure_count == total_keys ? -1 : 0);
