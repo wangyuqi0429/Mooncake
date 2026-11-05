@@ -45,6 +45,12 @@ urma_eid_info_t mock_eid_info = {
 
 }  // namespace
 
+urma_status_t urma_register_log_func(urma_log_cb_t func) {
+    // Mock device has no driver logs to redirect.
+    (void)func;
+    return URMA_SUCCESS;
+}
+
 urma_status_t urma_init(urma_init_attr_t *init_attr) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (initialized) {

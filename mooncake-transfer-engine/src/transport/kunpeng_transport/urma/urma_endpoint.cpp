@@ -17,6 +17,11 @@
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <string_view>
 #include "config.h"
 #include "mooncake_logging.h"
 #include "transport/kunpeng_transport/urma/urma_endpoint.h"
@@ -27,12 +32,72 @@
 #include "transport/kunpeng_transport/ub_diagnostics.h"
 
 namespace mooncake {
-
 namespace {
+
 constexpr uint64_t kNumaAffinitySampleInterval = 10000;
 
 std::atomic<int> g_urma_runtime_init_depth{0};
 std::atomic<bool> g_urma_runtime_owned{false};
+
+// liburma log redirect (urma_api.h urma_register_log_func; default goes to
+// rsyslog). Enabled explicitly with MC_URMA_LOG_REDIRECT=1; disabled by
+// default because driver-side volume is unbounded and would flood the
+// application log. Levels follow urma_vlog_level_t (syslog style):
+//   0-3 (EMERG/ALERT/CRIT/ERR) -> ERROR, 4-5 (WARNING/NOTICE) -> WARNING,
+//   6 (INFO) -> INFO, 7 (DEBUG) -> VLOG(1) (not persisted by default).
+// glog's LOG macros are thread-safe; the callback may be invoked from
+// arbitrary library/driver worker threads.
+void UrmaLogRedirectCb(int level, char *message) {
+    const char *msg = message ? message : "";
+    // Trim the trailing newline liburma appends: glog adds its own.
+    const size_t len = strlen(msg);
+    const bool has_newline = len > 0 && msg[len - 1] == '\n';
+    const std::string text(msg, has_newline ? len - 1 : len);
+    switch (level) {
+        case 0:
+        case 1:
+        case 2:
+        case 3:
+            LOG(ERROR) << "URMA: " << text;
+            break;
+        case 4:
+        case 5:
+            LOG(WARNING) << "URMA: " << text;
+            break;
+        case 6:
+            LOG(INFO) << "URMA: " << text;
+            break;
+        default:
+            VLOG(1) << "URMA: " << text;
+            break;
+    }
+}
+
+bool UrmalogRedirectEnabledByEnv() {
+    const char *value = std::getenv("MC_URMA_LOG_REDIRECT");
+    if (!value || !*value) return false;
+    const std::string_view sv(value);
+    return sv == "1" || sv == "on" || sv == "true" || sv == "yes";
+}
+
+}  // namespace
+
+void UrmaRegisterLogRedirectIfEnabled() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (!UrmalogRedirectEnabledByEnv()) {
+            LOG(INFO) << "URMA log redirect disabled "
+                        "(set MC_URMA_LOG_REDIRECT=1 to redirect liburma "
+                        "logs into the application log)";
+            return;
+        }
+        const auto ret = urma_register_log_func(&UrmaLogRedirectCb);
+        LOG(ret == URMA_SUCCESS ? INFO : WARNING)
+            << "URMA log redirect registration "
+            << (ret == URMA_SUCCESS ? "succeeded" : "failed, ret=")
+            << (ret == URMA_SUCCESS ? "" : std::to_string(ret));
+    });
+}
 }  // namespace
 
 static urma_transport_mode_t parseTransMode(const std::string& mode) {
@@ -801,6 +866,9 @@ bool UrmaContext::uninit() {
 }
 
 bool UrmaContext::init() {
+    // Register the log redirect BEFORE urma_init so init-phase driver logs are
+    // also captured. No-op unless MC_URMA_LOG_REDIRECT is set.
+    UrmaRegisterLogRedirectIfEnabled();
     urma_init_attr_t init_attr = {};
     auto ret = urma_init(&init_attr);
     if (ret != URMA_SUCCESS && ret != URMA_EEXIST) {

@@ -29,6 +29,13 @@
 #include "transport/kunpeng_transport/ub_endpoint.h"
 
 namespace mooncake {
+
+// Redirect liburma driver logs (default rsyslog) into the application's glog
+// output. Enabled explicitly with MC_URMA_LOG_REDIRECT=1; idempotent, safe to
+// call from any init path before urma_init(). Levels follow
+// urma_vlog_level_t: 0-3 -> ERROR, 4-5 -> WARNING, 6 -> INFO, 7 -> VLOG(1).
+void UrmaRegisterLogRedirectIfEnabled();
+
 struct UrmaJFC {
     UrmaJFC() : native(nullptr), outstanding(0) {}
 
