@@ -51,6 +51,15 @@ urma_status_t urma_register_log_func(urma_log_cb_t func) {
     return URMA_SUCCESS;
 }
 
+urma_status_t urma_register_loc_log_func(urma_loc_log_cb func) {
+    (void)func;
+    return URMA_SUCCESS;
+}
+
+urma_status_t urma_unregister_log_func(void) {
+    return URMA_SUCCESS;
+}
+
 urma_status_t urma_init(urma_init_attr_t *init_attr) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (initialized) {

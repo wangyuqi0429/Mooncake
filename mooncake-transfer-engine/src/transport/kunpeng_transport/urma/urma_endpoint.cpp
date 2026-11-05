@@ -45,32 +45,54 @@ std::atomic<bool> g_urma_runtime_owned{false};
 // application log. Levels follow urma_vlog_level_t (syslog style):
 //   0-3 (EMERG/ALERT/CRIT/ERR) -> ERROR, 4-5 (WARNING/NOTICE) -> WARNING,
 //   6 (INFO) -> INFO, 7 (DEBUG) -> VLOG(1) (not persisted by default).
-// glog's LOG macros are thread-safe; the callback may be invoked from
-// arbitrary library/driver worker threads.
-void UrmaLogRedirectCb(int level, char *message) {
-    const char *msg = message ? message : "";
+
+// emit one liburma log line into glog, mapping urma_vlog_level_t (syslog
+// style) onto glog severities. glog's LOG macros are thread-safe; callbacks
+// may be invoked from arbitrary library/driver worker threads.
+void UrmaLogEmit(int level, const char *msg) {
+    const char *text = msg ? msg : "";
     // Trim the trailing newline liburma appends: glog adds its own.
-    const size_t len = strlen(msg);
-    const bool has_newline = len > 0 && msg[len - 1] == '\n';
-    const std::string text(msg, has_newline ? len - 1 : len);
+    const size_t len = strlen(text);
+    const bool has_newline = len > 0 && text[len - 1] == '\n';
+    const std::string line(text, has_newline ? len - 1 : len);
     switch (level) {
         case 0:
         case 1:
         case 2:
         case 3:
-            LOG(ERROR) << "URMA: " << text;
+            LOG(ERROR) << "URMA: " << line;
             break;
         case 4:
         case 5:
-            LOG(WARNING) << "URMA: " << text;
+            LOG(WARNING) << "URMA: " << line;
             break;
         case 6:
-            LOG(INFO) << "URMA: " << text;
+            LOG(INFO) << "URMA: " << line;
             break;
         default:
-            VLOG(1) << "URMA: " << text;
+            VLOG(1) << "URMA: " << line;
             break;
     }
+}
+
+// Plain callback (urma_log_cb_t). Receives the fully formatted liburma message,
+// which already embeds "[URMA][file:function:line][tid][thread_tag][liburma]".
+void UrmaLogRedirectCb(int level, char *message) {
+    UrmaLogEmit(level, message);
+}
+
+// Location callback (urma_loc_log_cb). liburma passes file/function/line as
+// typed fields, but the same header is also present in the message text, so
+// they are redundant for our flat log output; kept in the signature per ABI.
+// Must be registered together with the plain callback: only the plain one is
+// propagated to provider drivers (urma_register_log_func ->
+// urma_register_log_func_to_providers), and non-loc core paths always use it.
+void UrmaLocLogRedirectCb(int level, const char *file, const char *function,
+                          int line, char *message) {
+    (void)file;
+    (void)function;
+    (void)line;
+    UrmaLogEmit(level, message);
 }
 
 bool UrmalogRedirectEnabledByEnv() {
@@ -91,14 +113,24 @@ void UrmaRegisterLogRedirectIfEnabled() {
                         "logs into the application log)";
             return;
         }
+        // Plain callback first: it reaches provider drivers and non-loc core
+        // paths. The location callback is registered afterwards so that
+        // urma_vlog_loc paths prefer it (last registered wins). Not calling
+        // urma_unregister_log_func(): registering for the process lifetime
+        // keeps teardown-period driver logs visible for debugging, and
+        // urma_uninit() does not reset the callback anyway.
         const auto ret = urma_register_log_func(&UrmaLogRedirectCb);
         LOG(ret == URMA_SUCCESS ? INFO : WARNING)
-            << "URMA log redirect registration "
+            << "URMA log redirect (plain) registration "
             << (ret == URMA_SUCCESS ? "succeeded" : "failed, ret=")
             << (ret == URMA_SUCCESS ? "" : std::to_string(ret));
+        const auto loc_ret = urma_register_loc_log_func(&UrmaLocLogRedirectCb);
+        LOG(loc_ret == URMA_SUCCESS ? INFO : WARNING)
+            << "URMA log redirect (location) registration "
+            << (loc_ret == URMA_SUCCESS ? "succeeded" : "failed, ret=")
+            << (loc_ret == URMA_SUCCESS ? "" : std::to_string(loc_ret));
     });
 }
-}  // namespace
 
 static urma_transport_mode_t parseTransMode(const std::string& mode) {
     if (mode == "RC") return URMA_TM_RC;
