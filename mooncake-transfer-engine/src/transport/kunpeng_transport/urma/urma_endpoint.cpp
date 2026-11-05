@@ -120,15 +120,19 @@ void UrmaRegisterLogRedirectIfEnabled() {
         // keeps teardown-period driver logs visible for debugging, and
         // urma_uninit() does not reset the callback anyway.
         const auto ret = urma_register_log_func(&UrmaLogRedirectCb);
-        LOG(ret == URMA_SUCCESS ? INFO : WARNING)
-            << "URMA log redirect (plain) registration "
-            << (ret == URMA_SUCCESS ? "succeeded" : "failed, ret=")
-            << (ret == URMA_SUCCESS ? "" : std::to_string(ret));
+        if (ret == URMA_SUCCESS) {
+            LOG(INFO) << "URMA log redirect (plain) registration succeeded";
+        } else {
+            LOG(WARNING) << "URMA log redirect (plain) registration failed"
+                         << ", ret=" << ret;
+        }
         const auto loc_ret = urma_register_loc_log_func(&UrmaLocLogRedirectCb);
-        LOG(loc_ret == URMA_SUCCESS ? INFO : WARNING)
-            << "URMA log redirect (location) registration "
-            << (loc_ret == URMA_SUCCESS ? "succeeded" : "failed, ret=")
-            << (loc_ret == URMA_SUCCESS ? "" : std::to_string(loc_ret));
+        if (loc_ret == URMA_SUCCESS) {
+            LOG(INFO) << "URMA log redirect (location) registration succeeded";
+        } else {
+            LOG(WARNING) << "URMA log redirect (location) registration failed"
+                         << ", ret=" << loc_ret;
+        }
     });
 }
 
