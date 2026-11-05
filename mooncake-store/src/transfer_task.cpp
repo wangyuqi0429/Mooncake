@@ -1,4 +1,9 @@
 #include "transfer_task.h"
+#include "vsegment/file_segment.h"
+#include "store_rpc_client_io_context.h"
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_io/client_pool.hpp>
+#include <async_simple/coro/SyncAwait.h>
 
 #include <glog/logging.h>
 
@@ -9,6 +14,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <memory>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <sys/syscall.h>
@@ -2242,10 +2248,84 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
+namespace {
+ErrorCode PersistFileRange(const vsegment::EndpointTransferSubRequest& request) {
+    try {
+        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config config{};
+        config.connect_retry_count = 1;
+        config.host_alive_detect_duration = std::chrono::milliseconds{0};
+        coro_io::client_pools<coro_rpc::coro_rpc_client> pools(config, GetStoreRpcClientIoContextPool());
+        auto pool = pools.at(request.persistence_endpoint);
+        return async_simple::coro::syncAwait(
+            [&]() -> async_simple::coro::Lazy<ErrorCode> {
+                auto sent = co_await pool->send_request(
+                    [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+                        return client.send_request<&vsegment::FileSegmentStore::Persist>(
+                            request.transfer.segment_id, request.segment_offset, request.transfer.length);
+                    });
+                if (!sent) co_return ErrorCode::RPC_FAIL;
+                auto result = co_await std::move(sent.value());
+                if (!result) co_return ErrorCode::RPC_FAIL;
+                co_return result->result();
+            }());
+    } catch (...) {
+        return ErrorCode::RPC_FAIL;
+    }
+}
+
+class VSegmentOperationState final : public OperationState {
+ public:
+    std::vector<TransferFuture> children;
+    bool submission_failed{false};
+    bool is_completed() override {
+        for (const auto& child : children)
+            if (!child.isReady()) return false;
+        wait_for_completion();
+        return true;
+    }
+    void wait_for_completion() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (result_) return;
+        auto error = submission_failed ? ErrorCode::INVALID_PARAMS : ErrorCode::OK;
+        for (auto& child : children) {
+            const auto child_error = child.get();
+            if (child_error != ErrorCode::OK) error = child_error;
+        }
+        result_ = error;
+    }
+    TransferStrategy get_strategy() const override { return TransferStrategy::SPDK_NVMF; }
+};
+}  // namespace
+
 std::optional<TransferFuture> TransferSubmitter::submitVSegment(
     const vsegment::VSegmentTransferPlan& plan,
     TransferRequest::OpCode op_code) {
     if (!plan || plan.requests.empty()) return std::nullopt;
+    const bool has_nof = std::any_of(plan.requests.begin(), plan.requests.end(),
+        [](const auto& request) { return request.backend == vsegment::PSegmentBackend::NOF; });
+    if (has_nof) {
+#ifndef USE_NOF
+        return std::nullopt;
+#else
+        // No mixed backend plans: validate before starting any I/O.
+        if (std::any_of(plan.requests.begin(), plan.requests.end(),
+            [](const auto& request) { return request.backend != vsegment::PSegmentBackend::NOF; }))
+            return std::nullopt;
+        auto state = std::make_shared<VSegmentOperationState>();
+        for (const auto& request : plan.requests) {
+            AllocatedBuffer::Descriptor handle{};
+            handle.transport_endpoint_ = request.endpoint;
+            handle.buffer_address_ = request.transfer.physical_offset;
+            handle.size_ = request.transfer.length;
+            auto child = submitSpdkNofOperation(handle,
+                reinterpret_cast<void*>(request.transfer.client_address),
+                request.transfer.length, op_code);
+            if (!child) { state->submission_failed = true; break; }
+            state->children.push_back(std::move(*child));
+        }
+        return TransferFuture(state);
+#endif
+    }
     std::vector<TransferRequest> requests;
     requests.reserve(plan.requests.size());
     for (const auto& subrequest : plan.requests) {
@@ -2265,6 +2345,23 @@ std::optional<TransferFuture> TransferSubmitter::submitVSegment(
         requests.push_back(request);
     }
     auto future = submitTransfer(requests);
+    const bool needs_persistence = std::any_of(plan.requests.begin(), plan.requests.end(),
+        [](const auto& request) { return !request.persistence_endpoint.empty(); });
+    if (future && needs_persistence && op_code == TransferRequest::WRITE) {
+        // The object must remain reserved until the owner has persisted every
+        // touched file range. A failed barrier never becomes a successful PutEnd.
+        auto result = future->get();
+        if (result == ErrorCode::OK) {
+            for (const auto& request : plan.requests) {
+                if (request.persistence_endpoint.empty()) continue;
+                result = PersistFileRange(request);
+                if (result != ErrorCode::OK) break;
+            }
+        }
+        auto state = std::make_shared<MemcpyOperationState>();
+        state->set_completed(result);
+        future = TransferFuture(state);
+    }
     if (future) {
         size_t bytes = 0;
         for (const auto& request : plan.requests)
@@ -2781,6 +2878,8 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
+    if (size / block_size > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return std::nullopt;
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     const bool track_timing =
         mooncake::logging::ShouldSampleHiFreqLog(trace_id) ||

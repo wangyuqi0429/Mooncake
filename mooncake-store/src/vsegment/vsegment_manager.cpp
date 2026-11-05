@@ -166,6 +166,12 @@ VSegmentPutStartResult VSegmentManager::StartPut(
         return {ErrorCode::INVALID_PARAMS, operation_id, {},
                 "invalid PutStart operation, length, or profile"};
 
+    const auto& profile = profiles_.at(profile_name);
+    if (profile.required_medium == "nof" &&
+        (profile.io_alignment == 0 || length % profile.io_alignment != 0))
+        return {ErrorCode::INVALID_PARAMS, operation_id, {},
+                "NoF object length must satisfy profile io_alignment"};
+
     for (int pass = 0; pass < 2; ++pass) {
         std::shared_ptr<VSegmentDeferredCommitHandle> fence;
         bool allocated = false;
@@ -478,6 +484,12 @@ ReservationResult VSegmentManager::ReservePut(
             managed->second.lifecycle != Lifecycle::ACTIVE)
             return ReservationError(ErrorCode::SEGMENT_NOT_FOUND,
                                     "vsegment not found or not active");
+        const auto& profile = profiles_.at(managed->second.profile_name);
+        const auto alignment = profile.io_alignment;
+        if (profile.required_medium == "nof" &&
+            (length == 0 || alignment == 0 || length % alignment != 0))
+            return ReservationError(ErrorCode::INVALID_PARAMS,
+                                    "object length must satisfy profile io_alignment");
         auto existing = operation_vsegments_.find(operation_id);
         if (existing != operation_vsegments_.end() &&
             existing->second != vsegment_id)

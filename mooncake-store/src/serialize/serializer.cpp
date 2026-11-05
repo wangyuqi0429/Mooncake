@@ -875,9 +875,9 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
     // te_endpoint, status, has_buffer_allocator, buffer_allocator_data,
-    // host_id]
+    // host_id, protocol, medium, persistence_endpoint]
 
-    packer.pack_array(9);
+    packer.pack_array(12);
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -901,6 +901,9 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
                 return tl::unexpected(result.error());
             }
             packer.pack(mounted_segment.segment.host_id);
+            packer.pack(mounted_segment.segment.protocol);
+            packer.pack(mounted_segment.segment.medium);
+            packer.pack(mounted_segment.segment.persistence_endpoint);
             return {};
         }
     }
@@ -908,6 +911,9 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     packer.pack(false);  // Mark no valid buffer allocator exists
     packer.pack_nil();
     packer.pack(mounted_segment.segment.host_id);
+    packer.pack(mounted_segment.segment.protocol);
+    packer.pack(mounted_segment.segment.medium);
+    packer.pack(mounted_segment.segment.persistence_endpoint);
     return {};
 }
 
@@ -966,6 +972,11 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
         }
         if (obj.via.array.size >= 9) {
             mounted_segment.segment.host_id = array[8].as<std::string>();
+        }
+        if (obj.via.array.size >= 12) {
+            mounted_segment.segment.protocol = array[9].as<std::string>();
+            mounted_segment.segment.medium = array[10].as<std::string>();
+            mounted_segment.segment.persistence_endpoint = array[11].as<std::string>();
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(

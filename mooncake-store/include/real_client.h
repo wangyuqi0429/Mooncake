@@ -14,6 +14,7 @@
 
 #include "pyclient.h"
 #include "client_service.h"
+#include "vsegment/file_segment.h"
 #include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
@@ -794,6 +795,7 @@ class RealClient : public PyClient {
         void *mmap_base = nullptr;
         size_t size = 0;
         std::string path;
+        std::shared_ptr<vsegment::FileSegmentFd> file;
     };
 
     struct AllocatedSegmentRecord {
@@ -977,6 +979,10 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;
+    std::mutex file_mount_mutex_;
+    vsegment::FileSegmentStore file_segment_store_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> file_segment_rpc_server_;
+    std::string file_segment_rpc_endpoint_;
 
     std::unordered_map<std::string, AllocatedSegmentRecord>
         allocated_segment_records_;

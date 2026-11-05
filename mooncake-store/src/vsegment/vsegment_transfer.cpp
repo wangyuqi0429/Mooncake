@@ -51,8 +51,7 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
     view.logical_capacity = it->logical_capacity;
     view.checksum = it->checksum;
     view.members.reserve(it->members.size());
-    std::unordered_map<std::string, std::pair<std::string, uint64_t>>
-        member_locations;
+    std::unordered_map<std::string, const VSegmentLayoutMember*> member_locations;
     for (const auto& member : it->members) {
         view.members.push_back(PSegmentExtent{member.segment_id,
                                               member.base_offset,
@@ -65,9 +64,7 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
                           member.segment_id;
             return plan;
         }
-        member_locations.emplace(member.segment_id,
-                                 std::make_pair(member.endpoint,
-                                                member.base_address));
+        member_locations.emplace(member.segment_id, &member);
     }
     std::string validation_detail;
     if (ValidateViewStructure(view, &validation_detail) != ErrorCode::OK) {
@@ -80,36 +77,34 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
                                     replica.length, slices);
     if (!resolved) return {resolved.error, {}, std::move(resolved.detail)};
 
-    // Resolve each distinct psegment only once per Plan: the sub-request count
-    // grows with (length / stripe_size) while distinct segments are bounded by
-    // member_count.
-    std::unordered_map<std::string, std::pair<std::string, uint64_t>>
-        endpoints;
     for (auto& request : resolved.requests) {
-        auto [entry, inserted] = endpoints.try_emplace(request.segment_id);
-        if (inserted) {
-            auto found = member_locations.find(request.segment_id);
-            if (found == member_locations.end()) {
-                plan.error = ErrorCode::SEGMENT_NOT_FOUND;
-                plan.detail =
-                    "inline layout missing endpoint for " + request.segment_id;
-                plan.requests.clear();
-                return plan;
-            }
-            entry->second = found->second;
+        auto found = member_locations.find(request.segment_id);
+        if (found == member_locations.end()) {
+            return {ErrorCode::SEGMENT_NOT_FOUND, {},
+                    "inline layout missing endpoint for " + request.segment_id};
         }
-        const auto& [endpoint, base_address] = entry->second;
+        const auto& location = *found->second;
         if (request.physical_offset >
-            std::numeric_limits<uint64_t>::max() - base_address) {
+            std::numeric_limits<uint64_t>::max() - location.base_address) {
             plan.error = ErrorCode::INVALID_PARAMS;
             plan.detail = "psegment target address overflows";
             plan.requests.clear();
             return plan;
         }
-        request.physical_offset += base_address;
+        const auto segment_offset = request.physical_offset;
+        request.physical_offset += location.base_address;
         // NOTE: endpoint is shared by every sub-request of this segment, so it
         // must be copied rather than moved.
-        plan.requests.push_back({std::move(request), endpoint});
+        if (location.backend == PSegmentBackend::NOF &&
+            (location.io_alignment == 0 ||
+             request.physical_offset % location.io_alignment != 0 ||
+             request.client_address % location.io_alignment != 0 ||
+             request.length % location.io_alignment != 0)) {
+            return {ErrorCode::INVALID_PARAMS, {}, "unaligned NoF stripe or client slice"};
+        }
+        plan.requests.push_back({std::move(request), location.endpoint,
+                                 location.backend, location.persistence_endpoint,
+                                 segment_offset});
     }
     return plan;
 }

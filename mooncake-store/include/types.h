@@ -492,9 +492,11 @@ struct Segment {
     // --cvm_segment_default_medium。支持混合介质集群：不同 segment 可上报
     // 不同 medium，planner 按 profile.required_medium 自动过滤。
     std::string medium{};
+    std::string persistence_endpoint{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id, medium);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id, medium,
+         persistence_endpoint);
 
 /**
  * @brief Allocation strategy type for segment allocation

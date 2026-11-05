@@ -4718,7 +4718,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
-    const std::string& location) {
+    const std::string& location, std::optional<UUID> stable_id,
+    const std::string& persistence_endpoint) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -4752,8 +4753,9 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         }
 
         Segment segment;
-        segment.id = generate_uuid();
-        segment.name = local_hostname_;
+        segment.id = stable_id ? *stable_id : generate_uuid();
+        segment.persistence_endpoint = persistence_endpoint;
+        segment.name = persistence_endpoint.empty() ? local_hostname_ : UuidToString(segment.id);
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
         segment.protocol = protocol;
@@ -4793,6 +4795,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             if (!any_mounted) {
                 LOG(ERROR) << "mount_segment_to_all_submasters_failed base="
                            << buffer << " size=" << size;
+                if (!persistence_endpoint.empty()) mounted_segments_[segment.id] = segment;
                 return tl::unexpected(ErrorCode::RPC_FAIL);
             }
         } else {
@@ -4801,6 +4804,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
                 ErrorCode err = mount_result.error();
                 LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                            << " size=" << size << ", error=" << err;
+                if (!persistence_endpoint.empty()) mounted_segments_[segment.id] = segment;
                 return tl::unexpected(err);
             }
         }

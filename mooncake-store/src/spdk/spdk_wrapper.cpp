@@ -617,6 +617,7 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
 
 nof_seg_handle *SpdkWrapper::OpenNofSegmentWithLaneCount(
     const std::string &tr_str, uint32_t requested_lane_count) {
+    if (!InitializeEnv()) return nullptr;
     tr_info tr;
     int ret = ParseTransPortStr(tr_str, &tr);
     if (ret != 0) {
@@ -779,6 +780,30 @@ uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     return spdk_nvme_ns_get_sector_size(seg_handle->ns);
 }
 
+uint64_t SpdkWrapper::GetNamespaceSize(const nof_seg_handle *handle) {
+    return handle && handle->ns ? spdk_nvme_ns_get_size(handle->ns) : 0;
+}
+
+std::string SpdkWrapper::GetNamespaceIdentity(const nof_seg_handle *handle) {
+    if (!handle || !handle->ns) return {};
+    const auto* data = spdk_nvme_ns_get_data(handle->ns);
+    if (!data) return {};
+    std::string identity;
+    bool nonzero = false;
+    constexpr char digits[] = "0123456789abcdef";
+    for (const auto byte : data->nguid) {
+        nonzero |= byte != 0;
+        identity += digits[byte >> 4];
+        identity += digits[byte & 15];
+    }
+    for (const auto byte : data->eui64) {
+        nonzero |= byte != 0;
+        identity += digits[byte >> 4];
+        identity += digits[byte & 15];
+    }
+    return nonzero ? identity : std::string{};
+}
+
 uint32_t SpdkWrapper::GetBlockSize(const nof_io_lane *lane) {
     return lane == nullptr ? INVALID_BLOCK_SIZE : GetBlockSize(lane->segment);
 }
@@ -803,11 +828,12 @@ int SpdkWrapper::SubmitRequestOnQpair(struct spdk_nvme_qpair *qpair,
                                      cb_ctx, 0);
     } else if (op == kSpdkNofOpWrite) {
         if (io_opts != nullptr) {
+            io_opts->io_flags |= SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS;
             return spdk_nvme_ns_cmd_write_ext(ns, qpair, ptr, lba, lba_count,
                                               cb_fn, cb_ctx, io_opts);
         }
         return spdk_nvme_ns_cmd_write(ns, qpair, ptr, lba, lba_count, cb_fn,
-                                      cb_ctx, 0);
+                                      cb_ctx, SPDK_NVME_IO_FLAGS_FORCE_UNIT_ACCESS);
     }
     return -1;
 }

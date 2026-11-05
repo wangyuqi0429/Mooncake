@@ -17,6 +17,9 @@ namespace mooncake::vsegment {
 struct EndpointTransferSubRequest {
     TransferSubRequest transfer;
     std::string endpoint;
+    PSegmentBackend backend{PSegmentBackend::TRANSFER_ENGINE};
+    std::string persistence_endpoint;
+    uint64_t segment_offset{0};
 };
 
 struct VSegmentTransferPlan {

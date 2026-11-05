@@ -68,6 +68,8 @@ struct SegmentDescriptor {
     std::string te_endpoint;  // transport endpoint, e.g. "host:port"
     std::string protocol;
     std::string host_id;
+    uint64_t base_offset{0};
+    std::string device_identity;
     // Future: partitions for psegment/vsegment split
     struct Partition {
         uint16_t slot_start{0};
@@ -83,7 +85,7 @@ struct SegmentDescriptor {
     std::string medium;
     // I/O 对齐字节数。Planner 取 max(profile.io_alignment, segment.io_alignment)。
     uint64_t io_alignment{1};
-    // 是否支持非对齐 I/O。false 时该 psegment 不参与 vsegment 条带化。
+    // 是否支持非对齐 I/O。false 时要求 profile 和客户端请求满足设备块对齐。
     bool supports_unaligned_io{true};
     // 故障域标识，缺省由 host_id 兜底，可由部署标签补充。
     std::string failure_domain;
@@ -100,7 +102,7 @@ struct SegmentDescriptor {
 YLT_REFL(SegmentDescriptor, segment_id, segment_name, capacity, te_endpoint,
          protocol, host_id, partitions, medium, io_alignment,
          supports_unaligned_io, failure_domain, used_bytes,
-         vsegment_exclusive);
+         vsegment_exclusive, base_offset, device_identity);
 
 // ---------------------------------------------------------------------------
 // Master registration: liveness + role, persisted under an etcd lease

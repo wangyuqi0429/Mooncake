@@ -22,15 +22,22 @@ YLT_REFL(ObjectMeta, key, object_checksum);
 // Runtime-resolved location of one vsegment member. Only filled for vsegment
 // replicas; ordinary memory/NoF/disk replicas carry their own endpoint/base in
 // Replica::Descriptor.
+namespace vsegment {
+enum class PSegmentBackend : uint8_t { TRANSFER_ENGINE = 0, NOF = 1 };
+}  // namespace vsegment
+
 struct VSegmentLayoutMember {
     std::string segment_id;
     uint64_t base_offset{0};
     uint64_t length{0};
     std::string endpoint;
     uint64_t base_address{0};
+    vsegment::PSegmentBackend backend{vsegment::PSegmentBackend::TRANSFER_ENGINE};
+    uint64_t io_alignment{1};
+    std::string persistence_endpoint;
 };
 YLT_REFL(VSegmentLayoutMember, segment_id, base_offset, length, endpoint,
-         base_address);
+         base_address, backend, io_alignment, persistence_endpoint);
 
 // Deduplicated per-vsegment layout carried alongside replica descriptors.
 // The layout is immutable; endpoint/base are runtime values resolved by the

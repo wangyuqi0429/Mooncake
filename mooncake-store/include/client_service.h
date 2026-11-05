@@ -355,7 +355,9 @@ class Client {
      */
     tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        std::optional<UUID> stable_id = std::nullopt,
+        const std::string& persistence_endpoint = {});
 
     /**
      * @brief Unmounts a segment by its UUID.

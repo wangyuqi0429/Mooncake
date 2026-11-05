@@ -329,7 +329,8 @@ ErrorCode ValidateQuotaSnapshot(
             if (segment == geometry.end())
                 return Invalid("quota references unknown psegment", detail);
             if (!segment->second.healthy ||
-                !segment->second.supports_unaligned_io)
+                (!segment->second.supports_unaligned_io &&
+                 profile->second.io_alignment % segment->second.io_alignment != 0))
                 return Invalid("quota references ineligible psegment", detail);
             if (segment->second.medium != quota.medium)
                 return Invalid("quota psegment medium mismatch", detail);

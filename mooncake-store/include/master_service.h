@@ -2703,6 +2703,9 @@ class MasterService {
     // <seg_id> 同步到 etcd，CvmHttpServer 据此聚合出 segment 视图。仅在 etcd
     // HA backend 下生效，其余场景为空操作。
     void PublishSegmentOwnerForCvm(const Segment& segment);
+    std::optional<VSegmentLayoutMember> ResolveVSegmentLayoutMember(
+        const std::string& segment_id);
+    ErrorCode PublishNoFSegmentForVSegment(const NoFSegment& segment);
     void RemoveSegmentOwnerForCvm(const UUID& segment_id);
     // 方案一 A（代际替换）：worker 每次进程启动都以新 client_id 重挂段。
     // stale_evict_thread_ drain 时调用本方法（MountSegment 尾部经
@@ -2925,6 +2928,9 @@ class MasterService {
     std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
     std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
     mutable std::shared_mutex snapshot_mutex_;
+    // Runtime registrations only: snapshots must not authorize old mmap bases.
+    std::mutex file_segment_registration_mutex_;
+    std::unordered_set<std::string> live_file_segment_ids_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
