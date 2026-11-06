@@ -52,6 +52,41 @@ else()
     message(STATUS "URMA headers lack urma_seg_cfg_t::is_gpu_seg; gdr-peermem disabled (host/staging only)")
 endif()
 
+# The k8s (optical-fabric) path exchanges user-space segment/jetty context
+# blobs, so the resolved URMA headers must provide urma_get_seg_ctx and
+# urma_get_rjetty. Fail at configure time with an actionable message instead
+# of a cryptic compile error.
+set(_UB_SAVED_CMAKE_TRY_COMPILE_TARGET_TYPE ${CMAKE_TRY_COMPILE_TARGET_TYPE})
+set(_UB_SAVED_CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES})
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+set(CMAKE_REQUIRED_INCLUDES ${urma_INCLUDE_DIR})
+check_cxx_source_compiles("
+#include <urma_api.h>
+int main() {
+    urma_target_seg_t *tseg = nullptr;
+    urma_seg_t *seg = nullptr;
+    uint32_t seg_size = 0;
+    (void)urma_get_seg_ctx(tseg, &seg, &seg_size);
+    (void)urma_put_seg_ctx(seg);
+    urma_jetty_t *jetty = nullptr;
+    urma_rjetty_t *rjetty = nullptr;
+    uint32_t rjetty_len = 0;
+    (void)urma_get_rjetty(jetty, &rjetty, &rjetty_len);
+    (void)urma_put_rjetty(rjetty);
+    return 0;
+}
+" HAVE_URMA_SEG_CTX_API)
+set(CMAKE_REQUIRED_INCLUDES ${_UB_SAVED_CMAKE_REQUIRED_INCLUDES})
+set(CMAKE_TRY_COMPILE_TARGET_TYPE ${_UB_SAVED_CMAKE_TRY_COMPILE_TARGET_TYPE})
+unset(_UB_SAVED_CMAKE_REQUIRED_INCLUDES)
+unset(_UB_SAVED_CMAKE_TRY_COMPILE_TARGET_TYPE)
+if (NOT HAVE_URMA_SEG_CTX_API)
+    message(FATAL_ERROR
+            "The resolved URMA headers do not provide urma_get_seg_ctx/urma_get_rjetty. "
+            "Mooncake's k8s (optical-fabric) UB path requires them. Point URMA_ROOT/UMDK_ROOT "
+            "at an SDK matching the deployed liburma. Resolved urma_INCLUDE_DIR: ${urma_INCLUDE_DIR}")
+endif()
+
 target_link_libraries(ub_transport
         PRIVATE
         JsonCpp::JsonCpp
