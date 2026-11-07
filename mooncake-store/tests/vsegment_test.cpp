@@ -2666,6 +2666,54 @@ TEST(BuildDiscoveredQuotaPlanTest, AcceptsExclusiveSegmentsAndReadsRealFacts) {
     EXPECT_EQ(request.profile_specs[0].member_count, 2u);
 }
 
+TEST(BuildDiscoveredQuotaPlanTest, SingleNoFAutoPlanWaitsForManualMount) {
+    VSegmentUserPolicy policy;
+    policy.required_medium = "nof";
+    policy.io_alignment = 4096;
+    policy.member_count = 1;
+    policy.stripe_size = 2ULL << 20;
+    policy.member_extent_size = 64ULL << 20;
+
+    cvm::MasterRegistration master;
+    master.master_id = "primary";
+    cvm::SegmentDescriptor segment;
+    segment.segment_id = "nof-a";
+    segment.te_endpoint = "nof-target";
+    segment.protocol = "nof";
+    segment.medium = "nof";
+    segment.io_alignment = 4096;
+    segment.supports_unaligned_io = false;
+    segment.vsegment_exclusive = true;
+    segment.capacity = (100ULL << 20) * cvm::SlotCount();
+    cvm::MountEntry mount;
+    mount.segment_id = segment.segment_id;
+
+    PartitionQuotaPlanRequest request;
+    EXPECT_EQ(BuildDiscoveredQuotaPlan(policy, {segment}, {master}, {},
+                                       &request),
+              ErrorCode::VSEGMENT_STATIC_QUOTA_INSUFFICIENT);
+    ASSERT_EQ(BuildDiscoveredQuotaPlan(policy, {segment}, {master},
+                                       {{master.master_id, mount}}, &request),
+              ErrorCode::OK);
+    auto plan = PartitionQuotaPlanner().Plan(request);
+    ASSERT_TRUE(plan) << plan.detail;
+    ASSERT_EQ(plan.snapshot.profile_specs.size(), 1u);
+    const auto& profile = plan.snapshot.profile_specs.front();
+    EXPECT_EQ(plan.snapshot.default_profile, profile.name);
+    EXPECT_EQ(profile.required_medium, "nof");
+    EXPECT_EQ(profile.io_alignment, 4096u);
+    PartitionVSegmentConfig config;
+    ASSERT_EQ(BuildPartitionConfig(plan.snapshot, "0", profile.name, &config),
+              ErrorCode::OK);
+    auto allocation = PartitionQuotaAllocator(config).Allocate("vs", profile);
+    ASSERT_TRUE(allocation) << allocation.detail;
+    ASSERT_EQ(allocation.view.members.size(), 1u);
+    EXPECT_EQ(allocation.view.members.front().segment_id, segment.segment_id);
+    auto memory_profile = profile;
+    memory_profile.required_medium = "DRAM";
+    EXPECT_EQ(ValidateProfile(memory_profile), ErrorCode::INVALID_PARAMS);
+}
+
 TEST(BuildDiscoveredQuotaPlanTest, RejectsEmptyMediumFromAllocator) {
     VSegmentUserPolicy policy;
     policy.member_count = 1;

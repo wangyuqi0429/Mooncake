@@ -34,8 +34,10 @@ void AppendString(std::string& output, const std::string& value) {
 
 ErrorCode ValidateProfile(const VSegmentProfile& profile, std::string* detail) {
     if (profile.name.empty()) return Invalid("profile name is empty", detail);
-    if (profile.member_count < 2)
-        return Invalid("member_count must be at least 2", detail);
+    const uint32_t min_members = profile.required_medium == "nof" ? 1 : 2;
+    if (profile.member_count < min_members)
+        return Invalid("member_count must be at least " +
+                           std::to_string(min_members), detail);
     if (profile.stripe_size == 0)
         return Invalid("stripe_size must be positive", detail);
     if (profile.member_extent_size == 0)

@@ -838,6 +838,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     config.vsegment_auto_plan_member_extent_size;
                 policy.reserved_ratio =
                     config.vsegment_auto_plan_reserved_ratio;
+                policy.required_medium =
+                    config.vsegment_auto_plan_required_medium;
+                policy.io_alignment = config.vsegment_auto_plan_io_alignment;
                 wrapped_master_service->SetVSegmentAutoPlanPolicy(policy);
             }
 

@@ -276,6 +276,8 @@ class MasterServiceSupervisorConfig {
     uint64_t vsegment_auto_plan_stripe_size = 0;
     uint64_t vsegment_auto_plan_member_extent_size = 0;
     double vsegment_auto_plan_reserved_ratio = 0.0;
+    std::string vsegment_auto_plan_required_medium;
+    uint64_t vsegment_auto_plan_io_alignment = 1;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =

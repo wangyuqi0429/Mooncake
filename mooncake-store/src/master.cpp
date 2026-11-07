@@ -214,12 +214,16 @@ DEFINE_bool(enable_ha, false,
 
 // vsegment 配额自动规划（启动 bootstrap，etcd HA 模式专属）：quota 快照
 // 不存在时按以下策略自动「发现→规划→发布」（等价 vsegment_quota_planner
-// --publish；高级参数 required_medium/io_alignment 等走 master 的
-// POST /vsegment_quota 端点）。多实例并发安全：etcd 原子首写，
+// --publish）。多实例并发安全：etcd 原子首写，
 // first-writer-wins。变更策略需先删除已发布快照再重启（或改用端点重发）。
 DEFINE_bool(vsegment_auto_plan, false,
             "Auto-plan and publish the vsegment quota snapshot at startup "
             "when none exists (etcd HA mode only)");
+DEFINE_string(vsegment_required_medium, "",
+              "Required medium for vsegment auto-plan. Empty discovers all "
+              "eligible media.");
+DEFINE_uint64(vsegment_io_alignment, 1,
+              "Required I/O alignment in bytes for vsegment auto-plan");
 DEFINE_uint32(vsegment_member_count, 0,
               "vsegment auto-plan: number of distinct members per vsegment");
 DEFINE_uint64(vsegment_stripe_size, 0,
@@ -1558,6 +1562,20 @@ BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
     policy.stripe_size = FLAGS_vsegment_stripe_size;
     policy.member_extent_size = FLAGS_vsegment_member_extent_size;
     policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    policy.required_medium = FLAGS_vsegment_required_medium;
+    policy.io_alignment = FLAGS_vsegment_io_alignment;
+    if (!policy.required_medium.empty()) {
+        const mooncake::vsegment::VSegmentProfile profile{
+            policy.profile_name, policy.member_count, policy.stripe_size,
+            policy.member_extent_size, policy.io_alignment,
+            policy.required_medium, policy.initial_vsegment_count};
+        std::string detail;
+        if (mooncake::vsegment::ValidateProfile(profile, &detail) !=
+            mooncake::ErrorCode::OK) {
+            LOG(ERROR) << "Invalid vsegment auto-plan profile: " << detail;
+            return std::nullopt;
+        }
+    }
     LOG(INFO) << "VSegment auto-plan policy: member_count="
               << policy.member_count << ", stripe_size="
               << policy.stripe_size << ", member_extent_size="
@@ -1594,6 +1612,17 @@ void TryAutoPlanVSegmentQuota(
     mooncake::vsegment::PartitionPhysicalQuotaSnapshot existing;
     mooncake::vsegment::EtcdPartitionQuotaSnapshotStore store(config.cluster_id);
     if (store.Load(&existing) == mooncake::ErrorCode::OK) {
+        const auto& medium = policy_opt->required_medium;
+        if (!medium.empty() &&
+            std::none_of(existing.profile_specs.begin(),
+                         existing.profile_specs.end(), [&](const auto& profile) {
+                             return profile.name == existing.default_profile &&
+                                    profile.required_medium == medium;
+                         })) {
+            LOG(WARNING) << "Existing vsegment quota default profile does not "
+                            "match requested medium " << medium
+                         << "; retaining published quota";
+        }
         LOG(INFO) << "vsegment auto-plan: quota generation "
                   << existing.config_generation
                   << " already published; skipping";
@@ -1877,6 +1906,20 @@ int main(int argc, char* argv[]) {
         metadata_server_ptr = http_metadata_server.get();
     }
 
+    if (FLAGS_vsegment_auto_plan && FLAGS_vsegment_required_medium == "nof") {
+#if defined(USE_NOF) && defined(STORE_USE_ETCD)
+        if (!master_config.enable_ha || master_config.ha_backend_type != "etcd" ||
+            !master_config.cvm_segments_vsegment_exclusive) {
+            LOG(ERROR) << "NOF vsegment auto-plan requires etcd HA and "
+                          "--cvm_segments_vsegment_exclusive=true";
+            return -1;
+        }
+#else
+        LOG(ERROR) << "NOF vsegment auto-plan requires USE_NOF and STORE_USE_ETCD";
+        return -1;
+#endif
+    }
+
     if (master_config.enable_ha) {
 #ifdef STORE_USE_ETCD
         // vsegment 配额自动规划（--vsegment_auto_plan）：supervisor 启动前
@@ -1886,6 +1929,10 @@ int main(int argc, char* argv[]) {
         // 见 MasterService::MaybeRetryVSegmentAutoPlan）。
         const auto auto_plan_policy =
             BuildVSegmentAutoPlanPolicy(master_config);
+        if (FLAGS_vsegment_auto_plan &&
+            !FLAGS_vsegment_required_medium.empty() && !auto_plan_policy) {
+            return -1;
+        }
         TryAutoPlanVSegmentQuota(master_config, auto_plan_policy);
 #endif
         mooncake::MasterServiceSupervisorConfig supervisor_config{
@@ -1903,6 +1950,10 @@ int main(int argc, char* argv[]) {
                 auto_plan_policy->member_extent_size;
             supervisor_config.vsegment_auto_plan_reserved_ratio =
                 auto_plan_policy->reserved_ratio;
+            supervisor_config.vsegment_auto_plan_required_medium =
+                auto_plan_policy->required_medium;
+            supervisor_config.vsegment_auto_plan_io_alignment =
+                auto_plan_policy->io_alignment;
         }
 #endif
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
