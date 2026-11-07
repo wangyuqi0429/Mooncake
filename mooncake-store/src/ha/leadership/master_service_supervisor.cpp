@@ -30,7 +30,6 @@
 #include "cvm/cvm_service_delegate.h"
 #include "cvm/etcd_view_store.h"
 #include "etcd_helper.h"
-#include "vsegment/partition_quota_planner.h"
 
 namespace mooncake {
 namespace ha {
@@ -839,9 +838,6 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                     config.vsegment_auto_plan_member_extent_size;
                 policy.reserved_ratio =
                     config.vsegment_auto_plan_reserved_ratio;
-                policy.required_medium =
-                    config.vsegment_auto_plan_required_medium;
-                policy.io_alignment = config.vsegment_auto_plan_io_alignment;
                 wrapped_master_service->SetVSegmentAutoPlanPolicy(policy);
             }
 
@@ -873,55 +869,6 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                                  "state before serve";
                 }
             }
-
-#if defined(USE_NOF) && defined(STORE_USE_ETCD)
-            std::optional<UUID> startup_nof_owner;
-            if (config.vsegment_auto_plan_required_medium == "nof") {
-                if (!cvm_controller || cvm_controller->GetLeaseId() == 0) {
-                    LOG(ERROR) << "NOF vsegment startup requires a CVM lease";
-                    return -1;
-                }
-                vsegment::EtcdPartitionQuotaSnapshotStore quota_store(
-                    config.cluster_id);
-                vsegment::PartitionPhysicalQuotaSnapshot snapshot;
-                const auto error = quota_store.Load(&snapshot);
-                if (error == ErrorCode::OK) {
-                    const auto profile = std::find_if(
-                        snapshot.profile_specs.begin(),
-                        snapshot.profile_specs.end(),
-                        [&](const auto& spec) {
-                            return spec.name == snapshot.default_profile;
-                        });
-                    if (profile == snapshot.profile_specs.end() ||
-                        profile->required_medium != "nof") {
-                        LOG(ERROR) << "Existing vsegment quota default profile "
-                                      "does not use NOF";
-                        return -1;
-                    }
-                } else if (error != ErrorCode::ETCD_KEY_NOT_EXIST) {
-                    LOG(ERROR) << "Cannot check vsegment quota at NOF startup: "
-                               << toString(error);
-                    return -1;
-                }
-                if (!config.nof_startup_segments.empty()) {
-                    startup_nof_owner = generate_uuid();
-                    for (const auto& segment : config.nof_startup_segments) {
-                        auto mounted =
-                            wrapped_master_service->MountNoFSegment(
-                                segment, *startup_nof_owner);
-                        if (!mounted) {
-                            LOG(ERROR) << "Failed to mount startup NOF namespace "
-                                       << segment.name << ": "
-                                       << toString(mounted.error());
-                            return -1;
-                        }
-                    }
-                    LOG(INFO) << "Published "
-                              << config.nof_startup_segments.size()
-                              << " startup NOF namespaces for vsegment";
-                }
-            }
-#endif
 
             mooncake::RegisterRpcService(server, *wrapped_master_service);
 
@@ -998,28 +945,6 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             metrics_reporter.SetRole("standby");
             wrapped_master_service->StopSlotOwnerHeartbeat();
             wrapped_master_service->StopInterMasterRpc();
-#if defined(USE_NOF) && defined(STORE_USE_ETCD)
-            if (startup_nof_owner) {
-                for (const auto& segment : config.nof_startup_segments) {
-                    const auto mounts =
-                        wrapped_master_service->GetNoFSegmentsByName(
-                            segment.name);
-                    if (!mounts) continue;
-                    for (const auto& mount : *mounts) {
-                        if (mount.client_id != *startup_nof_owner) continue;
-                        const auto removed =
-                            wrapped_master_service->UnmountNoFSegment(
-                                mount.segment_id, mount.client_id);
-                        if (!removed) {
-                            LOG(WARNING)
-                                << "Failed to unmount startup NOF namespace "
-                                << segment.name << ": "
-                                << toString(removed.error());
-                        }
-                    }
-                }
-            }
-#endif
             cvm_membership_coordinator.SetServeStopSignal(nullptr);
             DeactivateServingState(admin_server, label_reconciler);
             EnterStandbyMode(admin_server, *standby_controller,

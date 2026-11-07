@@ -4,19 +4,16 @@
 #include <dirent.h>  // For opendir (MC_LOG_DIR validation)
 #include <unistd.h>  // For access/W_OK (MC_LOG_DIR validation)
 
-#include <algorithm>  // For std::max
 #include <atomic>  // For std::atomic
-#include <charconv>
 #include <chrono>  // For std::chrono
+#include <algorithm>  // For std::max
 #include <csignal>
 #include <cstdlib>  // For std::getenv
 #include <fstream>  // For std::ifstream
 #include <memory>   // For std::unique_ptr
 #include <optional>  // For std::optional
-#include <sstream>
 #include <string>
 #include <thread>  // For std::thread
-#include <unordered_set>
 #include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
@@ -29,7 +26,6 @@
 #include "master_admin_service.h"
 #include "mooncake_logging.h"
 #include "rpc_service.h"
-#include "ssd_register_client.h"
 #include "types.h"
 #include "utils.h"
 
@@ -224,13 +220,6 @@ DEFINE_bool(enable_ha, false,
 DEFINE_bool(vsegment_auto_plan, false,
             "Auto-plan and publish the vsegment quota snapshot at startup "
             "when none exists (etcd HA mode only)");
-DEFINE_string(vsegment_required_medium, "",
-              "vsegment auto-plan: required medium; empty discovers all media");
-DEFINE_uint64(vsegment_io_alignment, 1,
-              "vsegment auto-plan: I/O alignment in bytes");
-DEFINE_string(nof_startup_segments_file, "",
-              "Mount NoF namespaces on this submaster at serve startup. "
-              "Each line: nqn nsid traddr trsvcid trtype size_bytes");
 DEFINE_uint32(vsegment_member_count, 0,
               "vsegment auto-plan: number of distinct members per vsegment");
 DEFINE_uint64(vsegment_stripe_size, 0,
@@ -1569,8 +1558,6 @@ BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
     policy.stripe_size = FLAGS_vsegment_stripe_size;
     policy.member_extent_size = FLAGS_vsegment_member_extent_size;
     policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
-    policy.required_medium = FLAGS_vsegment_required_medium;
-    policy.io_alignment = FLAGS_vsegment_io_alignment;
     LOG(INFO) << "VSegment auto-plan policy: member_count="
               << policy.member_count << ", stripe_size="
               << policy.stripe_size << ", member_extent_size="
@@ -1632,66 +1619,6 @@ void TryAutoPlanVSegmentQuota(
     }
 }
 #endif  // STORE_USE_ETCD
-
-#if defined(USE_NOF) && defined(STORE_USE_ETCD)
-namespace {
-
-bool LoadStartupNoFSegments(const std::string& path,
-                            std::vector<mooncake::NoFSegment>& segments) {
-    std::ifstream input(path);
-    if (!input) {
-        LOG(ERROR) << "Cannot open NOF namespace list: " << path;
-        return false;
-    }
-    const auto parse_positive = [](const std::string& text, size_t& value) {
-        const auto* end = text.data() + text.size();
-        const auto result = std::from_chars(text.data(), end, value);
-        return result.ec == std::errc{} && result.ptr == end && value > 0;
-    };
-    std::unordered_set<std::string> endpoints;
-    std::string line;
-    size_t line_number = 0;
-    while (std::getline(input, line)) {
-        ++line_number;
-        if (const auto comment = line.find('#'); comment != std::string::npos)
-            line.resize(comment);
-        std::istringstream row(line);
-        std::string nqn, nsid_text, address, port_text, transport, size_text;
-        std::string extra;
-        if (!(row >> nqn)) continue;
-        size_t nsid = 0, port = 0, size = 0;
-        if (!(row >> nsid_text >> address >> port_text >> transport >>
-              size_text) ||
-            (row >> extra) || !parse_positive(nsid_text, nsid) ||
-            nsid > UINT32_MAX || !parse_positive(port_text, port) ||
-            port > UINT16_MAX || !parse_positive(size_text, size)) {
-            LOG(ERROR) << "Invalid NOF namespace entry: " << path << ':'
-                       << line_number;
-            return false;
-        }
-        auto endpoint =
-            mooncake::BuildNoFEndpoint(nqn, nsid, address, port, transport);
-        if (endpoint.empty() || !endpoints.insert(endpoint).second) {
-            LOG(ERROR) << "Invalid or duplicate NOF endpoint: " << path << ':'
-                       << line_number;
-            return false;
-        }
-        mooncake::NoFSegment segment{};
-        segment.id = mooncake::generate_uuid();
-        segment.name = endpoint;
-        segment.te_endpoint = std::move(endpoint);
-        segment.size = size;
-        segments.push_back(std::move(segment));
-    }
-    if (input.bad() || segments.empty()) {
-        LOG(ERROR) << "Cannot read a nonempty NOF namespace list: " << path;
-        return false;
-    }
-    return true;
-}
-
-}  // namespace
-#endif
 
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
@@ -1950,33 +1877,6 @@ int main(int argc, char* argv[]) {
         metadata_server_ptr = http_metadata_server.get();
     }
 
-    std::vector<mooncake::NoFSegment> nof_startup_segments;
-    if (!FLAGS_nof_startup_segments_file.empty() ||
-        FLAGS_vsegment_required_medium == "nof") {
-#if defined(USE_NOF) && defined(STORE_USE_ETCD)
-        if (!master_config.enable_ha || master_config.ha_backend_type != "etcd" ||
-            !master_config.cvm_segments_vsegment_exclusive ||
-            !FLAGS_vsegment_auto_plan || FLAGS_vsegment_required_medium != "nof" ||
-            FLAGS_vsegment_member_count == 0 || FLAGS_vsegment_stripe_size == 0 ||
-            FLAGS_vsegment_member_extent_size == 0 ||
-            FLAGS_vsegment_io_alignment == 0 ||
-            FLAGS_vsegment_stripe_size % FLAGS_vsegment_io_alignment != 0 ||
-            FLAGS_vsegment_member_extent_size % FLAGS_vsegment_stripe_size != 0) {
-            LOG(ERROR) << "NOF startup requires etcd HA, vsegment exclusive "
-                          "mode and a valid NOF auto-plan policy";
-            return -1;
-        }
-        if (!FLAGS_nof_startup_segments_file.empty() &&
-            !LoadStartupNoFSegments(FLAGS_nof_startup_segments_file,
-                                    nof_startup_segments)) {
-            return -1;
-        }
-#else
-        LOG(ERROR) << "NOF startup requires USE_NOF and STORE_USE_ETCD";
-        return -1;
-#endif
-    }
-
     if (master_config.enable_ha) {
 #ifdef STORE_USE_ETCD
         // vsegment 配额自动规划（--vsegment_auto_plan）：supervisor 启动前
@@ -1986,15 +1886,12 @@ int main(int argc, char* argv[]) {
         // 见 MasterService::MaybeRetryVSegmentAutoPlan）。
         const auto auto_plan_policy =
             BuildVSegmentAutoPlanPolicy(master_config);
-        if (FLAGS_vsegment_required_medium != "nof") {
-            TryAutoPlanVSegmentQuota(master_config, auto_plan_policy);
-        }
+        TryAutoPlanVSegmentQuota(master_config, auto_plan_policy);
 #endif
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
         supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
-        supervisor_config.nof_startup_segments = std::move(nof_startup_segments);
 #ifdef STORE_USE_ETCD
         if (auto_plan_policy) {
             supervisor_config.vsegment_auto_plan = true;
@@ -2006,10 +1903,6 @@ int main(int argc, char* argv[]) {
                 auto_plan_policy->member_extent_size;
             supervisor_config.vsegment_auto_plan_reserved_ratio =
                 auto_plan_policy->reserved_ratio;
-            supervisor_config.vsegment_auto_plan_required_medium =
-                auto_plan_policy->required_medium;
-            supervisor_config.vsegment_auto_plan_io_alignment =
-                auto_plan_policy->io_alignment;
         }
 #endif
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);

@@ -360,7 +360,7 @@ void SpdkWrapper::ProbeReadComplete(void *ctx,
         probe_ctx->success.store(true, std::memory_order_release);
     }
     probe_ctx->done.store(true, std::memory_order_release);
-    if (probe_ctx->owner != nullptr) {
+    if (probe_ctx->released.exchange(true, std::memory_order_acq_rel)) {
         probe_ctx->owner->RecycleProbeRequestContext(probe_ctx);
     }
 }
@@ -966,6 +966,11 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         }
     }
 
+    // The callback may finish after the poller times out. The second side
+    // to finish recycles the context.
+    if (probe_ctx->released.exchange(true, std::memory_order_acq_rel)) {
+        RecycleProbeRequestContext(probe_ctx);
+    }
     return ok;
 }
 

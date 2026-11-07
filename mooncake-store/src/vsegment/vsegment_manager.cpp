@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <set>
 #include <sstream>
 
@@ -572,6 +573,34 @@ ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
         return ErrorCode::OK;
     }
     return WaitForDurable(fence);
+}
+
+ErrorCode VSegmentManager::ValidateFileWrite(
+    const FileSegmentWriteRange& range) const {
+    const auto& replica = range.replica;
+    std::lock_guard lock(mutex_);
+    if (!owned_) return ErrorCode::STALE_ROUTE;
+    const auto managed = vsegments_.find(replica.vsegment_id);
+    if (managed == vsegments_.end() ||
+        !managed->second.logical_allocator->HasReservation(
+            replica.operation_id, {replica.logical_offset, replica.length})) {
+        return ErrorCode::INVALID_WRITE;
+    }
+    if (range.object_offset > replica.length ||
+        range.length > replica.length - range.object_offset ||
+        range.object_offset >
+            std::numeric_limits<uint64_t>::max() - replica.logical_offset) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    const auto resolved = ResolveTransfer(
+        managed->second.view, replica.logical_offset + range.object_offset,
+        range.length, {{0, range.length}});
+    if (!resolved || resolved.requests.size() != 1 ||
+        resolved.requests.front().segment_id != range.segment_id ||
+        resolved.requests.front().physical_offset != range.segment_offset) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
 }
 
 ErrorCode VSegmentManager::AbortPut(const std::string& vsegment_id,

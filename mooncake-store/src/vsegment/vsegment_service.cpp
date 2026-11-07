@@ -401,6 +401,12 @@ ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
     return result == ErrorCode::OBJECT_NOT_FOUND ? ErrorCode::OK : result;
 }
 
+ErrorCode VSegmentService::ValidateFileWrite(
+    const FileSegmentWriteRange& range) {
+    auto manager = FindPartition(range.replica.partition_id);
+    return manager ? manager->ValidateFileWrite(range) : ErrorCode::STALE_ROUTE;
+}
+
 ErrorCode VSegmentService::LoadView(const std::string& partition_id,
                                     const std::string& vsegment_id,
                                     VSegmentView* view, std::string* detail) {

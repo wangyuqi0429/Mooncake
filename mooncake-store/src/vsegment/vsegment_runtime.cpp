@@ -78,6 +78,13 @@ ReservationResult LogicalRangeAllocator::Reserve(
     return {ErrorCode::OK, reserved, {}};
 }
 
+bool LogicalRangeAllocator::HasReservation(const std::string& operation_id,
+                                           LogicalRange range) const {
+    std::lock_guard lock(mutex_);
+    const auto it = reservations_.find(operation_id);
+    return it != reservations_.end() && it->second == range;
+}
+
 ErrorCode LogicalRangeAllocator::Commit(const std::string& operation_id,
                                         const std::string& allocation_id,
                                         LogicalRange* range) {

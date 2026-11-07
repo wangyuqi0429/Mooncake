@@ -190,6 +190,7 @@ class VSegmentManager {
         const std::vector<VSegmentObjectReference>& references,
         std::string* detail = nullptr);
     bool FindView(const std::string& vsegment_id, VSegmentView* view) const;
+    ErrorCode ValidateFileWrite(const FileSegmentWriteRange& range) const;
     VSegmentManagerStats Stats() const;
     // 注入运行时坏端点排除集提供者（te_endpoint 与 segment_name 双形式）。
     // 物理分配（CreateSingleFlight）时调用获取快照，跳过其中的段，避免把

@@ -227,6 +227,16 @@ struct VSegmentReplicaData {
     VSegmentDescriptor descriptor;
 };
 
+struct FileSegmentWriteRange {
+    VSegmentDescriptor replica;
+    std::string segment_id;
+    uint64_t segment_offset{0};
+    uint64_t object_offset{0};
+    uint64_t length{0};
+    YLT_REFL(FileSegmentWriteRange, replica, segment_id, segment_offset,
+             object_offset, length);
+};
+
 class Replica {
    public:
     struct Descriptor;

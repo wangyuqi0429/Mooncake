@@ -87,6 +87,9 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+    ErrorCode ValidateFileWrite(const FileSegmentWriteRange& range) {
+        return master_client_.ValidateFileWrite(range);
+    }
     void SetVSegmentTransferPlanner(
         std::shared_ptr<vsegment::VSegmentTransferPlanner> planner) {
         vsegment_transfer_planner_ = std::move(planner);

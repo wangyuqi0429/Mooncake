@@ -32,28 +32,42 @@
 namespace mooncake::vsegment {
 namespace {
 
-TEST(FileSegmentTest, PersistsExactRangeAndRejectsInvalidBounds) {
+TEST(FileSegmentTest, RejectsLateWriteAfterReservationWasReused) {
     std::unique_ptr<FILE, decltype(&fclose)> temp(tmpfile(), fclose);
     ASSERT_NE(temp, nullptr);
     ASSERT_EQ(ftruncate(fileno(temp.get()), 64), 0);
     auto file = std::make_shared<FileSegmentFd>();
     file->fd = dup(fileno(temp.get()));
     ASSERT_GE(file->fd, 0);
-    std::string data = "abcdefgh";
+
     FileSegmentStore store;
-    ASSERT_TRUE(store.Register("segment", {data.data(), data.size(), 16, file}));
-    EXPECT_FALSE(store.Register("segment", {data.data(), data.size(), 16, file}));
-    EXPECT_EQ(store.Persist("segment", 2, 4), ErrorCode::OK);
+    ASSERT_TRUE(store.Register("segment", {8, 16, file}));
+    auto active_operation = std::string("old");
+    store.SetWriteValidator([&](const FileSegmentWriteRange& range) {
+        return range.replica.operation_id == active_operation
+                   ? ErrorCode::OK
+                   : ErrorCode::INVALID_WRITE;
+    });
+    FileSegmentWriteRange old{
+        {"0", "vs", 0, 4, "old"}, "segment", 2, 0, 4};
+    auto replacement = old;
+    replacement.replica.operation_id = "new";
+    active_operation = "new";
+    ASSERT_EQ(store.Write(replacement, "new!"), ErrorCode::OK);
+    EXPECT_EQ(store.Write(old, "old!"), ErrorCode::INVALID_WRITE);
+
     char result[64]{};
     ASSERT_EQ(pread(file->fd, result, sizeof(result), 0), 64);
-    EXPECT_EQ(std::string(result + 18, 4), "cdef");
+    EXPECT_EQ(std::string(result + 18, 4), "new!");
     EXPECT_EQ(result[17], 0);
     EXPECT_EQ(result[22], 0);
-    EXPECT_EQ(store.Persist("segment", 7, 2), ErrorCode::INVALID_PARAMS);
-    EXPECT_EQ(store.Persist("segment", std::numeric_limits<uint64_t>::max(), 1),
-              ErrorCode::INVALID_PARAMS);
+
+    replacement.segment_offset = 7;
+    EXPECT_EQ(store.Write(replacement, "data"), ErrorCode::INVALID_PARAMS);
+    replacement.segment_offset = 2;
+    EXPECT_EQ(store.Write(replacement, "x"), ErrorCode::INVALID_PARAMS);
     store.Unregister("segment");
-    EXPECT_EQ(store.Persist("segment", 0, 1), ErrorCode::SEGMENT_NOT_FOUND);
+    EXPECT_EQ(store.Write(replacement, "data"), ErrorCode::SEGMENT_NOT_FOUND);
 }
 
 TEST(FileSegmentTest, StableIdentityAndExclusiveFileLock) {
@@ -73,6 +87,24 @@ TEST(FileSegmentTest, StableIdentityAndExclusiveFileLock) {
     EXPECT_NE(*next, *first);
     ASSERT_EQ(flock(fileno(temp.get()), LOCK_EX | LOCK_NB), 0);
     EXPECT_NE(flock(reopened, LOCK_EX | LOCK_NB), 0);
+}
+
+TEST(NoFRecoveryEpochTest, MountRecordReadsLegacyJsonAndPreservesEpoch) {
+    cvm::MountEntry mount;
+    ASSERT_EQ(cvm::EtcdViewStore::DeserializeMountEntry(
+                  R"({"segment_id":"nof-a","mounted_at_ms":1,"partition_slot_starts":[]})",
+                  mount),
+              ErrorCode::OK);
+    EXPECT_TRUE(mount.recovery_epoch.empty());
+    mount.recovery_epoch = "successful-registration";
+    std::string json;
+    ASSERT_EQ(cvm::EtcdViewStore::SerializeMountEntry(mount, json),
+              ErrorCode::OK);
+    cvm::MountEntry restored;
+    ASSERT_EQ(cvm::EtcdViewStore::DeserializeMountEntry(json, restored),
+              ErrorCode::OK);
+    EXPECT_EQ(restored.segment_id, mount.segment_id);
+    EXPECT_EQ(restored.recovery_epoch, mount.recovery_epoch);
 }
 
 uint64_t MetricValue(const std::string& name) {
@@ -1070,6 +1102,30 @@ TEST(VSegmentManagerTest, RejectsUnalignedNoFReservationWithoutConsumingSpace) {
     auto reservation = manager.ReservePut(allocation.view.vsegment_id, "good", 16);
     ASSERT_TRUE(reservation);
     EXPECT_EQ(reservation.range.offset, 0u);
+}
+
+TEST(VSegmentManagerTest, RejectsFileWriteFromReclaimedReservation) {
+    VSegmentManager manager(Config(), {Profile()}, Committer());
+    auto allocation = manager.Create("default");
+    ASSERT_TRUE(allocation);
+    const auto& view = allocation.view;
+    auto reserved = manager.ReservePut(view.vsegment_id, "old", 4);
+    ASSERT_TRUE(reserved);
+    FileSegmentWriteRange request{
+        {view.partition_id, view.vsegment_id, reserved.range.offset, 4, "old"},
+        view.members.front().segment_id, view.members.front().base_offset, 0, 4};
+    EXPECT_EQ(manager.ValidateFileWrite(request), ErrorCode::OK);
+    ++request.segment_offset;
+    EXPECT_EQ(manager.ValidateFileWrite(request), ErrorCode::INVALID_PARAMS);
+    --request.segment_offset;
+
+    ASSERT_EQ(manager.AbortPut(view.vsegment_id, "old"), ErrorCode::OK);
+    auto replacement = manager.ReservePut(view.vsegment_id, "new", 4);
+    ASSERT_TRUE(replacement);
+    EXPECT_EQ(replacement.range, reserved.range);
+    EXPECT_EQ(manager.ValidateFileWrite(request), ErrorCode::INVALID_WRITE);
+    request.replica.operation_id = "new";
+    EXPECT_EQ(manager.ValidateFileWrite(request), ErrorCode::OK);
 }
 
 TEST(VSegmentManagerTest, SnapshotRestorePreservesReservationsAndFreeSpace) {

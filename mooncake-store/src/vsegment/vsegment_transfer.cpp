@@ -106,6 +106,12 @@ VSegmentTransferPlan VSegmentTransferPlanner::Plan(
                                  location.backend, location.persistence_endpoint,
                                  segment_offset});
     }
+    if (std::any_of(plan.requests.begin(), plan.requests.end(),
+                    [](const auto& request) {
+                        return !request.persistence_endpoint.empty();
+                    })) {
+        plan.file_write_replica = replica;
+    }
     return plan;
 }
 

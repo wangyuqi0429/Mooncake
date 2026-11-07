@@ -2249,25 +2249,54 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 }
 
 namespace {
-ErrorCode PersistFileRange(const vsegment::EndpointTransferSubRequest& request) {
+ErrorCode WriteFileRange(const vsegment::EndpointTransferSubRequest& request,
+                         const VSegmentDescriptor& replica) {
     try {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config config{};
         config.connect_retry_count = 1;
         config.host_alive_detect_duration = std::chrono::milliseconds{0};
-        coro_io::client_pools<coro_rpc::coro_rpc_client> pools(config, GetStoreRpcClientIoContextPool());
+        coro_io::client_pools<coro_rpc::coro_rpc_client> pools(
+            config, GetStoreRpcClientIoContextPool());
         auto pool = pools.at(request.persistence_endpoint);
-        return async_simple::coro::syncAwait(
-            [&]() -> async_simple::coro::Lazy<ErrorCode> {
-                auto sent = co_await pool->send_request(
-                    [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-                        return client.send_request<&vsegment::FileSegmentStore::Persist>(
-                            request.transfer.segment_id, request.segment_offset, request.transfer.length);
-                    });
-                if (!sent) co_return ErrorCode::RPC_FAIL;
-                auto result = co_await std::move(sent.value());
-                if (!result) co_return ErrorCode::RPC_FAIL;
-                co_return result->result();
-            }());
+        auto accelerator = device::GetAcceleratorRegistry().RuntimeAccelerators();
+        for (uint64_t done = 0; done < request.transfer.length;) {
+            const auto length = std::min<uint64_t>(
+                request.transfer.length - done,
+                vsegment::FileSegmentStore::kMaxWriteBytes);
+            const auto* source = reinterpret_cast<const void*>(
+                request.transfer.client_address + done);
+            std::string data(length, '\0');
+            device::PointerInfo info;
+            if (auto* gpu = accelerator.FindDeviceForPointer(source, &info)) {
+                gpu->SetContext(info.device_id);
+                if (!gpu->Copy(data.data(), source, length,
+                               device::CopyDirection::kDeviceToHost)) {
+                    return ErrorCode::TRANSFER_FAIL;
+                }
+            } else {
+                std::memcpy(data.data(), source, length);
+            }
+            const FileSegmentWriteRange range{
+                replica, request.transfer.segment_id,
+                request.segment_offset + done,
+                request.transfer.client_buffer_offset + done, length};
+            const auto error = async_simple::coro::syncAwait(
+                [&]() -> async_simple::coro::Lazy<ErrorCode> {
+                    auto sent = co_await pool->send_request(
+                        [&](coro_io::client_reuse_hint,
+                            coro_rpc::coro_rpc_client& client) {
+                            return client.send_request<
+                                &vsegment::FileSegmentStore::Write>(range, data);
+                        });
+                    if (!sent) co_return ErrorCode::RPC_FAIL;
+                    auto result = co_await std::move(sent.value());
+                    if (!result) co_return ErrorCode::RPC_FAIL;
+                    co_return result->result();
+                }());
+            if (error != ErrorCode::OK) return error;
+            done += length;
+        }
+        return ErrorCode::OK;
     } catch (...) {
         return ErrorCode::RPC_FAIL;
     }
@@ -2328,7 +2357,13 @@ std::optional<TransferFuture> TransferSubmitter::submitVSegment(
     }
     std::vector<TransferRequest> requests;
     requests.reserve(plan.requests.size());
+    bool has_file_writes = false;
     for (const auto& subrequest : plan.requests) {
+        if (op_code == TransferRequest::WRITE &&
+            !subrequest.persistence_endpoint.empty()) {
+            has_file_writes = true;
+            continue;
+        }
         SegmentHandle segment = engine_.openSegment(subrequest.endpoint);
         if (segment == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open vsegment member endpoint='"
@@ -2344,17 +2379,18 @@ std::optional<TransferFuture> TransferSubmitter::submitVSegment(
         request.length = subrequest.transfer.length;
         requests.push_back(request);
     }
-    auto future = submitTransfer(requests);
-    const bool needs_persistence = std::any_of(plan.requests.begin(), plan.requests.end(),
-        [](const auto& request) { return !request.persistence_endpoint.empty(); });
-    if (future && needs_persistence && op_code == TransferRequest::WRITE) {
-        // The object must remain reserved until the owner has persisted every
-        // touched file range. A failed barrier never becomes a successful PutEnd.
-        auto result = future->get();
+    if (has_file_writes && !plan.file_write_replica) return std::nullopt;
+    std::optional<TransferFuture> future;
+    if (!requests.empty()) {
+        future = submitTransfer(requests);
+        if (!future) return std::nullopt;
+    }
+    if (has_file_writes) {
+        auto result = future ? future->get() : ErrorCode::OK;
         if (result == ErrorCode::OK) {
             for (const auto& request : plan.requests) {
                 if (request.persistence_endpoint.empty()) continue;
-                result = PersistFileRange(request);
+                result = WriteFileRange(request, *plan.file_write_replica);
                 if (result != ErrorCode::OK) break;
             }
         }

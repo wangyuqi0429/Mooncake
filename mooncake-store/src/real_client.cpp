@@ -1586,8 +1586,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
 
     // Reset all resources
-    client_.reset();
     file_segment_rpc_server_.reset();
+    file_segment_store_.SetWriteValidator({});
+    client_.reset();
     ReleaseAllMountedSegmentRecords();
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
@@ -1697,8 +1698,22 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
     auto file = std::make_shared<vsegment::FileSegmentFd>();
     file->fd = fd;
     if (!file_segment_rpc_server_) {
+        file_segment_store_.SetWriteValidator(
+            [client = std::weak_ptr<Client>(client_)](const auto& range) {
+                const auto locked = client.lock();
+                const auto result =
+                    locked ? locked->ValidateFileWrite(range)
+                           : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+                if (result != ErrorCode::OK) {
+                    LOG(WARNING) << "File vsegment write admission failed: "
+                                 << toString(result);
+                    return ErrorCode::INVALID_WRITE;
+                }
+                return ErrorCode::OK;
+            });
         file_segment_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(2, 0, "0.0.0.0");
-        file_segment_rpc_server_->register_handler<&vsegment::FileSegmentStore::Persist>(&file_segment_store_);
+        file_segment_rpc_server_->register_handler<
+            &vsegment::FileSegmentStore::Write>(&file_segment_store_);
         file_segment_rpc_server_->async_start();
         if (file_segment_rpc_server_->get_errc()) {
             file_segment_rpc_server_.reset();
@@ -1732,7 +1747,7 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
         }
         const auto stable_id = *identity;
         const auto id_text = UuidToString(stable_id);
-        if (!file_segment_store_.Register(id_text, {ptr, chunk_size, current_offset, file})) {
+        if (!file_segment_store_.Register(id_text, {chunk_size, current_offset, file})) {
             munmap(ptr, chunk_size);
             break;
         }

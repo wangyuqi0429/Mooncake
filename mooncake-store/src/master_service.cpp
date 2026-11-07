@@ -997,28 +997,13 @@ void MasterService::SetVSegmentAutoPlanPolicy(
     const vsegment::VSegmentUserPolicy& policy) {
     std::lock_guard<std::mutex> lock(vsegment_auto_plan_mutex_);
     vsegment_auto_plan_policy_ = policy;
-    require_nof_vsegment_.store(policy.required_medium == "nof");
-}
-
-bool MasterService::AcceptsVSegmentStartupQuota(
-    const vsegment::PartitionPhysicalQuotaSnapshot& quota) const {
-    if (!require_nof_vsegment_.load()) return true;
-    return std::any_of(quota.profile_specs.begin(), quota.profile_specs.end(),
-                       [&](const auto& profile) {
-                           return profile.name == quota.default_profile &&
-                                  profile.required_medium == "nof";
-                       });
 }
 
 tl::expected<std::optional<PutStartResult>, ErrorCode>
 MasterService::TryVSegmentPutStart(
     const UUID& client_id, const std::string& key, const TenantId& tenant_id,
     uint64_t slice_length, const ReplicateConfig& config) {
-    if (!vsegment_service_) {
-        if (require_nof_vsegment_.load())
-            return tl::make_unexpected(ErrorCode::VSEGMENT_SERVICE_NOT_READY);
-        return std::optional<PutStartResult>{};
-    }
+    if (!vsegment_service_) return std::optional<PutStartResult>{};
     if (config.replica_num == 0 || config.nof_replica_num != 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1451,6 +1436,7 @@ bool MasterService::MaybeRetryVSegmentAutoPlan(const char* trigger) {
 
 ErrorCode MasterService::RefreshVSegmentOwnership(
     const std::string& acquiring, vsegment::VSegmentCommitBatch* batch) {
+    RefreshRecoveredNoFEndpoints();
     if (!ordered_oplog_writer_) return ErrorCode::OK;
     if (vsegment_runtime_gate_active_.load(std::memory_order_acquire)) {
         const auto gate_state =
@@ -1495,10 +1481,6 @@ ErrorCode MasterService::RefreshVSegmentOwnership(
                 if (error != ErrorCode::OK) {
                     LOG(ERROR) << "Failed to load vsegment quota: " << detail;
                     return error;
-                }
-                if (!AcceptsVSegmentStartupQuota(quota)) {
-                    LOG(ERROR) << "vsegment quota default profile must use NOF";
-                    return ErrorCode::INVALID_PARAMS;
                 }
                 // 先在局部完成全部配置，最后一步原子发布：并发读者要么见
                 // null 要么见完整服务，绝不读到 provider 未注入的半成品。
@@ -1831,12 +1813,6 @@ void MasterService::VSegmentInitThreadFunc() {
                          << " (will retry on next heartbeat)";
             // etcd 读取失败同样不阻塞 slot（slot 就绪不依赖 vsegment）：
             // 置 kNoQuota 放行 + 每心跳重探，绝不置 kIdle 挂起 slot。
-            vsegment_init_state_.store(VSegmentInitState::kNoQuota,
-                                       std::memory_order_release);
-            return;
-        }
-        if (!AcceptsVSegmentStartupQuota(quota)) {
-            LOG(ERROR) << "vsegment quota default profile must use NOF";
             vsegment_init_state_.store(VSegmentInitState::kNoQuota,
                                        std::memory_order_release);
             return;
@@ -4830,13 +4806,38 @@ ErrorCode MasterService::PublishNoFSegmentForVSegment(const NoFSegment& segment)
     const auto end = segment.te_endpoint.find(" subnqn:");
     desc.failure_domain = segment.te_endpoint.substr(0, end);
     desc.vsegment_exclusive = true;
+    uint64_t failure_revision;
+    {
+        std::shared_lock lock(invalid_endpoints_mutex_);
+        failure_revision = nof_failure_revision_;
+    }
+    std::string probe_error;
+    if (!ProbeNoFSegment(segment.te_endpoint, &probe_error)) {
+        LOG(WARNING) << "NOF vsegment registration probe failed: "
+                     << segment.te_endpoint << ", reason=" << probe_error;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
     auto error = cvm::EtcdViewStore::SaveSegmentDescriptor(cluster_id_, desc);
     if (error != ErrorCode::OK) return error;
     cvm::MountEntry mount;
     mount.segment_id = desc.segment_id;
+    mount.recovery_epoch = UuidToString(generate_uuid());
     error = cvm::EtcdViewStore::SaveMountEntryWithLease(
         cluster_id_, master_id_, mount, cvm_lease_id_);
-    if (error == ErrorCode::OK) NoteVSegmentMountActivity();
+    if (error == ErrorCode::OK) {
+        {
+            std::unique_lock lock(invalid_endpoints_mutex_);
+            // Do not erase a failure reported while the probe/publication
+            // was in flight. Heartbeat compares epochs for deferred recovery.
+            if (nof_failure_revision_ == failure_revision) {
+                invalid_replica_endpoints_.erase(segment.te_endpoint);
+                invalid_replica_endpoints_.erase(segment.name);
+                invalid_replica_endpoints_.erase(desc.segment_id);
+                invalid_nof_recovery_observations_.erase(segment.te_endpoint);
+            }
+        }
+        NoteVSegmentMountActivity();
+    }
     return error;
 #else
     return cvm_segments_vsegment_exclusive_ ? ErrorCode::UNAVAILABLE_IN_CURRENT_MODE
@@ -4920,6 +4921,7 @@ auto MasterService::MountNoFSegment(const NoFSegment& requested_segment,
             return tl::make_unexpected(err);
         }
     }
+    if (!cvm_segments_vsegment_exclusive_) return {};
     std::vector<MountedNoFSegmentSnapshot> mounted;
     nof_segment_manager_.GetMountedSegmentsSnapshot(mounted);
     for (const auto& entry : mounted) {
@@ -4941,8 +4943,9 @@ auto MasterService::MountNoFSegment(const NoFSegment& requested_segment,
             }
             return tl::make_unexpected(publish);
         }
+        return {};
     }
-    return {};
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 #endif
 }
 
@@ -6858,6 +6861,7 @@ void MasterService::RestoreFromStandbySnapshot(
     {
         std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
         invalid_replica_endpoints_.clear();
+        invalid_nof_recovery_observations_.clear();
     }
     for (const auto& seg : segments) {
         if (seg.is_memory_segment) {
@@ -7643,6 +7647,51 @@ ErrorCode MasterService::VSegmentPutEnd(
                                         object_id);
 }
 
+ErrorCode MasterService::ValidateFileWrite(const FileSegmentWriteRange& range) {
+#ifdef STORE_USE_ETCD
+    const auto& partition = range.replica.partition_id;
+    if (!cvm_segments_vsegment_exclusive_ || !cvm_controller_ ||
+        cvm_controller_->GetCurrentRole() != cvm::MasterRole::kPrimary ||
+        partition.empty() || partition.size() > 5 ||
+        partition.find_first_not_of("0123456789") != std::string::npos) {
+        return ErrorCode::STALE_ROUTE;
+    }
+    const auto slot = std::stoul(partition);
+    const auto groups = cvm_controller_->GetCachedSlotGroupCount();
+    if (slot >= cvm::SlotCount() || groups == 0) return ErrorCode::STALE_ROUTE;
+    const auto rank = cvm::SlotToRank(static_cast<uint16_t>(slot), groups);
+    cvm::RingSlotAssign cached_assignment;
+    if (!cvm_controller_->GetCachedRingSlotAssign(rank, cached_assignment) ||
+        cached_assignment.primary_id != master_id_) {
+        return ErrorCode::STALE_ROUTE;
+    }
+    const auto writable = CheckSlotWritable(static_cast<uint16_t>(slot));
+    if (writable != ErrorCode::OK) return writable;
+    {
+        std::shared_lock lock(snapshot_mutex_);
+        if (!vsegment_service_) return ErrorCode::VSEGMENT_SERVICE_NOT_READY;
+        const auto validated = vsegment_service_->ValidateFileWrite(range);
+        if (validated != ErrorCode::OK) return validated;
+    }
+    // Recheck authority in etcd after inspecting local state. A cached route
+    // alone may still point at this master after the slot changed owners.
+    cvm::RingSlotAssign assignment;
+    ViewVersionId revision;
+    const auto error = cvm::EtcdViewStore::LoadRingSlotAssign(
+        cluster_id_, rank, assignment, revision);
+    if (error != ErrorCode::OK) return error;
+    if (assignment.primary_id != master_id_ ||
+        assignment.epoch != cached_assignment.epoch ||
+        assignment.state != static_cast<int32_t>(cvm::SlotState::kStable)) {
+        return ErrorCode::STALE_ROUTE;
+    }
+    return ErrorCode::OK;
+#else
+    (void)range;
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#endif
+}
+
 ErrorCode MasterService::VSegmentPutRevoke(
     const std::string& partition_id, const std::string& vsegment_id,
     uint64_t route_epoch, const std::string& operation_id) {
@@ -8265,17 +8314,15 @@ auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
-    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now)
+    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
+    const std::function<void()>& replace_file_replica)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    if (require_nof_vsegment_.load() && !vsegment_service_) {
-        return tl::make_unexpected(ErrorCode::VSEGMENT_SERVICE_NOT_READY);
-    }
     auto& tenant_state = shard->tenants[tenant_id];
-    if (tenant_state.metadata.contains(key)) {
+    if (!replace_file_replica && tenant_state.metadata.contains(key)) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
-    if (GetGroupRoute(tenant_id, key).has_value()) {
+    if (!replace_file_replica && GetGroupRoute(tenant_id, key).has_value()) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
@@ -8307,6 +8354,7 @@ auto MasterService::AllocateAndInsertMetadata(
         std::vector<Replica::Descriptor> descriptors;
         for (const auto& replica : replicas)
             descriptors.push_back(replica.get_descriptor());
+        if (replace_file_replica) replace_file_replica();
         auto [it, inserted] = tenant_state.metadata.emplace(
             std::piecewise_construct, std::forward_as_tuple(key),
             std::forward_as_tuple(
@@ -9633,7 +9681,34 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return tl::make_unexpected(ErrorCode::OBJECT_REPLICA_BUSY);
                 }
 
-                if (metadata.size == slice_length) {
+                bool file_vsegment = false;
+                if (metadata.size == slice_length && vsegment_service_) {
+                    metadata.VisitReplicas(
+                        [](const Replica& replica) {
+                            return replica.is_vsegment_replica();
+                        },
+                        [&](const Replica& replica) {
+                            if (file_vsegment) return;
+                            const auto& descriptor =
+                                replica.get_vsegment_descriptor();
+                            vsegment::VSegmentView view;
+                            if (vsegment_service_->LoadView(
+                                    descriptor.partition_id,
+                                    descriptor.vsegment_id, &view) !=
+                                ErrorCode::OK) return;
+                            auto access = segment_manager_.getSegmentAccess();
+                            file_vsegment = std::any_of(
+                                view.members.begin(), view.members.end(),
+                                [&](const auto& member) {
+                                    UUID id;
+                                    Segment segment;
+                                    return StringToUuid(member.segment_id, id) &&
+                                           access.GetSegment(id, segment) &&
+                                           !segment.persistence_endpoint.empty();
+                                });
+                        });
+                }
+                if (metadata.size == slice_length && !file_vsegment) {
                     // --- Case B: same size — in-place update ---
                     // Reuse existing buffer addresses.  No allocation or
                     // deallocation. The client will RDMA-write new data to the
@@ -9685,8 +9760,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return replica_list;
                 }
 
-                // --- Case C: different size — discard old replicas and
-                // reallocate
+                // --- Case C: reallocate a resized object or get a fresh
+                // write reservation for a file-backed replica.
                 // --- Old buffers cannot be reused.  Move them to
                 // discarded_replicas_ for delayed release (readers may still
                 // hold descriptors without refcnt), then allocate fresh buffers
@@ -9706,24 +9781,37 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.committed_quota_charge_bytes != 0
                         ? metadata.committed_quota_charge_bytes
                         : CompletedMemoryQuotaCharge(metadata);
-                auto old_replicas =
-                    PopReplicasWithCacheTotalAccounting(metadata);
-                if (!old_replicas.empty()) {
-                    std::lock_guard lock(discarded_replicas_mutex_);
-                    discarded_replicas_.emplace_back(
-                        std::move(old_replicas),
-                        now + put_start_release_timeout_sec_);
+                bool old_discarded = false;
+                const auto discard_old = [&] {
+                    auto old_replicas =
+                        PopReplicasWithCacheTotalAccounting(metadata);
+                    if (!old_replicas.empty()) {
+                        std::lock_guard lock(discarded_replicas_mutex_);
+                        discarded_replicas_.emplace_back(
+                            std::move(old_replicas),
+                            now + put_start_release_timeout_sec_);
+                    }
+                    EraseMetadata(tenant_state, it, object_id.tenant_id,
+                                  QuotaEraseMode::kPreserveOld, &shard);
+                    old_discarded = true;
+                };
+                std::function<void()> replace_file_replica;
+                if (file_vsegment) {
+                    replace_file_replica = discard_old;
+                } else {
+                    discard_old();
                 }
-                EraseMetadata(tenant_state, it, object_id.tenant_id,
-                              QuotaEraseMode::kPreserveOld, &shard);
 
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
                 auto allocate_result = AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, merged_config,
-                    existing_group_id, object_id.tenant_id, now);
+                    existing_group_id, object_id.tenant_id, now,
+                    replace_file_replica);
                 if (!allocate_result) {
-                    ReleaseTenantQuota(object_id.tenant_id, old_quota_charge);
+                    if (old_discarded)
+                        ReleaseTenantQuota(object_id.tenant_id,
+                                           old_quota_charge);
                     return allocate_result;
                 }
                 auto new_it = tenant_state.metadata.find(key);
@@ -11404,6 +11492,57 @@ auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
     return {};
 }
 
+void MasterService::RefreshRecoveredNoFEndpoints() {
+#if defined(USE_NOF) && defined(STORE_USE_ETCD)
+    if (!cvm_segments_vsegment_exclusive_) return;
+    decltype(invalid_nof_recovery_observations_) pending;
+    {
+        std::unique_lock lock(invalid_endpoints_mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        if (invalid_nof_recovery_observations_.empty() ||
+            now < nof_recovery_next_check_) return;
+        nof_recovery_next_check_ = now + std::chrono::seconds(5);
+        pending = invalid_nof_recovery_observations_;
+    }
+    std::vector<cvm::SegmentDescriptor> descriptors;
+    std::vector<std::pair<std::string, cvm::MountEntry>> mounts;
+    std::vector<cvm::MasterRegistration> masters;
+    ViewVersionId version;
+    if (cvm::EtcdViewStore::LoadAllSegmentDescriptors(
+            cluster_id_, descriptors, version) != ErrorCode::OK ||
+        cvm::EtcdViewStore::LoadAllMountEntries(
+            cluster_id_, mounts, version) != ErrorCode::OK ||
+        cvm::EtcdViewStore::LoadAllMasters(
+            cluster_id_, masters, version) != ErrorCode::OK) return;
+    for (const auto& desc : descriptors) {
+        auto old = pending.find(desc.te_endpoint);
+        if (desc.protocol != "nof" || old == pending.end()) continue;
+        const bool recovered = std::any_of(
+            mounts.begin(), mounts.end(), [&](const auto& record) {
+                const auto& [owner, mount] = record;
+                return mount.segment_id == desc.segment_id &&
+                       !mount.recovery_epoch.empty() &&
+                       !old->second.epochs.contains(mount.recovery_epoch) &&
+                       std::any_of(masters.begin(), masters.end(),
+                                   [&](const auto& master) {
+                                       return master.master_id == owner &&
+                                              master.role == static_cast<int32_t>(
+                                                  cvm::MasterRole::kPrimary);
+                                   });
+            });
+        if (!recovered) continue;
+        std::unique_lock lock(invalid_endpoints_mutex_);
+        auto current = invalid_nof_recovery_observations_.find(desc.te_endpoint);
+        if (current == invalid_nof_recovery_observations_.end() ||
+            current->second.revision != old->second.revision) continue;
+        invalid_replica_endpoints_.erase(desc.te_endpoint);
+        invalid_replica_endpoints_.erase(desc.segment_name);
+        invalid_replica_endpoints_.erase(desc.segment_id);
+        invalid_nof_recovery_observations_.erase(current);
+    }
+#endif
+}
+
 auto MasterService::ReportInvalidReplicaEndpoints(
     const std::vector<std::string>& endpoints)
     -> tl::expected<void, ErrorCode> {
@@ -11422,6 +11561,7 @@ auto MasterService::ReportInvalidReplicaEndpoints(
     // 路径，一次 etcd range 可接受；etcd 解析失败则降级为仅本地结果。
     std::vector<std::string> names;
     std::vector<std::string> segment_ids;
+    decltype(invalid_nof_recovery_observations_) nof_observations;
     {
         ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> all_segments;
@@ -11444,7 +11584,10 @@ auto MasterService::ReportInvalidReplicaEndpoints(
         std::set<std::string> resolved(endpoints.begin(), endpoints.end());
         for (const auto& name : names) resolved.insert(name);
         std::vector<cvm::SegmentDescriptor> descriptors;
+        std::vector<std::pair<std::string, cvm::MountEntry>> mounts;
         ViewVersionId revision = 0;
+        bool queried_mounts = false;
+        bool have_mounts = false;
         if (cvm::EtcdViewStore::LoadAllSegmentDescriptors(
                 cluster_id_, descriptors, revision) == ErrorCode::OK) {
             for (const auto& desc : descriptors) {
@@ -11455,6 +11598,24 @@ auto MasterService::ReportInvalidReplicaEndpoints(
                     !desc.segment_name.empty() &&
                     resolved.count(desc.segment_name) > 0;
                 if (by_endpoint || by_name) {
+                    if (cvm_segments_vsegment_exclusive_ &&
+                        desc.protocol == "nof") {
+                        if (!queried_mounts) {
+                            queried_mounts = true;
+                            have_mounts =
+                                cvm::EtcdViewStore::LoadAllMountEntries(
+                                    cluster_id_, mounts, revision) == ErrorCode::OK;
+                        }
+                        if (have_mounts) {
+                            auto& observation =
+                                nof_observations[desc.te_endpoint];
+                            observation.segment_name = desc.segment_name;
+                            observation.segment_id = desc.segment_id;
+                            for (const auto& [owner, mount] : mounts)
+                                if (mount.segment_id == desc.segment_id)
+                                    observation.epochs.insert(mount.recovery_epoch);
+                        }
+                    }
                     if (!desc.segment_id.empty())
                         segment_ids.push_back(desc.segment_id);
                     if (by_endpoint && !desc.segment_name.empty())
@@ -11470,6 +11631,25 @@ auto MasterService::ReportInvalidReplicaEndpoints(
     {
         std::lock_guard<std::shared_mutex> lock(invalid_endpoints_mutex_);
         before = invalid_replica_endpoints_.size();
+        ++nof_failure_revision_;
+        // An etcd lookup failure must not leave an older observation able
+        // to clear this report. Match known aliases even without etcd.
+        std::erase_if(invalid_nof_recovery_observations_,
+                      [&](const auto& entry) {
+                          const auto& [endpoint, observation] = entry;
+                          return std::any_of(
+                              endpoints.begin(), endpoints.end(),
+                              [&](const auto& reported) {
+                                  return reported == endpoint ||
+                                         reported == observation.segment_name ||
+                                         reported == observation.segment_id;
+                              });
+                      });
+        for (auto& [endpoint, observation] : nof_observations) {
+            observation.revision = nof_failure_revision_;
+            invalid_nof_recovery_observations_[endpoint] =
+                std::move(observation);
+        }
         for (const auto& endpoint : endpoints) {
             if (!endpoint.empty()) {
                 invalid_replica_endpoints_.insert(endpoint);

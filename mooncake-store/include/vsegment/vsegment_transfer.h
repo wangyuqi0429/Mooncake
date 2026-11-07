@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,7 @@ struct VSegmentTransferPlan {
     ErrorCode error{ErrorCode::OK};
     std::vector<EndpointTransferSubRequest> requests;
     std::string detail;
+    std::optional<VSegmentDescriptor> file_write_replica{};
     explicit operator bool() const { return error == ErrorCode::OK; }
 };
 

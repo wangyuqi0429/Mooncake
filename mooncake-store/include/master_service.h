@@ -229,6 +229,7 @@ class MasterService {
                              uint64_t route_epoch,
                              const std::string& operation_id,
                              const std::string& object_id);
+    ErrorCode ValidateFileWrite(const FileSegmentWriteRange& range);
     ErrorCode VSegmentPutRevoke(const std::string& partition_id,
                                 const std::string& vsegment_id,
                                 uint64_t route_epoch,
@@ -1923,7 +1924,8 @@ class MasterService {
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& group_id,
         const TenantId& tenant_id,
-        const std::chrono::system_clock::time_point& now)
+        const std::chrono::system_clock::time_point& now,
+        const std::function<void()>& replace_file_replica = {})
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     auto PutEndInternal(const UUID& client_id, const ObjectMeta& object_meta,
@@ -2603,15 +2605,12 @@ class MasterService {
     // 下一次心跳的既有 Load 路径拉起 VSegmentService。etcd Create 原子首写
     // 保证多 submaster 并发重试 first-writer-wins。
     bool MaybeRetryVSegmentAutoPlan(const char* trigger);
-    bool AcceptsVSegmentStartupQuota(
-        const vsegment::PartitionPhysicalQuotaSnapshot& quota) const;
     // W6 静默期信号（集群级）：把最近一次 mount/remount 的墙钟毫秒写入
     // etcd 共享 key（cvm::VSegmentMountActivityKey），由
     // PlanAndPublishDiscoveredQuota 在发布前读取并等待静默——对全部触发
     // 方统一生效。
     void NoteVSegmentMountActivity();
     vsegment::VSegmentUserPolicy vsegment_auto_plan_policy_{};  // member_count==0 ⇒ 关闭
-    std::atomic<bool> require_nof_vsegment_{false};
     mutable std::mutex vsegment_auto_plan_mutex_;  // 叶子锁：仅保护下方状态
     bool vsegment_auto_plan_published_{false};     // 发布成功（含并发赢家）锁存
     bool vsegment_auto_plan_gave_up_{false};       // INVALID_PARAMS 终态锁存
@@ -3098,6 +3097,17 @@ class MasterService {
 
     // Invalid endpoints from standby that don't exist locally
     std::unordered_set<std::string> invalid_replica_endpoints_;
+    struct NoFRecoveryObservation {
+        std::string segment_name;
+        std::string segment_id;
+        std::set<std::string> epochs;
+        uint64_t revision{0};
+    };
+    std::unordered_map<std::string, NoFRecoveryObservation>
+        invalid_nof_recovery_observations_;
+    uint64_t nof_failure_revision_{0};
+    std::chrono::steady_clock::time_point nof_recovery_next_check_{};
+    void RefreshRecoveredNoFEndpoints();
     // Guards invalid_replica_endpoints_. The read path (IsReplicaReadable, on
     // GetReplicaList) runs on many threads without snapshot_mutex_, while the
     // set is written during standby restore / remount / mount. A shared_mutex

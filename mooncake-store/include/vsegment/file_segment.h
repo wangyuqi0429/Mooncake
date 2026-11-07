@@ -3,17 +3,16 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
-#include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <vector>
 #include <unistd.h>
 #include <sys/xattr.h>
 #include <ylt/util/tl/expected.hpp>
-#include "types.h"
+#include "replica.h"
 
 namespace mooncake::vsegment {
 
@@ -44,12 +43,13 @@ struct FileSegmentFd {
     ~FileSegmentFd() { if (fd >= 0) close(fd); }
 };
 
-// Owner-side persistence barrier. Keep the registry lock while using mappings:
-// unregister/munmap must wait for an in-progress barrier.
+// Serialize admission and writes at the file owner. A new writer cannot pass
+// an earlier admitted write even when the master has released its reservation.
 class FileSegmentStore {
  public:
+    using WriteValidator = std::function<ErrorCode(const FileSegmentWriteRange&)>;
+    static constexpr size_t kMaxWriteBytes = 1 << 20;
     struct Region {
-        void* address;
         uint64_t length;
         uint64_t file_offset;
         std::shared_ptr<FileSegmentFd> file;
@@ -58,43 +58,56 @@ class FileSegmentStore {
         std::lock_guard<std::mutex> lock(mutex_);
         return regions_.emplace(id, std::move(region)).second;
     }
+    void SetWriteValidator(WriteValidator validator) {
+        std::lock_guard lock(mutex_);
+        write_validator_ = std::move(validator);
+    }
     void Unregister(const std::string& id) {
         std::lock_guard<std::mutex> lock(mutex_);
         regions_.erase(id);
     }
-    ErrorCode Persist(const std::string& id, uint64_t offset, uint64_t length) {
+    ErrorCode Write(const FileSegmentWriteRange& range, const std::string& data) {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = regions_.find(id);
+        auto it = regions_.find(range.segment_id);
         if (it == regions_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
         const auto& region = it->second;
+        if (data.size() != range.length || data.size() > kMaxWriteBytes ||
+            !ValidRange(region, range.segment_offset, range.length)) {
+            return ErrorCode::INVALID_PARAMS;
+        }
+        if (!write_validator_) return ErrorCode::INVALID_WRITE;
+        const auto validation = write_validator_(range);
+        if (validation != ErrorCode::OK) return validation;
+        return PersistRegion(region, range.segment_offset, data);
+    }
+
+ private:
+    static bool ValidRange(const Region& region, uint64_t offset,
+                           uint64_t length) {
         if (length == 0 || offset > region.length || length > region.length - offset ||
+            offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) ||
             region.file_offset > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - offset ||
             length > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) - region.file_offset - offset)
-            return ErrorCode::INVALID_PARAMS;
-        // DMA writes need not dirty filesystem pages. Explicit pwrite makes the
-        // affected bytes visible to filesystem writeback before fdatasync.
-        constexpr size_t kChunk = 1024 * 1024;
-        std::vector<char> buffer(static_cast<size_t>(std::min<uint64_t>(length, kChunk)));
-        uint64_t done = 0;
-        while (done < length) {
-            const auto count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), length - done));
-            std::memcpy(buffer.data(), static_cast<const char*>(region.address) + offset + done, count);
-            size_t written = 0;
-            while (written < count) {
-                auto n = pwrite(region.file->fd, buffer.data() + written, count - written,
-                                region.file_offset + offset + done + written);
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) return ErrorCode::INTERNAL_ERROR;
-                written += static_cast<size_t>(n);
-            }
-            done += count;
+            return false;
+        return true;
+    }
+    static ErrorCode PersistRegion(const Region& region, uint64_t offset,
+                                   const std::string& data) {
+        size_t written = 0;
+        while (written < data.size()) {
+            auto n = pwrite(region.file->fd, data.data() + written,
+                            data.size() - written,
+                            region.file_offset + offset + written);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return ErrorCode::INTERNAL_ERROR;
+            written += static_cast<size_t>(n);
         }
         int status;
         do { status = fdatasync(region.file->fd); } while (status != 0 && errno == EINTR);
         return status == 0 ? ErrorCode::OK : ErrorCode::INTERNAL_ERROR;
     }
- private:
     std::mutex mutex_;
     std::unordered_map<std::string, Region> regions_;
+    WriteValidator write_validator_;
 };
 }  // namespace mooncake::vsegment

@@ -93,6 +93,11 @@ struct RpcNameTraits<&WrappedMasterService::VSegmentPutEnd> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ValidateFileWrite> {
+    static constexpr const char* value = "ValidateFileWrite";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::VSegmentPutRevoke> {
     static constexpr const char* value = "VSegmentPutRevoke";
 };
@@ -1521,6 +1526,17 @@ ErrorCode MasterClient::VSegmentPutEnd(
     };
     auto result = invoke();
     return result ? result.value() : result.error();
+}
+
+ErrorCode MasterClient::ValidateFileWrite(const FileSegmentWriteRange& range) {
+    auto target = ResolveVSegmentSubmaster(range.replica.partition_id);
+    if (!target) return target.error();
+    auto result = target->empty()
+                      ? invoke_rpc<&WrappedMasterService::ValidateFileWrite,
+                                   ErrorCode>(range)
+                      : invoke_rpc_to<&WrappedMasterService::ValidateFileWrite,
+                                      ErrorCode>(*target, range);
+    return result ? *result : result.error();
 }
 
 ErrorCode MasterClient::VSegmentPutRevoke(

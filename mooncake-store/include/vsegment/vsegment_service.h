@@ -103,6 +103,7 @@ class VSegmentService final {
     ErrorCode LoadView(const std::string& partition_id,
                        const std::string& vsegment_id, VSegmentView* view,
                        std::string* detail = nullptr);
+    ErrorCode ValidateFileWrite(const FileSegmentWriteRange& range);
 
    private:
     std::shared_ptr<VSegmentManager> FindPartition(

@@ -120,6 +120,8 @@ class SpdkWrapper {
     struct ProbeRequestContext {
         std::atomic<bool> done{false};
         std::atomic<bool> success{false};
+        // The poller and completion callback each release once.
+        std::atomic<bool> released{false};
         std::mutex error_mutex;
         std::string error_reason;
         SpdkWrapper *owner{nullptr};
@@ -129,6 +131,7 @@ class SpdkWrapper {
             owner = wrapper;
             done.store(false, std::memory_order_release);
             success.store(false, std::memory_order_release);
+            released.store(false, std::memory_order_relaxed);
             error_reason.clear();
         }
     };

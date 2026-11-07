@@ -104,6 +104,7 @@ class LogicalRangeAllocator {
 
     uint64_t FreeBytes() const;
     size_t ReservationCount() const;
+    bool HasReservation(const std::string& operation_id, LogicalRange range) const;
     size_t CommittedCount() const;
     bool Empty() const;
     ErrorCode ForgetCompleted(const std::string& operation_id);

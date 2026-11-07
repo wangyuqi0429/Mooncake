@@ -77,6 +77,7 @@ class WrappedMasterService {
                              uint64_t route_epoch,
                              const std::string& operation_id,
                              const std::string& object_id);
+    ErrorCode ValidateFileWrite(const FileSegmentWriteRange& range);
     ErrorCode VSegmentPutRevoke(const std::string& partition_id,
                                 const std::string& vsegment_id,
                                 uint64_t route_epoch,

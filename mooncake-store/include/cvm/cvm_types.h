@@ -51,8 +51,11 @@ struct MountEntry {
     int64_t mounted_at_ms{0};
     // Future: partition_slot_starts for psegment/vsegment partial mount
     std::vector<uint16_t> partition_slot_starts;
+    // Set only after a successful NOF vsegment probe and registration.
+    std::string recovery_epoch;
 };
-YLT_REFL(MountEntry, segment_id, mounted_at_ms, partition_slot_starts);
+YLT_REFL(MountEntry, segment_id, mounted_at_ms, partition_slot_starts,
+         recovery_epoch);
 
 // Neutral descriptor of a segment — authoritative copy lives under
 // segments/{segment_id} and is written once per segment (idempotent).

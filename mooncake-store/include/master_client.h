@@ -265,6 +265,7 @@ class MasterClient {
     [[nodiscard]] ErrorCode VSegmentPutEnd(
         const VSegmentDescriptor& replica, uint64_t route_epoch,
         const std::string& operation_id, const std::string& object_id);
+    [[nodiscard]] ErrorCode ValidateFileWrite(const FileSegmentWriteRange& range);
     [[nodiscard]] ErrorCode VSegmentPutRevoke(
         const std::string& partition_id, const std::string& vsegment_id,
         uint64_t route_epoch, const std::string& operation_id);

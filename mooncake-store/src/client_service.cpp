@@ -3244,13 +3244,15 @@ class PutOperation {
         // 条带成员端点（best-effort：无法定位具体失败成员，误报由 worker
         // 重挂载时 MountSegment 的 erase 自愈兜底）。
         std::vector<std::string> transport_endpoints;
+        bool file_write;
 
         PendingTransferRecord(
             ReplicaType type, TransferFuture&& transfer_future,
-            std::vector<std::string> endpoints = {})
+            std::vector<std::string> endpoints = {}, bool is_file_write = false)
             : replica_type(type),
               future(std::move(transfer_future)),
-              transport_endpoints(std::move(endpoints)) {}
+              transport_endpoints(std::move(endpoints)),
+              file_write(is_file_write) {}
     };
 
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -3642,6 +3644,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                             .buffer_descriptor.transport_endpoint_);
                 }
                 std::optional<TransferFuture> submit_result;
+                bool file_write = false;
                 if (replica.is_vsegment_replica()) {
                     if (!vsegment_transfer_planner_) {
                         op.transfer_summary.RecordFailure(
@@ -3670,6 +3673,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     for (const auto& subrequest : plan.requests) {
                         transport_endpoints.push_back(subrequest.endpoint);
                     }
+                    file_write = plan.file_write_replica.has_value();
                     submit_result = transfer_submitter_->submitVSegment(
                         plan, TransferRequest::WRITE);
                 } else if (replica.is_nof_replica()) {
@@ -3707,7 +3711,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 
                 op.pending_transfers.emplace_back(
                     replica_type, std::move(submit_result.value()),
-                    std::move(transport_endpoints));
+                    std::move(transport_endpoints), file_write);
             }
         }
 
@@ -3731,9 +3735,12 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                                                   transfer_result);
                 // 方案二被动层：异步传输失败时按提交时记录的端点归因
                 // （vsegment 为 plan 解析出的全部条带成员端点，best-effort）
-                for (const auto& endpoint :
-                     pending_transfer.transport_endpoints) {
-                    op.failed_endpoints.insert(endpoint);
+                if (!pending_transfer.file_write ||
+                    transfer_result != ErrorCode::INVALID_WRITE) {
+                    for (const auto& endpoint :
+                         pending_transfer.transport_endpoints) {
+                        op.failed_endpoints.insert(endpoint);
+                    }
                 }
                 std::string error_context =
                     "Transfer " + std::to_string(i) + " failed";
@@ -5797,6 +5804,7 @@ ErrorCode Client::TransferData(
     }
 
     std::optional<TransferFuture> future;
+    bool file_write = false;
     // vsegment 传输 plan 解析出的条带成员物理端点，失败时 best-effort 归因
     // （无法定位具体失败成员，全部上报；误报由 worker 重挂载自愈兜底）。
     std::vector<std::string> vsegment_plan_endpoints;
@@ -5829,6 +5837,7 @@ ErrorCode Client::TransferData(
         for (const auto& subrequest : plan.requests) {
             vsegment_plan_endpoints.push_back(subrequest.endpoint);
         }
+        file_write = !is_read && plan.file_write_replica.has_value();
         SpDiag::PerfPoint pt_vsegment_submit(
             PerfKey::VSEGMENT_READ_SUBMIT, SpDiag::PerfLevel::MODULE);
         if (is_read) pt_submit.Start();
@@ -5874,7 +5883,8 @@ ErrorCode Client::TransferData(
     if (is_read) pt_wait.Start();
     if (is_vsegment_read) pt_vsegment_wait.Start();
     const ErrorCode result = future->get();
-    if (result != ErrorCode::OK && failed_endpoints) {
+    if (result != ErrorCode::OK && failed_endpoints &&
+        (!file_write || result != ErrorCode::INVALID_WRITE)) {
         for (const auto& endpoint : vsegment_plan_endpoints) {
             failed_endpoints->insert(endpoint);
         }

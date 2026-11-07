@@ -346,6 +346,11 @@ ErrorCode WrappedMasterService::VSegmentPutEnd(
                                           object_id);
 }
 
+ErrorCode WrappedMasterService::ValidateFileWrite(
+    const FileSegmentWriteRange& range) {
+    return master_service_.ValidateFileWrite(range);
+}
+
 ErrorCode WrappedMasterService::VSegmentPutRevoke(
     const std::string& partition_id, const std::string& vsegment_id,
     uint64_t route_epoch, const std::string& operation_id) {
@@ -2312,6 +2317,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::VSegmentPutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::VSegmentPutEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ValidateFileWrite>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::VSegmentPutRevoke>(
