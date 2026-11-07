@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <cstdlib>
 #include <sstream>
@@ -796,7 +797,12 @@ std::string SpdkWrapper::GetNamespaceIdentity(const nof_seg_handle *handle) {
         identity += digits[byte >> 4];
         identity += digits[byte & 15];
     }
-    for (const auto byte : data->eui64) {
+    // Use the Identify Namespace byte order for both scalar and array EUI64
+    // definitions, without taking the address of a potentially packed field.
+    const auto* eui64 = reinterpret_cast<const unsigned char*>(data) +
+                        offsetof(spdk_nvme_ns_data, eui64);
+    for (std::size_t i = 0; i < sizeof(data->eui64); ++i) {
+        const auto byte = eui64[i];
         nonzero |= byte != 0;
         identity += digits[byte >> 4];
         identity += digits[byte & 15];
