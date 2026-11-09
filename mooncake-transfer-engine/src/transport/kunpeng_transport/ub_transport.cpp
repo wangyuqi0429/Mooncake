@@ -461,7 +461,7 @@ int UbTransport::install(std::string& local_server_name,
         uninit(this);
         return ret;
     }
-    LOG(INFO) << "Transfer engine allocate local segment done";
+    LOG(INFO) << "Transfer engine allocated local segment id";
 
     ret = startHandshakeDaemon(local_server_name);
     if (ret) {

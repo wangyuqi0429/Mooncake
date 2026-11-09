@@ -252,14 +252,14 @@ int UrmaContext::construct(GlobalConfig& config) {
             return ERR_CONTEXT;
         }
     }
-    LOG(INFO) << "create jfce done";
+    LOG(INFO) << "created " << num_jfces << " jfce";
     if (joinNonblockingPollList(event_fd_, urma_context_->async_fd)) {
         LOG(ERROR) << "Failed to register context async fd to epoll";
         close(event_fd_);
         return ERR_CONTEXT;
     }
 
-    LOG(INFO) << "join blocking list done";
+    LOG(INFO) << "registered async fd to epoll";
     jfc_list_.resize(num_jfc_list);
     urma_jfc_cfg_t jfc_s_cfg[num_jfc_list] = {};
     for (size_t i = 0; i < num_jfc_list; ++i) {
@@ -288,7 +288,7 @@ int UrmaContext::construct(GlobalConfig& config) {
             return ERR_CONTEXT;
         }
         jfc_r_list_[i] = jfc;
-        LOG(INFO) << "create jfc(send) done, jfc id : " << jfc->jfc_id.id;
+        LOG(INFO) << "create jfc(recv) done, jfc id : " << jfc->jfc_id.id;
     }
     jfr_list_.resize(num_jfc_list);
     urma_jfr_cfg_t jfr_cfg[num_jfc_list] = {};
@@ -311,15 +311,8 @@ int UrmaContext::construct(GlobalConfig& config) {
         }
         jfr_list_[i].native = jfr;
     }
-    LOG(INFO) << "create jfr done";
-    LOG(INFO) << "URMA device: " << urma_context_->dev->name
-              << ", EID: (EID_Index " << eid_index_ << ") " << eid()
-              << ", transport mode: " << transModeToString(trans_mode_);
-
-    LOG(INFO) << "context_ == NULL ? "
-              << (urma_context_ == nullptr ? "TRUE" : "FALSE");
+    LOG(INFO) << "created " << num_jfc_list << " jfr";
     worker_pool_ = std::make_shared<UbWorkerPool>(*this, socketId());
-    LOG(INFO) << "create workerpool done";
     return 0;
 }
 
@@ -631,7 +624,8 @@ int UrmaContext::openDevice(const std::string& device_name, int8_t port,
         }
         eid_ = selected_eid->eid;
         LOG(INFO) << "Selected URMA device " << device_name << ", EID index "
-                  << eid_index << ", EID " << eid();
+                  << eid_index << ", EID " << eid()
+                  << ", transport mode " << transModeToString(trans_mode_);
         urma_free_eid_list(eid_list);
 
         context = urma_create_context(devices[i], eid_index);

@@ -329,9 +329,10 @@ Client::Client(const std::string& local_hostname,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
-    LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
+    } else {
+        LOG(INFO) << "client_id=" << client_id_;
     }
     if (object_checksum_enabled_) {
         LOG(INFO) << "Object checksum validation is enabled";
@@ -1270,7 +1271,7 @@ ErrorCode Client::InitTransferEngine(
             }
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
-            LOG(ERROR) << "ub protocol entable device names is " << deviceName;
+            LOG(INFO) << "ub protocol enabled device names: " << deviceName;
             auto devices = splitString(deviceName, ',', true);
             auto topology = transfer_engine_->getLocalTopology();
             if (topology) {
