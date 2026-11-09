@@ -170,14 +170,14 @@ class UbContext {
             LOG(INFO) << "failed construct context " << toString();
             return 1;
         }
-        LOG(INFO) << "finish construct context " << toString();
         endpoint_store_ =
             std::make_shared<UbSIEVEEndpointStore>(max_endpoints_);
         if (endpoint_store_ == nullptr) {
             LOG(INFO) << "failed create endpoint store.";
             return 1;
         }
-        LOG(INFO) << "finish create endpoint store.";
+        LOG(INFO) << "finish construct context " << toString()
+                  << ", endpoint store ready";
         return 0;
     }
 
