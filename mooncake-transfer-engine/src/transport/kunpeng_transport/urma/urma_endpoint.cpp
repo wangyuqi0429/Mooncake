@@ -594,8 +594,16 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
     }
     memcpy(handle, output_buffer.data(), output_buffer.size());
 
+    auto t_import_start = std::chrono::steady_clock::now();
     auto import_tseg =
         urma_import_seg(urma_context_, handle, &urma_token, 0, import_flag_);
+    auto import_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t_import_start)
+                         .count();
+    MC_LOG(INFO) << "urma_import_seg_breakdown blob_len["
+                 << output_buffer.size() << "] va[0x" << std::hex
+                 << handle->ubva.va << std::dec << "] import_us[" << import_us
+                 << "] status[" << (import_tseg ? 0 : -1) << "]";
     if (import_tseg == NULL) {
         LOG(ERROR) << "Import segment Failed, blob size "
                    << output_buffer.size() << ", eid " << eid();

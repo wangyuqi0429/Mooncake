@@ -315,7 +315,8 @@ int UbWorkerPool::submitPostSend(
             LOG(ERROR) << "[UB] target segment has no context blob for "
                           "target_id="
                        << slice->target_id << " buffer_id=" << buffer_id
-                       << " device_id=" << device_id;
+                       << " device_id=" << device_id
+                       << " trace_id=" << slice->trace_id;
             slice->markFailed();
             markTargetFailed(slice->target_id);
             continue;
@@ -326,7 +327,8 @@ int UbWorkerPool::submitPostSend(
             LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
                        << slice->target_id << " buffer_id=" << buffer_id
                        << " device_id=" << device_id
-                       << " dest_addr=" << slice->ub.dest_addr;
+                       << " dest_addr=" << slice->ub.dest_addr
+                       << " trace_id=" << slice->trace_id;
             slice->markFailed();
             markTargetFailed(slice->target_id);
             continue;
@@ -673,6 +675,12 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
             slice->ub.r_seg =
                 context_.retrieveRemoteSeg(peer_buf.tseg_ctx[device_id]);
             if (!slice->ub.r_seg) {
+                LOG(ERROR) << "[UB] retrieveRemoteSeg failed while "
+                              "redispatching target_id="
+                           << slice->target_id << " buffer_id=" << buffer_id
+                           << " device_id=" << device_id
+                           << " dest_addr=" << slice->ub.dest_addr
+                           << " trace_id=" << slice->trace_id;
                 slice->markFailed();
                 processed_slice_count_++;
                 markTargetFailed(slice->target_id);
