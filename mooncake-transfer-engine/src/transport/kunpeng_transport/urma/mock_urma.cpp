@@ -332,6 +332,21 @@ urma_target_seg_t *urma_import_seg(urma_context_t *ctx, urma_seg_t *seg,
     return tseg;
 }
 
+urma_status_t urma_get_seg_ctx(urma_target_seg_t *tseg, urma_seg_t **seg,
+                               uint32_t *size) {
+    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (!tseg || !seg || !size || seg_map.find(tseg) == seg_map.end()) {
+        return URMA_EINVAL;
+    }
+    auto *seg_ctx = new urma_seg_t;
+    *seg_ctx = tseg->seg;
+    *seg = seg_ctx;
+    *size = sizeof(urma_seg_t);
+    return URMA_SUCCESS;
+}
+
+void urma_put_seg_ctx(urma_seg_t *seg) { delete seg; }
+
 urma_status_t urma_unimport_seg(urma_target_seg_t *tseg) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);
     if (!tseg || seg_map.find(tseg) == seg_map.end()) {
@@ -381,6 +396,26 @@ urma_status_t urma_delete_jetty(urma_jetty_t *jetty) {
     delete jetty;
     return URMA_SUCCESS;
 }
+
+urma_status_t urma_get_rjetty(urma_jetty_t *jetty, urma_rjetty_t **rjetty,
+                              uint32_t *length) {
+    std::shared_lock<std::shared_mutex> lock(g_rw_mutex);
+    if (!jetty || !rjetty || !length ||
+        jetty_map.find(jetty) == jetty_map.end()) {
+        return URMA_EINVAL;
+    }
+    auto *out = new urma_rjetty_t;
+    memset(out, 0, sizeof(urma_rjetty_t));
+    out->jetty_id = jetty->jetty_id;
+    out->trans_mode = jetty->jetty_cfg.jfs_cfg.trans_mode;
+    out->type = URMA_JETTY;
+    out->tp_type = URMA_CTP;
+    *rjetty = out;
+    *length = sizeof(urma_rjetty_t);
+    return URMA_SUCCESS;
+}
+
+void urma_put_rjetty(urma_rjetty_t *rjetty) { delete rjetty; }
 
 urma_status_t urma_unbind_jetty(urma_jetty_t *jetty) {
     std::unique_lock<std::shared_mutex> lock(g_rw_mutex);

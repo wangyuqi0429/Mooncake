@@ -202,12 +202,16 @@ class UrmaEndpoint : public UbEndPoint {
    private:
     std::vector<uint32_t> JettyNum() const;
 
+    std::vector<std::string> JettyRjettyBlobs() const;
+
     int doSetupConnection(const std::string& peer_eid,
                           std::vector<uint32_t> peer_jetty_num_list,
+                          std::vector<std::string> peer_rjetty_blobs,
                           std::string* reply_msg = nullptr);
 
     int doSetupConnection(int qp_index, const std::string& peer_eid,
                           uint32_t peer_jetty_num,
+                          const std::string& peer_rjetty_blob,
                           std::string* reply_msg = nullptr);
 
    private:

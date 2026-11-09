@@ -60,6 +60,10 @@ class UbWorkerPool {
 
     void redispatch(std::vector<Transport::Slice*>& slice_list, int thread_id);
 
+    bool isTargetSuppressed(int target_id);
+
+    void markTargetFailed(int target_id);
+
     void transferWorker(int thread_id);
 
     bool hasWorkerWork(int thread_id);
@@ -87,6 +91,9 @@ class UbWorkerPool {
     std::atomic<uint64_t> submitted_slice_count_;
     std::atomic<uint64_t> processed_slice_count_;
     uint64_t success_nr_polls = 0, failed_nr_polls = 0;
+    static constexpr uint64_t kFailedTargetCooldownNs = 1000000000ull;
+    std::mutex failed_target_mutex_;
+    std::unordered_map<int, uint64_t> failed_target_ids_;
 };
 
 class UbEndpointStore {
