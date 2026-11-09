@@ -137,6 +137,8 @@ PERF_KEY_DEF(UB_ENDPOINT_PASSIVE_SETUP,      "urma_endpoint.cpp::setupConnection
 PERF_KEY_DEF(UB_ENDPOINT_DO_SETUP_ALL,       "urma_endpoint.cpp::doSetupConnection",                    "DoSetupAll")
 PERF_KEY_DEF(UB_ENDPOINT_IMPORT_JETTY,       "urma_endpoint.cpp::doSetupConnection",                    "ImportJetty")
 PERF_KEY_DEF(UB_ENDPOINT_BIND_JETTY,         "urma_endpoint.cpp::doSetupConnection",                    "BindJetty")
+PERF_KEY_DEF(UB_ENDPOINT_GET_RJETTY,         "urma_endpoint.cpp::JettyRjettyBlobs",                     "GetRjetty")
+PERF_KEY_DEF(UB_SEGMENT_IMPORT,              "urma_endpoint.cpp::retrieveRemoteSeg",                    "ImportSeg")
 
 // ============================================================
 // === Master 服务端打点（程序名 mooncake_master）           ===

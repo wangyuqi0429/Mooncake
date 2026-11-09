@@ -90,6 +90,9 @@ class UbWorkerPool {
         collective_slice_queue_;
     std::atomic<uint64_t> submitted_slice_count_;
     std::atomic<uint64_t> processed_slice_count_;
+    std::atomic<uint64_t> import_attempts_{0};
+    std::atomic<uint64_t> import_failures_{0};
+    std::atomic<uint64_t> import_suppressed_{0};
     uint64_t success_nr_polls = 0, failed_nr_polls = 0;
     static constexpr uint64_t kFailedTargetCooldownNs = 1000000000ull;
     std::mutex failed_target_mutex_;

@@ -272,6 +272,7 @@ int UbWorkerPool::submitPostSend(
     uint64_t submitted_slice_count = 0;
     for (auto& slice : slice_list) {
         if (isTargetSuppressed(slice->target_id)) {
+            import_suppressed_.fetch_add(1, std::memory_order_relaxed);
             slice->markFailed();
             continue;
         }
@@ -311,7 +312,9 @@ int UbWorkerPool::submitPostSend(
             continue;
         }
         const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+        import_attempts_.fetch_add(1, std::memory_order_relaxed);
         if (device_id < 0 || device_id >= (int)peer_buf.tseg_ctx.size()) {
+            import_failures_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "[UB] target segment has no context blob for "
                           "target_id="
                        << slice->target_id << " buffer_id=" << buffer_id
@@ -324,6 +327,7 @@ int UbWorkerPool::submitPostSend(
         slice->ub.r_seg =
             context_.retrieveRemoteSeg(peer_buf.tseg_ctx[device_id]);
         if (!slice->ub.r_seg) {
+            import_failures_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
                        << slice->target_id << " buffer_id=" << buffer_id
                        << " device_id=" << device_id
@@ -666,7 +670,9 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                 continue;
             }
             const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+            import_attempts_.fetch_add(1, std::memory_order_relaxed);
             if (device_id < 0 || device_id >= (int)peer_buf.tseg_ctx.size()) {
+                import_failures_.fetch_add(1, std::memory_order_relaxed);
                 slice->markFailed();
                 processed_slice_count_++;
                 markTargetFailed(slice->target_id);
@@ -675,6 +681,7 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
             slice->ub.r_seg =
                 context_.retrieveRemoteSeg(peer_buf.tseg_ctx[device_id]);
             if (!slice->ub.r_seg) {
+                import_failures_.fetch_add(1, std::memory_order_relaxed);
                 LOG(ERROR) << "[UB] retrieveRemoteSeg failed while "
                               "redispatching target_id="
                            << slice->target_id << " buffer_id=" << buffer_id
@@ -823,6 +830,15 @@ void UbWorkerPool::transferWorker(int thread_id) {
                      << " idle_wait_us=" << metrics.idle_wait_ns / 1000
                      << " pending_context_slices=" << pendingSliceCount()
                      << " final=" << final;
+        if (thread_id == 0) {
+            MC_LOG(INFO) << "ub_import_breakdown nic=" << context_.nicPath()
+                         << " import_attempts_total="
+                         << import_attempts_.load(std::memory_order_relaxed)
+                         << " import_failures_total="
+                         << import_failures_.load(std::memory_order_relaxed)
+                         << " import_suppressed_total="
+                         << import_suppressed_.load(std::memory_order_relaxed);
+        }
         metrics = {};
         last_report_ns = now_ns;
     };

@@ -429,6 +429,8 @@ int UrmaContext::buildLocalBufferDesc(uint64_t addr,
         return ERR_CONTEXT;
     }
     std::string seg_ctx_blob = base64Encode(seg_ctx, seg_ctx_size);
+    VLOG(1) << "Exported delegated segment context, va=0x" << std::hex << addr
+            << std::dec << ", blob_len=" << seg_ctx_size;
     urma_put_seg_ctx(seg_ctx);
     auto index = local_tseg_list().size() - 1;
     buffer_desc.tseg.push_back(str);
@@ -595,11 +597,15 @@ void* UrmaContext::retrieveRemoteSeg(const std::string& remoteSegmentStr) {
     memcpy(handle, output_buffer.data(), output_buffer.size());
 
     auto t_import_start = std::chrono::steady_clock::now();
+    SpDiag::PerfPoint pt_import(PerfKey::UB_SEGMENT_IMPORT,
+                                SpDiag::PerfLevel::DEBUG);
+    pt_import.Start();
     auto import_tseg =
         urma_import_seg(urma_context_, handle, &urma_token, 0, import_flag_);
     auto import_us = std::chrono::duration_cast<std::chrono::microseconds>(
                          std::chrono::steady_clock::now() - t_import_start)
                          .count();
+    pt_import.End(import_tseg ? 0 : -1);
     MC_LOG(INFO) << "urma_import_seg_breakdown blob_len["
                  << output_buffer.size() << "] va[0x" << std::hex
                  << handle->ubva.va << std::dec << "] import_us[" << import_us
@@ -1545,9 +1551,23 @@ std::vector<std::string> UrmaEndpoint::JettyRjettyBlobs() const {
     for (auto* jetty : jetty_list_) {
         urma_rjetty_t* rjetty = nullptr;
         uint32_t length = 0;
-        if (jetty == nullptr ||
-            urma_get_rjetty(jetty, &rjetty, &length) != URMA_SUCCESS ||
-            rjetty == nullptr || length == 0) {
+        auto t_export_start = std::chrono::steady_clock::now();
+        SpDiag::PerfPoint pt_export(PerfKey::UB_ENDPOINT_GET_RJETTY,
+                                    SpDiag::PerfLevel::DEBUG);
+        pt_export.Start();
+        const bool ok =
+            jetty != nullptr &&
+            urma_get_rjetty(jetty, &rjetty, &length) == URMA_SUCCESS &&
+            rjetty != nullptr && length > 0;
+        auto export_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t_export_start)
+                             .count();
+        pt_export.End(ok ? 0 : -1);
+        MC_LOG(INFO) << "urma_get_rjetty_breakdown jetty_id["
+                     << (jetty ? (int)jetty->jetty_id.id : -1)
+                     << "] blob_len[" << (ok ? length : 0) << "] export_us["
+                     << export_us << "] status[" << (ok ? 0 : -1) << "]";
+        if (!ok) {
             LOG(ERROR) << "urma_get_rjetty failed; cannot export the local "
                           "jetty context for the peer";
             blobs.clear();
