@@ -1092,6 +1092,46 @@ urma_bind_jetty_breakdown index[{i}] local_jetty_id[{id}] peer_jetty_id[{id}] bi
 | `bind_us` | `urma_bind_jetty()` 调用耗时（微秒） |
 | `status` | 结果：`0` 成功 |
 
+### 12.8 UB 初始化日志序列（初始化阶段，建连之前）
+
+来源：`client_service.cpp`（Client 构造 / TE 安装）、`topology.cpp`、`urma_endpoint.cpp`（`UrmaContext::construct`）、`ub_context.h`、`ub_transport.cpp`。按发生顺序：
+
+```
+client_id=..., host_id=...                                  ← Client 构造
+ub protocol enabled device names: <dev[,dev]>               ← 显式设备列表（auto-discovery 关闭时）
+URMA module init success (topology discovery, temporary), ret=0
+UB device: <dev>, pci=<bus>, numa=<n>                       ← 设备发现（每设备一行）
+[WARNING] UB device <dev>: numa node unavailable; ...       ← 仅 numa<0 时出现
+Topology discovery complete with specified devices. Found <n> HCAs
+URMA module init success (owned), ret=0, depth=1            ← 传输层持有式 init
+Selected URMA device <dev>, EID index <i>, EID <eid>, transport mode <RM|RC|UM>
+created <n> jfce
+registered async fd to epoll
+create jfc(send) done, jfc id : <id>                        ← 每个发送 JFC 一行
+create jfc(recv) done, jfc id : <id>                        ← 每个接收 JFC 一行
+created <n> jfr
+UB worker scheduling: per-worker wait, workers=<w> jfcs=<n>
+finish construct context UrmaContext:{device_name: ..., max_endpoints: ..., async_fd: ...}, endpoint store ready
+device <dev> add to list
+ub resources init success
+allocated local segment id
+start handshake daemon done
+publish segments done
+```
+
+| 日志 | 含义 |
+|------|------|
+| `URMA module init success (topology discovery, temporary)` | 设备发现阶段临时 `urma_init`，发现结束即 `urma_uninit`；与下一处 owned init 成对出现是正常序列 |
+| `URMA module init success (owned), depth=1` | 传输层正式持有的 `urma_init`；`depth` 为进程内引用计数（多个 transport 实例共享时递增） |
+| `UB device: ..., numa=-1` | `-1` 表示无法从 `/sys/class/ubcore/<dev>/numa` 读到 NUMA 节点，NUMA 亲和对该设备不生效 |
+| `Selected URMA device ...` | 设备与 EID 的最终选择结果（EID 由 `MC_EID_INDEX` 决定），同时给出 `MC_URMA_TRANS_MODE` 解析后的传输模式 |
+| `registered async fd to epoll` | `urma_context->async_fd` 已注册进 epoll，后续异步事件（JETTY_ERR/PORT_DOWN 等）由事件线程处理 |
+| `UB worker scheduling: ...` | worker 线程数与 JFC 数（worker 按 `thread_id % jfcs` 条带轮询） |
+| `finish construct context ... endpoint store ready` | Context 构造完成；`max_endpoints` 为 endpoint 缓存容量（受设备 `max_jetty / num_jetty_per_ep` 约束） |
+| `allocated local segment id` | 已分配本地 segment 的元数据 ID（不是内存分配） |
+
+失败行为：若显式指定的设备列表匹配不到任何设备，初始化**直接失败**（`no UB device available ... refusing implicit mock fallback`），不会再静默退回 `mock_urma_device`；mock 设备仅当设备名被显式指定为 `mock_urma_device` 时可用。
+
 ---
 
 ## 13. 慢操作告警汇总
