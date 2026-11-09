@@ -1633,6 +1633,14 @@ int UrmaEndpoint::doSetupConnection(int jetty_index,
     }
     auto* rjetty = reinterpret_cast<urma_rjetty_t*>(rjetty_buf.data());
     rjetty->tp_type = URMA_CTP;
+    if (memcmp(rjetty->jetty_id.eid.raw, eid.raw, URMA_EID_SIZE) != 0) {
+        std::string message =
+            "rjetty blob eid mismatch, stale metadata for peer " + peer_eid;
+        LOG(ERROR) << "[Handshake] " << message << ", jetty id "
+                   << peer_jetty_num;
+        if (reply_msg) *reply_msg = message;
+        return ERR_REJECT_HANDSHAKE;
+    }
     LOG(INFO) << "Peer jetty id = " << peer_jetty_num;
     auto t_import_start = std::chrono::steady_clock::now();
     SpDiag::PerfPoint pt_import(PerfKey::UB_ENDPOINT_IMPORT_JETTY,
