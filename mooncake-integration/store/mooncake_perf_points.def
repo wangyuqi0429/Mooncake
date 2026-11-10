@@ -79,6 +79,10 @@ PERF_KEY_DEF(PUT_BATCH_INTERNAL_ALLOC_BUFFER,"real_client.cpp::put_batch_interna
 PERF_KEY_DEF(PUT_BATCH_INTERNAL_MEM_COPY,    "real_client.cpp::put_batch_internal",        "MemCopy")
 PERF_KEY_DEF(PUT_BATCH_INTERNAL_SPLIT_SLICES,"real_client.cpp::put_batch_internal",        "SplitSlices")
 
+// === RealClient::upsert_from (single key) ===
+PERF_KEY_DEF(UPSERT_FROM_INTERNAL,           "real_client.cpp::upsert_from",                "UpsertFromInternal")
+PERF_KEY_DEF(UPSERT_FROM_INTERNAL_QUERY,     "client_service.cpp::Upsert",                  "Query")
+
 // === Client::Put (单key) ===
 PERF_KEY_DEF(PUT_SINGLE_FULL,                "client_service.cpp::Put",                    "TransferPut")
 PERF_KEY_DEF(PUT_SINGLE_PUT_START,           "client_service.cpp::Put",                    "PutStart")
@@ -138,7 +142,6 @@ PERF_KEY_DEF(UB_ENDPOINT_DO_SETUP_ALL,       "urma_endpoint.cpp::doSetupConnecti
 PERF_KEY_DEF(UB_ENDPOINT_IMPORT_JETTY,       "urma_endpoint.cpp::doSetupConnection",                    "ImportJetty")
 PERF_KEY_DEF(UB_ENDPOINT_BIND_JETTY,         "urma_endpoint.cpp::doSetupConnection",                    "BindJetty")
 PERF_KEY_DEF(UB_ENDPOINT_GET_RJETTY,         "urma_endpoint.cpp::JettyRjettyBlobs",                     "GetRjetty")
-PERF_KEY_DEF(UB_SEGMENT_IMPORT,              "urma_endpoint.cpp::retrieveRemoteSeg",                    "ImportSeg")
 
 // ============================================================
 // === Master 服务端打点（程序名 mooncake_master）           ===
@@ -314,3 +317,32 @@ PERF_KEY_DEF(GET_INTERNAL_NOF_READ,       "real_client.cpp::get_buffer_internal"
 PERF_KEY_DEF(GET_INTERNAL_VSEG_READ,      "real_client.cpp::get_buffer_internal", "VSegRead")
 PERF_KEY_DEF(GET_INTO_INTERNAL_NOF_READ,  "real_client.cpp::get_into_internal",   "NoFRead")
 PERF_KEY_DEF(GET_INTO_INTERNAL_VSEG_READ, "real_client.cpp::get_into_internal",   "VSegRead")
+
+// === VSegment write breakdown ===
+// Appended to preserve the numeric identity of all pre-existing PerfKeys.
+PERF_KEY_DEF(VSEGMENT_WRITE_PLAN,         "client_service.cpp::vsegment_write", "VSegWritePlan")
+PERF_KEY_DEF(VSEGMENT_WRITE_SUBMIT,       "client_service.cpp::vsegment_write", "VSegWriteSubmit")
+PERF_KEY_DEF(VSEGMENT_WRITE_WAIT,         "client_service.cpp::vsegment_write", "VSegWriteWait")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_RESERVE,  "master_service.cpp::TryVSegmentPutStart", "VSegReserve")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_METADATA, "master_service.cpp::TryVSegmentPutStart", "VSegStartMetadata")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_LAYOUT,   "master_service.cpp::TryVSegmentPutStart", "VSegStartLayout")
+PERF_KEY_DEF(MASTER_VSEG_PUT_END_COMMIT,     "master_service.cpp::PutEndInternal",       "VSegCommit")
+PERF_KEY_DEF(MASTER_PUT_END_SHARD_LOCK_WAIT, "master_service.cpp::PutEndInternal",       "PutEndShardLockWait")
+PERF_KEY_DEF(MASTER_PUT_END_SHARD_LOCK_HOLD, "master_service.cpp::PutEndInternal",       "PutEndShardLockHold")
+PERF_KEY_DEF(MASTER_PUT_END_METADATA,        "master_service.cpp::PutEndInternal",       "PutEndMetadata")
+PERF_KEY_DEF(MASTER_PUT_END_OBJECT_OPLOG,    "master_service.cpp::PutEndInternal",       "PutEndObjectOpLog")
+PERF_KEY_DEF(VSEGMENT_STATE_SNAPSHOT,        "vsegment_manager.cpp::PersistDeferredLocked", "VSegStateSnapshot")
+PERF_KEY_DEF(VSEGMENT_STATE_DELTA,           "vsegment_ha.cpp::CommitDeferred",              "VSegStateDelta")
+PERF_KEY_DEF(VSEGMENT_STATE_SERIALIZE,       "vsegment_ha.cpp::CommitDeferred",              "VSegStateSerialize")
+PERF_KEY_DEF(VSEGMENT_STATE_ENQUEUE,         "vsegment_ha.cpp::CommitDeferred",              "VSegStateEnqueue")
+PERF_KEY_DEF(VSEGMENT_STATE_DURABLE_WAIT,    "vsegment_ha.cpp::WaitDurable",                 "VSegStateDurableWait")
+
+// === VSegment PutStart metadata fine-grained breakdown ===
+// Keep these appended so every pre-existing PerfKey retains its numeric ID.
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_SNAPSHOT_LOCK_WAIT, "master_service.cpp::TryVSegmentPutStart", "VSegSnapshotLockWait")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_QUOTA_RESERVE,      "master_service.cpp::TryVSegmentPutStart", "VSegQuotaReserve")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_DESCRIPTOR_BUILD,   "master_service.cpp::TryVSegmentPutStart", "VSegDescriptorBuild")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_SHARD_LOCK_WAIT,    "master_service.cpp::TryVSegmentPutStart", "VSegShardLockWait")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_METADATA_MUTATION,  "master_service.cpp::TryVSegmentPutStart", "VSegMetadataMutation")
+PERF_KEY_DEF(MASTER_VSEG_PUT_START_ROLLBACK,           "master_service.cpp::TryVSegmentPutStart", "VSegRollback")
+PERF_KEY_DEF(UB_SEGMENT_IMPORT,              "urma_endpoint.cpp::retrieveRemoteSeg",                    "ImportSeg")
