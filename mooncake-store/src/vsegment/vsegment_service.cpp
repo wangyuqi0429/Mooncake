@@ -1,9 +1,23 @@
 #include "vsegment/vsegment_service.h"
 
+#include <charconv>
+#include <cstdlib>
+#include <string_view>
+
+#include <glog/logging.h>
+
 #include "vsegment/vsegment_metrics.h"
 
 namespace mooncake::vsegment {
 namespace {
+
+constexpr char kMetricsRefreshIntervalMsEnv[] =
+    "MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS";
+constexpr int64_t kDefaultMetricsRefreshIntervalMs = 1000;
+constexpr uint64_t kMaxMetricsRefreshIntervalMs =
+    std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::nanoseconds::max())
+        .count();
 
 int64_t SteadyClockNowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -11,7 +25,33 @@ int64_t SteadyClockNowNs() {
         .count();
 }
 
+std::chrono::milliseconds MetricsRefreshIntervalFromEnv() {
+    const char* raw_value = std::getenv(kMetricsRefreshIntervalMsEnv);
+    if (raw_value == nullptr) {
+        return std::chrono::milliseconds(kDefaultMetricsRefreshIntervalMs);
+    }
+
+    const std::string_view value(raw_value);
+    uint64_t interval_ms = 0;
+    const auto [ptr, error] =
+        std::from_chars(value.data(), value.data() + value.size(), interval_ms);
+    if (value.empty() || error != std::errc{} ||
+        ptr != value.data() + value.size() ||
+        interval_ms > kMaxMetricsRefreshIntervalMs) {
+        LOG(WARNING) << "Invalid " << kMetricsRefreshIntervalMsEnv << "='"
+                     << raw_value << "', using default "
+                     << kDefaultMetricsRefreshIntervalMs << " ms";
+        return std::chrono::milliseconds(kDefaultMetricsRefreshIntervalMs);
+    }
+    return std::chrono::milliseconds(interval_ms);
+}
+
 }  // namespace
+
+VSegmentService::VSegmentService(
+    PartitionPhysicalQuotaSnapshot quota_snapshot)
+    : VSegmentService(std::move(quota_snapshot),
+                      MetricsRefreshIntervalFromEnv()) {}
 
 VSegmentService::VSegmentService(
     PartitionPhysicalQuotaSnapshot quota_snapshot,
@@ -327,8 +367,10 @@ VSegmentService::StartPutReplicasOwned(
         selected.push_back(result.replica.vsegment_id);
         results.push_back(std::move(result));
     }
-    const auto durable = batch.Flush();
-    if (durable != ErrorCode::OK) return tl::make_unexpected(durable);
+    // Match ordinary memory PutStart: journal submission protects ordering and
+    // backpressure, but the RPC does not wait for storage durability. A master
+    // failure may therefore lose an unfinished reservation in either path.
+    batch.DiscardDurabilityWaits();
     RefreshMetrics();
     return results;
 }

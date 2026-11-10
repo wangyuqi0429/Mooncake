@@ -148,12 +148,11 @@ class WrappedMasterService {
         const std::string& tenant_id = "default",
         const std::string& operation_id = "");
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchUpsertStart(const UUID& client_id,
-                     const std::vector<std::string>& keys,
-                     const std::vector<uint64_t>& slice_lengths,
-                     const ReplicateConfig& config,
-                     const std::string& tenant_id = "default");
+    std::vector<tl::expected<PutStartResult, ErrorCode>> BatchUpsertStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,

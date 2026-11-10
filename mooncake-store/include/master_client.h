@@ -367,8 +367,7 @@ class MasterClient {
         const std::string& key, const std::vector<size_t>& slice_lengths,
         const ReplicateConfig& config);
 
-    [[nodiscard]] std::vector<
-        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    [[nodiscard]] std::vector<tl::expected<PutStartResult, ErrorCode>>
     BatchUpsertStart(const std::vector<std::string>& keys,
                      const std::vector<std::vector<uint64_t>>& slice_lengths,
                      const ReplicateConfig& config);

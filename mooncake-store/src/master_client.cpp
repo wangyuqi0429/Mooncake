@@ -2058,7 +2058,7 @@ MasterClient::UpsertStart(const std::string& key,
     return result;
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<PutStartResult, ErrorCode>>
 MasterClient::BatchUpsertStart(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
@@ -2078,18 +2078,17 @@ MasterClient::BatchUpsertStart(
 
     // Single-master mode (routing not loaded): use the original batch path.
     if (partition_router_.Size() == 0) {
-        auto result =
-            invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
-                             std::vector<Replica::Descriptor>>(
-                keys.size(), client_id_, keys, total_slice_lengths, config,
-                tenant_id_.value());
+        auto result = invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
+                                       PutStartResult>(
+            keys.size(), client_id_, keys, total_slice_lengths, config,
+            tenant_id_.value());
         timer.LogResponse("result=", result.size(), " operations");
         return result;
     }
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results(keys.size(),
-                tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
+    std::vector<tl::expected<PutStartResult, ErrorCode>> results(
+        keys.size(),
+        tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS));
 
     auto groups = GroupKeysBySubmaster(keys, tenant_id_.value());
     for (auto& [submaster, indices] : groups) {
@@ -2109,11 +2108,11 @@ MasterClient::BatchUpsertStart(
             group_total_slice_lengths.push_back(total_slice_lengths[idx]);
         }
 
-        auto group_result = invoke_batch_rpc<
-            &WrappedMasterService::BatchUpsertStart,
-            std::vector<Replica::Descriptor>>(
-            group_keys.size(), client_id_, group_keys,
-            group_total_slice_lengths, config, tenant_id_.value());
+        auto group_result =
+            invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
+                             PutStartResult>(
+                group_keys.size(), client_id_, group_keys,
+                group_total_slice_lengths, config, tenant_id_.value());
         for (size_t j = 0; j < indices.size(); ++j) {
             results[indices[j]] = std::move(group_result[j]);
         }
@@ -2121,7 +2120,7 @@ MasterClient::BatchUpsertStart(
 
     // 路由自愈：STALE_ROUTE/SLOT_NOT_OWNED/SLOT_MIGRATING/无 owner 的
     // 失败子集刷新路由后重发一次（有界）；仍失败保持终态错误。
-    RetryBatchOnStaleRoute<std::vector<Replica::Descriptor>>(
+    RetryBatchOnStaleRoute<PutStartResult>(
         tenant_id_.value(), keys, results,
         [this, &results, &total_slice_lengths, &config](
             const std::string& submaster, std::vector<std::string> group_keys,
@@ -2132,11 +2131,11 @@ MasterClient::BatchUpsertStart(
             for (size_t idx : group_orig) {
                 group_total_slice_lengths.push_back(total_slice_lengths[idx]);
             }
-            auto group_result = invoke_batch_rpc<
-                &WrappedMasterService::BatchUpsertStart,
-                std::vector<Replica::Descriptor>>(
-                group_keys.size(), client_id_, group_keys,
-                group_total_slice_lengths, config, tenant_id_.value());
+            auto group_result =
+                invoke_batch_rpc<&WrappedMasterService::BatchUpsertStart,
+                                 PutStartResult>(
+                    group_keys.size(), client_id_, group_keys,
+                    group_total_slice_lengths, config, tenant_id_.value());
             if (group_result.size() != group_orig.size()) {
                 return false;
             }

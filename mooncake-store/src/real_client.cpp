@@ -5090,7 +5090,8 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
 
     std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
 
-    auto result = client_->Upsert(key, slices, config);
+    auto result = client_->Upsert(key, slices, config,
+                                  /*enable_upsert_from_diagnostics=*/true);
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -5099,8 +5100,16 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
 
 int RealClient::upsert_from(const std::string &key, void *buffer, size_t size,
                             const ReplicateConfig &config) {
+    mooncake::logging::ScopedTraceId trace(mooncake::logging::NewTraceId());
     auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
-        [&]() { return upsert_from_internal(key, buffer, size, config); },
+        [&]() {
+            SpDiag::PerfPoint pt_total(PerfKey::UPSERT_FROM_INTERNAL,
+                                       SpDiag::PerfLevel::KEY_MODULE);
+            pt_total.Start();
+            auto ret = upsert_from_internal(key, buffer, size, config);
+            pt_total.End(ret ? 0 : -1);
+            return ret;
+        },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &) {
             client_->ObserveTransferOperation(TransferOperationKind::kWrite,

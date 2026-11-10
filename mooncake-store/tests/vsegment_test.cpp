@@ -21,6 +21,7 @@
 #include <future>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -37,6 +38,25 @@ uint64_t MetricValue(const std::string& name) {
     const auto end = text.find('\n', begin);
     return std::stoull(text.substr(begin, end - begin));
 }
+
+class ScopedEnv {
+   public:
+    explicit ScopedEnv(const char* name) : name_(name) {
+        if (const char* value = std::getenv(name)) old_value_ = value;
+    }
+
+    ~ScopedEnv() {
+        if (old_value_) {
+            setenv(name_, old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+   private:
+    const char* name_;
+    std::optional<std::string> old_value_;
+};
 
 struct LegacySlotMetadataExport {
     uint16_t slot{0};
@@ -1792,6 +1812,36 @@ TEST(VSegmentServiceTest, ZeroIntervalRefreshesOnNonForcedCalls) {
     EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
 }
 
+TEST(VSegmentServiceTest, ReadsMetricsRefreshIntervalFromEnvironment) {
+    constexpr char kIntervalEnv[] =
+        "MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS";
+    ScopedEnv interval_env(kIntervalEnv);
+    ASSERT_EQ(setenv(kIntervalEnv, "0", 1), 0);
+
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+
+    VSegmentService service(snapshot);
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
+}
+
 TEST(VSegmentServiceTest, RejectsDescriptorMismatchBeforeCommit) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 1;
@@ -2209,6 +2259,33 @@ TEST(VSegmentLayoutMasterTest, BatchAndSingleResponsesCarryResolvedLayouts) {
     ASSERT_TRUE(loaded.has_value());
     ASSERT_TRUE(loaded->vsegment_layouts.has_value());
     EXPECT_EQ(loaded->vsegment_layouts->front().vsegment_id, vsegment_id);
+
+    // UpsertStart returns descriptors from the generic upsert state machine;
+    // the RPC wrapper enriches that response through this overload.
+    auto upsert = master.UpsertStart(client, key, tenant, 64, replicas);
+    ASSERT_TRUE(upsert.has_value());
+    PutStartResult upsert_response{{}, std::move(upsert.value())};
+    master.EnrichVSegmentLayouts(&upsert_response);
+    ASSERT_TRUE(upsert_response.vsegment_layouts.has_value());
+    EXPECT_EQ(upsert_response.vsegment_layouts->front().vsegment_id,
+              vsegment_id);
+    ASSERT_TRUE(master.UpsertEnd(client, ObjectMeta{key, std::nullopt}, tenant,
+                                 ReplicaType::MEMORY));
+
+    auto batch_upsert =
+        master.BatchUpsertStart(client, {key}, tenant, {64}, replicas);
+    ASSERT_EQ(batch_upsert.size(), 1u);
+    ASSERT_TRUE(batch_upsert.front().has_value());
+    PutStartResult batch_upsert_response{
+        {}, std::move(batch_upsert.front().value())};
+    master.EnrichVSegmentLayouts(&batch_upsert_response);
+    ASSERT_TRUE(batch_upsert_response.vsegment_layouts.has_value());
+    EXPECT_EQ(batch_upsert_response.vsegment_layouts->front().vsegment_id,
+              vsegment_id);
+    auto batch_end =
+        master.BatchUpsertEnd(client, {ObjectMeta{key, std::nullopt}}, tenant);
+    ASSERT_EQ(batch_end.size(), 1u);
+    EXPECT_TRUE(batch_end.front().has_value());
 }
 
 TEST(VSegmentLayoutMasterTest, UnmountInvalidatesCachedLayouts) {
@@ -2344,6 +2421,53 @@ TEST(VSegmentIntegrationTest, SizeChangingUpsertReleasesOldAndNewRanges) {
     EXPECT_EQ(full.replica.vsegment_id, original);
 }
 
+TEST(VSegmentIntegrationTest, SameSizeUpsertRevokeReleasesCommittedRange) {
+    const std::string key = "vsegment-upsert-inplace-revoke";
+    const auto& tenant = TenantId::Default();
+    const std::string partition_id = std::to_string(cvm::KeySlot(tenant, key));
+    PartitionPhysicalQuotaSnapshot quota;
+    quota.config_generation = 1;
+    quota.policy_digest = "policy";
+    quota.default_profile = "default";
+    quota.profile_specs = {Profile()};
+    quota.quotas = {{partition_id,
+                     "default",
+                     "DRAM",
+                     {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    auto vsegments = std::make_shared<VSegmentService>(quota);
+    ASSERT_EQ(vsegments->AddPartition(partition_id, 1, Committer()),
+              ErrorCode::OK);
+    MasterService master;
+    master.SetVSegmentService(vsegments);
+    ReplicateConfig config;
+    UUID client = generate_uuid();
+
+    tl::expected<std::optional<PutStartResult>, ErrorCode> started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = master.TryVSegmentPutStart(client, key, tenant, 64, config);
+        if (started && started->has_value()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started && started->has_value());
+    const auto original = (**started).replicas.front()
+                              .get_vsegment_descriptor()
+                              .vsegment_id;
+    ASSERT_TRUE(master.PutEnd(client, key, tenant, ReplicaType::MEMORY,
+                              (**started).operation_id));
+
+    auto upsert = master.UpsertStart(client, key, tenant, 64, config);
+    ASSERT_TRUE(upsert.has_value());
+    ASSERT_TRUE(master.UpsertRevoke(client, key, tenant,
+                                    ReplicaType::MEMORY));
+    EXPECT_EQ(master.GetReplicaList(key, tenant).error(),
+              ErrorCode::OBJECT_NOT_FOUND);
+
+    auto full = vsegments->StartPutOwned(partition_id, "full-after-revoke",
+                                         Profile().member_extent_size * 2);
+    ASSERT_TRUE(full) << full.detail;
+    EXPECT_EQ(full.replica.vsegment_id, original);
+}
+
 TEST(VSegmentServiceTest, ObjectReplicasUseDistinctVSegments) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 1;
@@ -2367,6 +2491,43 @@ TEST(VSegmentServiceTest, ObjectReplicasUseDistinctVSegments) {
     ASSERT_EQ(result->size(), 2u);
     EXPECT_NE((*result)[0].replica.vsegment_id,
               (*result)[1].replica.vsegment_id);
+}
+
+TEST(VSegmentServiceTest, PutStartDoesNotWaitForJournalDurability) {
+    std::atomic<bool> allow_write{true};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{},
+        [&](const OpLogBatchRecord&, const DurablePrefix&) {
+            while (!allow_write.load()) std::this_thread::yield();
+            return ErrorCode::OK;
+        });
+    writer.Start();
+
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {
+        {"partition-1", "default", "DRAM",
+         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    VSegmentService service(snapshot);
+    auto committer =
+        std::make_shared<OrderedOpLogVSegmentCommitter>(&writer);
+    ASSERT_EQ(service.AddPartition("partition-1", 1, std::move(committer)),
+              ErrorCode::OK);
+
+    allow_write = false;
+    auto started = std::async(std::launch::async, [&] {
+        return service.StartPutReplicasOwned("partition-1", {"put-1"}, 64);
+    });
+    const auto status = started.wait_for(std::chrono::seconds(2));
+    allow_write = true;
+    EXPECT_EQ(status, std::future_status::ready);
+    auto result = started.get();
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    ASSERT_EQ(result->size(), 1u);
+    writer.Stop();
 }
 
 TEST(VSegmentServiceTest, OrdinaryPutSelectsConfiguredProfile) {

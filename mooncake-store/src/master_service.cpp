@@ -1011,39 +1011,65 @@ MasterService::TryVSegmentPutStart(
     if (!normalized) return tl::make_unexpected(normalized.error());
     const std::string partition_id =
         std::to_string(cvm::KeySlot(*normalized, key));
-    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_,
+                                                      std::defer_lock);
+    {
+        SpDiag::PerfPoint pt_snapshot_lock(
+            PerfKey::MASTER_VSEG_PUT_START_SNAPSHOT_LOCK_WAIT,
+            SpDiag::PerfLevel::MODULE);
+        pt_snapshot_lock.Start();
+        snapshot_lock.lock();
+        pt_snapshot_lock.End(0);
+    }
     const auto ready = CheckVSegmentServiceability(partition_id);
     if (ready != ErrorCode::OK) return tl::make_unexpected(ready);
     std::vector<std::string> operation_ids(config.replica_num);
     for (auto& id : operation_ids) id = UuidToString(generate_uuid());
+    SpDiag::PerfPoint pt_reserve(PerfKey::MASTER_VSEG_PUT_START_RESERVE,
+                                 SpDiag::PerfLevel::MODULE);
+    pt_reserve.Start();
     auto reservations = vsegment_service_->StartPutReplicasOwned(
         partition_id, operation_ids, slice_length,
         config.vsegment_profile_name);
+    pt_reserve.End(reservations ? 0 : -1);
     if (!reservations) return tl::make_unexpected(reservations.error());
 
-    const auto abort = [&] {
-        for (const auto& reservation : *reservations)
-            vsegment_service_->AbortPutOwned(
+    const uint64_t quota_charge =
+        RequestedMemoryQuotaCharge(slice_length, config);
+    const auto rollback = [&](bool abort_quota) {
+        SpDiag::PerfPoint pt_rollback(
+            PerfKey::MASTER_VSEG_PUT_START_ROLLBACK,
+            SpDiag::PerfLevel::MODULE);
+        pt_rollback.Start();
+        bool rollback_succeeded = true;
+        for (const auto& reservation : *reservations) {
+            const auto error = vsegment_service_->AbortPutOwned(
                 reservation.replica.partition_id,
                 reservation.replica.vsegment_id,
                 reservation.operation_id);
+            rollback_succeeded = rollback_succeeded && error == ErrorCode::OK;
+        }
+        if (abort_quota) AbortTenantQuota(*normalized, quota_charge);
+        pt_rollback.End(rollback_succeeded ? 0 : -1);
     };
-    const uint64_t quota_charge =
-        RequestedMemoryQuotaCharge(slice_length, config);
+    SpDiag::PerfPoint pt_metadata(PerfKey::MASTER_VSEG_PUT_START_METADATA,
+                                  SpDiag::PerfLevel::MODULE);
+    pt_metadata.Start();
+    SpDiag::PerfPoint pt_quota(
+        PerfKey::MASTER_VSEG_PUT_START_QUOTA_RESERVE,
+        SpDiag::PerfLevel::MODULE);
+    pt_quota.Start();
     auto quota_result = ReserveTenantQuota(*normalized, quota_charge);
+    pt_quota.End(quota_result ? 0 : -1);
     if (!quota_result) {
-        abort();
+        rollback(false);
+        pt_metadata.End(-1);
         return tl::make_unexpected(quota_result.error());
     }
-    const auto shard_idx = getShardIndex(*normalized, key);
-    MetadataShardAccessorRW shard(this, shard_idx);
-    auto& tenant_state = shard->tenants[*normalized];
-    if (tenant_state.metadata.contains(key) ||
-        GetGroupRoute(*normalized, key).has_value()) {
-        abort();
-        AbortTenantQuota(*normalized, quota_charge);
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-    }
+    SpDiag::PerfPoint pt_descriptors(
+        PerfKey::MASTER_VSEG_PUT_START_DESCRIPTOR_BUILD,
+        SpDiag::PerfLevel::MODULE);
+    pt_descriptors.Start();
     std::vector<Replica> replicas;
     for (const auto& reservation : *reservations)
         replicas.emplace_back(reservation.replica,
@@ -1055,39 +1081,50 @@ MasterService::TryVSegmentPutStart(
         config.group_ids && !config.group_ids->empty()
             ? config.group_ids->front()
             : std::string{};
-    auto [it, inserted] = tenant_state.metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(
-            client_id, std::chrono::system_clock::now(), slice_length,
-            std::move(replicas), config.with_soft_pin, config.with_hard_pin,
-            config.data_type, group_id, *normalized, key));
+    pt_descriptors.End(0);
+    bool inserted = false;
+    {
+        const auto shard_idx = getShardIndex(*normalized, key);
+        SpDiag::PerfPoint pt_shard_lock(
+            PerfKey::MASTER_VSEG_PUT_START_SHARD_LOCK_WAIT,
+            SpDiag::PerfLevel::MODULE);
+        pt_shard_lock.Start();
+        MetadataShardAccessorRW shard(this, shard_idx);
+        pt_shard_lock.End(0);
+        SpDiag::PerfPoint pt_mutation(
+            PerfKey::MASTER_VSEG_PUT_START_METADATA_MUTATION,
+            SpDiag::PerfLevel::MODULE);
+        pt_mutation.Start();
+        auto& tenant_state = shard->tenants[*normalized];
+        if (!tenant_state.metadata.contains(key) &&
+            !GetGroupRoute(*normalized, key).has_value()) {
+            auto [it, emplaced] = tenant_state.metadata.emplace(
+                std::piecewise_construct, std::forward_as_tuple(key),
+                std::forward_as_tuple(
+                    client_id, std::chrono::system_clock::now(), slice_length,
+                    std::move(replicas), config.with_soft_pin,
+                    config.with_hard_pin, config.data_type, group_id,
+                    *normalized, key));
+            inserted = emplaced;
+            if (inserted) {
+                IncrementTenantMetadataObjectCount(*normalized);
+                it->second.reserved_quota_charge_bytes = quota_charge;
+                RegisterGroupMember(tenant_state, *normalized, key, group_id);
+                tenant_state.processing_keys.insert(key);
+            }
+        }
+        pt_mutation.End(inserted ? 0 : -1);
+    }
     if (!inserted) {
-        abort();
-        AbortTenantQuota(*normalized, quota_charge);
+        rollback(true);
+        pt_metadata.End(-1);
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
-    IncrementTenantMetadataObjectCount(*normalized);
-    it->second.reserved_quota_charge_bytes = quota_charge;
-    RegisterGroupMember(tenant_state, *normalized, key, group_id);
-    tenant_state.processing_keys.insert(key);
+    pt_metadata.End(0);
     PutStartResult result{
         operation_ids.size() == 1 ? operation_ids.front() : std::string{},
         std::move(descriptors)};
-    {
-        std::vector<std::pair<std::string, std::string>> vsegments;
-        for (const auto& replica : result.replicas) {
-            if (!replica.is_vsegment_replica()) continue;
-            const auto& descriptor = replica.get_vsegment_descriptor();
-            vsegments.emplace_back(descriptor.partition_id,
-                                   descriptor.vsegment_id);
-        }
-        if (!vsegments.empty()) {
-            auto layouts = BuildVSegmentLayoutTable(vsegments);
-            if (!layouts.empty()) {
-                result.vsegment_layouts = std::move(layouts);
-            }
-        }
-    }
+    EnrichVSegmentLayouts(&result);
     return std::optional<PutStartResult>(std::move(result));
 }
 
@@ -7595,11 +7632,29 @@ void MasterService::EnrichVSegmentLayouts(GetReplicaListResponse* response) {
     for (const auto& replica : response->replicas) {
         if (!replica.is_vsegment_replica()) continue;
         const auto& descriptor = replica.get_vsegment_descriptor();
-        vsegments.emplace_back(descriptor.partition_id,
-                               descriptor.vsegment_id);
+        vsegments.emplace_back(descriptor.partition_id, descriptor.vsegment_id);
     }
     if (vsegments.empty()) return;
     SpDiag::PerfPoint pt(PerfKey::VSEGMENT_READ_LAYOUT_BUILD,
+                         SpDiag::PerfLevel::MODULE);
+    pt.Start();
+    auto layouts = BuildVSegmentLayoutTable(vsegments);
+    pt.End(layouts.empty() ? -1 : 0);
+    if (!layouts.empty()) {
+        response->vsegment_layouts = std::move(layouts);
+    }
+}
+
+void MasterService::EnrichVSegmentLayouts(PutStartResult* response) {
+    if (response == nullptr) return;
+    std::vector<std::pair<std::string, std::string>> vsegments;
+    for (const auto& replica : response->replicas) {
+        if (!replica.is_vsegment_replica()) continue;
+        const auto& descriptor = replica.get_vsegment_descriptor();
+        vsegments.emplace_back(descriptor.partition_id, descriptor.vsegment_id);
+    }
+    if (vsegments.empty()) return;
+    SpDiag::PerfPoint pt(PerfKey::MASTER_VSEG_PUT_START_LAYOUT,
                          SpDiag::PerfLevel::MODULE);
     pt.Start();
     auto layouts = BuildVSegmentLayoutTable(vsegments);
@@ -8609,9 +8664,17 @@ auto MasterService::PutEndInternal(
     if (!OwnsSlot(cvm::KeySlot(object_id.tenant_id, object_id.user_key)))
         return tl::make_unexpected(ErrorCode::SLOT_NOT_OWNED);
 #endif
+    SpDiag::PerfPoint pt_shard_lock_wait(
+        PerfKey::MASTER_PUT_END_SHARD_LOCK_WAIT, SpDiag::PerfLevel::MODULE);
+    pt_shard_lock_wait.Start();
     MetadataAccessorRW accessor(this, object_id);
+    pt_shard_lock_wait.End(0);
+    SpDiag::PerfPoint pt_shard_lock_hold(
+        PerfKey::MASTER_PUT_END_SHARD_LOCK_HOLD, SpDiag::PerfLevel::MODULE);
+    pt_shard_lock_hold.Start();
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        pt_shard_lock_hold.End(-1);
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
@@ -8619,9 +8682,14 @@ auto MasterService::PutEndInternal(
     if (client_id != metadata.client_id) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
                    << ", was PutStart-ed by " << metadata.client_id;
+        pt_shard_lock_hold.End(-1);
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    const bool has_vsegment_replica = metadata.HasVSegmentReplica();
+    SpDiag::PerfPoint pt_vsegment_commit(
+        PerfKey::MASTER_VSEG_PUT_END_COMMIT, SpDiag::PerfLevel::MODULE);
+    if (has_vsegment_replica) pt_vsegment_commit.Start();
     vsegment::VSegmentCommitBatch vsegment_commits;
     ErrorCode vsegment_commit_error = ErrorCode::OK;
     metadata.VisitReplicas(
@@ -8645,15 +8713,25 @@ auto MasterService::PutEndInternal(
                     descriptor, effective_operation_id,
                     object_id.tenant_id.MakeScopedKey(key), &vsegment_commits);
         });
-    const auto durable = vsegment_commits.Flush();
-    if (durable != ErrorCode::OK) return tl::make_unexpected(durable);
+    // Match ordinary memory PutEnd: logical commits are ordered and accepted
+    // before the object PUT_END entry below, but the RPC does not wait for the
+    // backend durable prefix. Backpressure still performs a targeted Flush()
+    // in the retry branch above.
+    vsegment_commits.DiscardDurabilityWaits();
+    if (has_vsegment_replica) {
+        pt_vsegment_commit.End(vsegment_commit_error == ErrorCode::OK ? 0 : -1);
+    }
     if (vsegment_commit_error != ErrorCode::OK) {
         // Already committed replicas remain invisible with PROCESSING status.
         // Retrying PutEnd is idempotent and commits the remaining replicas;
         // releasing the prefix here would invalidate that retry contract.
+        pt_shard_lock_hold.End(-1);
         return tl::make_unexpected(vsegment_commit_error);
     }
 
+    SpDiag::PerfPoint pt_metadata(PerfKey::MASTER_PUT_END_METADATA,
+                                  SpDiag::PerfLevel::MODULE);
+    pt_metadata.Start();
     metadata.VisitReplicas(
         [replica_type](const Replica& replica) {
             if (replica.is_vsegment_replica()) {
@@ -8753,6 +8831,12 @@ auto MasterService::PutEndInternal(
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
     PublishKvStored(key, replica_type, metadata, object_id.tenant_id);
 
+    // TODO(P99-diag): Temporarily disable PutEnd IO-pattern recording. The
+    // synchronous feedback path runs every 64 accesses and was observed to
+    // hold the metadata shard write lock for up to milliseconds. Restore this
+    // after moving RecordAccess/ScheduleAdmission outside the shard lock or
+    // making feedback processing asynchronous.
+#if 0
     if (io_pattern_runtime_) {
         io_pattern_runtime_->RecordAccess(
             key, {.object = {object_id.tenant_id, key},
@@ -8775,17 +8859,26 @@ auto MasterService::PutEndInternal(
                 {object_id.tenant_id, key}, io_pattern::CacheTier::kL1Host);
         }
     }
+#endif
+    (void)write_batch_size;
+    (void)overwrite;
 
     if (enable_oplog_ && ordered_oplog_writer_) {
+        SpDiag::PerfPoint pt_object_oplog(
+            PerfKey::MASTER_PUT_END_OBJECT_OPLOG, SpDiag::PerfLevel::MODULE);
+        pt_object_oplog.Start();
         std::string payload = SerializeMetadataForOpLog(metadata);
         auto result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key, payload);
+        pt_object_oplog.End(result ? 0 : -1);
         if (!result) {
             LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
                          << ", err=" << static_cast<int>(result.error());
         }
     }
 
+    pt_metadata.End(0);
+    pt_shard_lock_hold.End(0);
     return {};
 }
 
@@ -8972,8 +9065,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
     ErrorCode vsegment_abort_error = ErrorCode::OK;
     metadata.VisitReplicas(
-        &Replica::fn_is_vsegment_replica,
-        [&](const Replica& replica) {
+        &Replica::fn_is_vsegment_replica, [&](const Replica& replica) {
             if (vsegment_abort_error != ErrorCode::OK) return;
             const auto& descriptor = replica.get_vsegment_descriptor();
             const std::string effective_operation_id =
@@ -8986,6 +9078,15 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
             vsegment_abort_error = vsegment_service_->AbortPutOwned(
                 descriptor.partition_id, descriptor.vsegment_id,
                 effective_operation_id);
+            // Same-size Upsert reuses a committed vsegment allocation and
+            // marks its replica PROCESSING without creating a new logical
+            // reservation. Abort therefore returns INVALID_WRITE. Let the
+            // normal replica-erasure path below release that committed
+            // allocation instead of leaving the key stuck in PROCESSING.
+            if (vsegment_abort_error == ErrorCode::INVALID_WRITE &&
+                replica.is_processing()) {
+                vsegment_abort_error = ErrorCode::OK;
+            }
         });
     if (vsegment_abort_error != ErrorCode::OK)
         return tl::make_unexpected(vsegment_abort_error);

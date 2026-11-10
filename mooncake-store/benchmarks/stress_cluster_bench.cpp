@@ -308,9 +308,9 @@ DEFINE_bool(enable_ssd_offload, false, "Enable SSD offload on this client");
 DEFINE_string(ssd_offload_path, "", "SSD offload directory path");
 
 DEFINE_string(scenario, "local_memory",
-              "Benchmark scenario: local_memory, remote_memory, local_disk, "
-              "remote_disk, segment_write, segment_read, list_segments, "
-              "remove, batch_remove");
+              "Benchmark scenario: local_memory, upsert, remote_memory, "
+              "local_disk, remote_disk, segment_write, segment_read, "
+              "list_segments, remove, batch_remove");
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
@@ -948,16 +948,14 @@ class StressBenchmark {
         }
         if (!BeginMeasurement()) return 1;
 
-        std::latch put_ready_latch(
-            static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch put_ready_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         std::latch put_start_latch(
             static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
-        std::latch put_done_latch(
-            static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch put_done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
         auto put_threads = LaunchPutWorkers(
             FLAGS_num_threads, FLAGS_num_keys, config, put_stats,
             put_ready_latch, put_start_latch, put_done_latch,
-            [](size_t idx) { return MakeKey(idx); });
+            [](size_t idx) { return MakeKey(idx); }, WriteApi::PUT);
 
         put_ready_latch.wait();
         put_stats.StartTimer();
@@ -1035,6 +1033,68 @@ class StressBenchmark {
         FinishMeasurement("local_memory_read");
         const int verification = FLAGS_verify ? VerifyData() : 0;
         return mooncake::bench::ExitCode(stats.total_failed(), verification);
+    }
+
+    int RunUpsert() {
+        LOG(INFO) << "=== UPSERT BENCHMARK ===";
+
+        int buf_ret = AllocateThreadBuffers(FLAGS_num_threads);
+        if (buf_ret != 0) return buf_ret;
+        if (!EnsureNofPools()) return 1;
+
+        mooncake::ReplicateConfig config = MakeReplicateConfig();
+        LOG(INFO) << "Prefilling " << FLAGS_num_keys
+                  << " keys outside the measured interval";
+        for (size_t i = 0; i < FLAGS_num_keys; ++i) {
+            FillBuffer(FLAGS_num_keys + i);
+            const int ret = client_->put_from(MakeUpsertKey(i), buffer_,
+                                              FLAGS_value_size, config);
+            if (ret != 0) {
+                LOG(ERROR) << "upsert prefill put_from failed for key="
+                           << MakeUpsertKey(i) << " ret=" << ret;
+                return ret;
+            }
+        }
+
+        // Keep transfer diagnostics focused on the measured overwrite phase.
+        system("spdiag clear");
+
+        BenchmarkStats upsert_stats;
+        upsert_stats.InitThreads(
+            FLAGS_num_threads,
+            (FLAGS_num_keys + FLAGS_num_threads - 1) / FLAGS_num_threads);
+        if (!BeginMeasurement()) return 1;
+
+        std::latch ready_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        std::latch start_latch(static_cast<ptrdiff_t>(FLAGS_num_threads + 1));
+        std::latch done_latch(static_cast<ptrdiff_t>(FLAGS_num_threads));
+        auto threads = LaunchPutWorkers(
+            FLAGS_num_threads, FLAGS_num_keys, config, upsert_stats,
+            ready_latch, start_latch, done_latch,
+            [](size_t idx) { return MakeUpsertKey(idx); }, WriteApi::UPSERT);
+
+        ready_latch.wait();
+        upsert_stats.StartTimer();
+        start_latch.arrive_and_wait();
+        done_latch.wait();
+        upsert_stats.StopTimer();
+        for (auto& thread : threads) thread.join();
+
+        FinishMeasurement("upsert");
+        upsert_stats.Finalize();
+        upsert_stats.Print(
+            "UPSERT BENCHMARK",
+            MaxEffectiveBatchSize(FLAGS_num_keys, FLAGS_num_threads,
+                                  FLAGS_batch_size),
+            FLAGS_batch_size > 1
+                ? "batch_upsert_from / automatic batch strategy"
+                : "upsert_from / per-object strategy");
+        const int verification =
+            FLAGS_verify
+                ? VerifyData([](size_t idx) { return MakeUpsertKey(idx); })
+                : 0;
+        return mooncake::bench::ExitCode(upsert_stats.total_failed(),
+                                         verification);
     }
 
     int RunLocalDisk() {
@@ -1940,6 +2000,8 @@ class StressBenchmark {
     int Run() {
         if (FLAGS_scenario == "local_memory") {
             return RunLocalMemory();
+        } else if (FLAGS_scenario == "upsert") {
+            return RunUpsert();
         } else if (FLAGS_scenario == "local_disk") {
             return RunLocalDisk();
         } else if (FLAGS_scenario == "segment_write") {
@@ -1968,6 +2030,8 @@ class StressBenchmark {
     bool DirectAcceptancePassed() const { return direct_acceptance_passed_; }
 
    private:
+    enum class WriteApi { PUT, UPSERT };
+
     bool EnsureNofPools() {
         if (!FLAGS_nof_whole_pool_register || FLAGS_nof_replica_num == 0) {
             return true;
@@ -2203,6 +2267,11 @@ class StressBenchmark {
         return "bench_key_" + std::to_string(idx);
     }
 
+    static std::string MakeUpsertKey(size_t idx) {
+        return "upsert_bench_key_vs" + std::to_string(FLAGS_value_size) + "_" +
+               std::to_string(idx);
+    }
+
     void FillBuffer(void* destination, size_t seed) {
         void* target = destination;
         static thread_local std::vector<uint8_t> shadow;
@@ -2416,7 +2485,8 @@ class StressBenchmark {
         const mooncake::ReplicateConfig& config, BenchmarkStats& stats,
         std::latch& ready_latch, std::latch& start_latch,
         std::latch& done_latch,
-        const std::function<std::string(size_t)>& key_func) {
+        const std::function<std::string(size_t)>& key_func,
+        WriteApi write_api) {
         std::vector<std::thread> threads;
         threads.reserve(num_threads);
         const size_t keys_per_thread = total_keys / num_threads;
@@ -2427,11 +2497,12 @@ class StressBenchmark {
             const size_t key_offset =
                 t * keys_per_thread + std::min(t, remainder);
 
-            threads.emplace_back([&, t, my_keys, key_offset, key_func]() {
+            threads.emplace_back([&, t, my_keys, key_offset, key_func,
+                                  write_api]() {
                 bindToSocket(t % NR_SOCKETS);
                 ThreadResult& result = stats.GetThreadResult(t);
-                result.latencies_ns.reserve(
-                    (my_keys + FLAGS_batch_size - 1) / FLAGS_batch_size);
+                result.latencies_ns.reserve((my_keys + FLAGS_batch_size - 1) /
+                                            FLAGS_batch_size);
                 char* write_buffer = thread_buffers_[t].ptr;
 
                 if (!FLAGS_verify) FillBuffer(write_buffer, t);
@@ -2444,14 +2515,21 @@ class StressBenchmark {
                         if (FLAGS_verify) FillBuffer(write_buffer, key_idx);
 
                         const auto t0 = Clock::now();
-                        const int ret = client_->put_from(
-                            key, write_buffer, FLAGS_value_size, config);
+                        const int ret =
+                            write_api == WriteApi::UPSERT
+                                ? client_->upsert_from(key, write_buffer,
+                                                       FLAGS_value_size, config)
+                                : client_->put_from(key, write_buffer,
+                                                    FLAGS_value_size, config);
                         const auto t1 = Clock::now();
                         if (ret == 0) {
                             AccountMeasuredIo(key, FLAGS_value_size, true);
                         } else {
-                            LOG(ERROR) << "put_from failed for key=" << key
-                                       << " ret=" << ret;
+                            LOG(ERROR)
+                                << (write_api == WriteApi::UPSERT
+                                        ? "upsert_from"
+                                        : "put_from")
+                                << " failed for key=" << key << " ret=" << ret;
                         }
                         RecordPutResult(result, ElapsedNanos(t0, t1), ret);
                     }
@@ -2480,11 +2558,14 @@ class StressBenchmark {
                         }
 
                         const auto t0 = Clock::now();
-                        const auto results = client_->batch_put_from(
-                            keys, buffers, sizes, config);
+                        const auto results =
+                            write_api == WriteApi::UPSERT
+                                ? client_->batch_upsert_from(keys, buffers,
+                                                             sizes, config)
+                                : client_->batch_put_from(keys, buffers, sizes,
+                                                          config);
                         const auto t1 = Clock::now();
-                        result.latencies_ns.emplace_back(
-                            ElapsedNanos(t0, t1));
+                        result.latencies_ns.emplace_back(ElapsedNanos(t0, t1));
                         ++result.total_queries;
 
                         for (size_t k = 0; k < keys.size(); ++k) {
@@ -2497,9 +2578,11 @@ class StressBenchmark {
                                                   true);
                             } else {
                                 ++result.failed_ops;
-                                LOG(ERROR)
-                                    << "batch_put_from failed for key="
-                                    << keys[k] << " ret=" << ret;
+                                LOG(ERROR) << (write_api == WriteApi::UPSERT
+                                                   ? "batch_upsert_from"
+                                                   : "batch_put_from")
+                                           << " failed for key=" << keys[k]
+                                           << " ret=" << ret;
                             }
                         }
                         i = batch_end;
@@ -2934,13 +3017,13 @@ class StressBenchmark {
         return mooncake::bench::ExitCode(errors);
     }
 
-    int VerifyData() {
+    int VerifyData(const std::function<std::string(size_t)>& key_func = {}) {
         LOG(INFO) << "Verifying data integrity for " << FLAGS_num_keys
                   << " keys...";
         int errors = 0;
 
         for (size_t i = 0; i < FLAGS_num_keys; ++i) {
-            std::string key = MakeKey(i);
+            std::string key = key_func ? key_func(i) : MakeKey(i);
             if (!VerifyDirectMemoryPlacement(key)) {
                 ++errors;
                 continue;
@@ -3066,14 +3149,13 @@ int main(int argc, char* argv[]) {
     // External review #2: GPU 写入是显式路径，不靠 role 绕行。writer（含
     // segment_write/remove 预填等直接写场景）带 --gpu_mode 时即从 GPU buffer
     // 发起 put（GPU-source write），Setup/FillBuffer/put 路径均已支持。
-    const bool remote_scenario = FLAGS_scenario == "remote_memory" ||
-                                 FLAGS_scenario == "remote_disk";
-    const bool writes_gpu_source = FLAGS_scenario == "segment_write" ||
-                                   FLAGS_scenario == "remove" ||
-                                   FLAGS_scenario == "batch_remove" ||
-                                   FLAGS_scenario == "local_memory" ||
-                                   FLAGS_scenario == "local_disk" ||
-                                   (remote_scenario && FLAGS_role == "writer");
+    const bool remote_scenario =
+        FLAGS_scenario == "remote_memory" || FLAGS_scenario == "remote_disk";
+    const bool writes_gpu_source =
+        FLAGS_scenario == "segment_write" || FLAGS_scenario == "remove" ||
+        FLAGS_scenario == "batch_remove" || FLAGS_scenario == "upsert" ||
+        FLAGS_scenario == "local_memory" || FLAGS_scenario == "local_disk" ||
+        (remote_scenario && FLAGS_role == "writer");
     if (remote_scenario && FLAGS_role != "writer" && FLAGS_role != "reader") {
         LOG(ERROR) << "Remote scenarios require --role=writer or --role=reader";
         return 1;

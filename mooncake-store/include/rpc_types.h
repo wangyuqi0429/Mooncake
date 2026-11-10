@@ -112,9 +112,10 @@ YLT_REFL(PutStartResult, operation_id, replicas, vsegment_layouts);
 
 // BatchGetReplicaList keeps its legacy vector wire type. Its deduplicated table
 // rides on the first successful per-key GetReplicaListResponse, whose
-// compatible field keeps that RPC wire-compatible. BatchPutStart intentionally
-// returns per-key PutStartResult values instead; that direct RPC type change
-// requires clients and masters to be upgraded together.
+// compatible field keeps that RPC wire-compatible. BatchPutStart and
+// BatchUpsertStart intentionally return per-key PutStartResult values instead;
+// those direct RPC type changes require clients and masters to be upgraded
+// together.
 
 // Attaches the deduplicated batch table to the first successful per-key
 // response. No-op when there is no table or no successful key.

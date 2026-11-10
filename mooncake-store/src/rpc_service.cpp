@@ -888,14 +888,11 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     return results;
 }
 
-tl::expected<PutStartResult, ErrorCode>
-WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
-                                  const uint64_t slice_length,
-                                  const ReplicateConfig& config,
-                                  const std::string& tenant_id) {
+tl::expected<PutStartResult, ErrorCode> WrappedMasterService::UpsertStart(
+    const UUID& client_id, const std::string& key, const uint64_t slice_length,
+    const ReplicateConfig& config, const std::string& tenant_id) {
     return execute_rpc(
-        "UpsertStart",
-        PerfKey::MASTER_RPC_UPSERT_START,
+        "UpsertStart", PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
             return WithWriteTenant(
                 tenant_id, master_service_.IsTenantQuotaEnabled(),
@@ -907,8 +904,9 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!descriptors) {
                         return tl::make_unexpected(descriptors.error());
                     }
-                    return PutStartResult{{},
-                                          std::move(descriptors.value())};
+                    PutStartResult response{{}, std::move(descriptors.value())};
+                    master_service_.EnrichVSegmentLayouts(&response);
+                    return response;
                 });
         },
         [&](auto& timer) {
@@ -969,7 +967,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<PutStartResult, ErrorCode>>
 WrappedMasterService::BatchUpsertStart(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
@@ -979,8 +977,7 @@ WrappedMasterService::BatchUpsertStart(
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
+    std::vector<tl::expected<PutStartResult, ErrorCode>> results;
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
@@ -999,8 +996,18 @@ WrappedMasterService::BatchUpsertStart(
         results.assign(keys.size(),
                        tl::make_unexpected(resolved_tenant_id.error()));
     } else {
-        results = master_service_.BatchUpsertStart(
+        auto descriptor_results = master_service_.BatchUpsertStart(
             client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
+        results.reserve(descriptor_results.size());
+        for (auto& descriptors : descriptor_results) {
+            if (!descriptors) {
+                results.emplace_back(tl::make_unexpected(descriptors.error()));
+                continue;
+            }
+            PutStartResult response{{}, std::move(descriptors.value())};
+            master_service_.EnrichVSegmentLayouts(&response);
+            results.emplace_back(std::move(response));
+        }
     }
 
     size_t failure_count = 0;

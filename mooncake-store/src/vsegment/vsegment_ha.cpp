@@ -4,6 +4,7 @@
 #include <mutex>
 #include <unordered_set>
 
+#include "master_perf.h"
 #include "mooncake_logging.h"
 
 namespace mooncake::vsegment {
@@ -122,6 +123,9 @@ ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
     record.route_epoch = state.route_epoch;
     record.metadata_revision = state.metadata_revision;
     record.mutation = mutation;
+    SpDiag::PerfPoint pt_delta(PerfKey::VSEGMENT_STATE_DELTA,
+                               SpDiag::PerfLevel::MODULE);
+    pt_delta.Start();
     auto previous = last_states_.find(state.partition_id);
     if (previous == last_states_.end() ||
         previous->second.metadata_revision + 1 != state.metadata_revision) {
@@ -131,6 +135,10 @@ ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
         record.full_state = false;
         record.delta = BuildDelta(previous->second, state);
     }
+    pt_delta.End(0);
+    SpDiag::PerfPoint pt_serialize(PerfKey::VSEGMENT_STATE_SERIALIZE,
+                                   SpDiag::PerfLevel::MODULE);
+    pt_serialize.Start();
     std::string payload;
     struct_json::to_json(record, payload);
     OpLogEntry entry;
@@ -141,19 +149,27 @@ ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
     std::string validation_detail;
     if (!ValidateOpLogEntrySize(entry, &validation_detail)) {
         if (detail) *detail = std::move(validation_detail);
+        pt_serialize.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
+    pt_serialize.End(0);
+    SpDiag::PerfPoint pt_enqueue(PerfKey::VSEGMENT_STATE_ENQUEUE,
+                                 SpDiag::PerfLevel::MODULE);
+    pt_enqueue.Start();
     auto reservation = writer_->Reserve();
     if (!reservation) {
         if (detail) *detail = "OpLog writer is not accepting vsegment state";
+        pt_enqueue.End(-1);
         return reservation.error();
     }
     auto wait = std::make_shared<DeferredDurableWait>();
     auto pending = writer_->Commit(std::move(*reservation), std::move(entry), {});
     if (!pending) {
         if (detail) *detail = "failed to enqueue vsegment OpLog entry";
+        pt_enqueue.End(-1);
         return pending.error();
     }
+    pt_enqueue.End(0);
     wait->sequence_id = pending->sequence_id();
     last_states_[state.partition_id] = state;
     *handle = std::move(wait);
@@ -168,8 +184,13 @@ ErrorCode OrderedOpLogVSegmentCommitter::WaitDurable(
         return ErrorCode::INVALID_PARAMS;
     }
     auto* wait = static_cast<DeferredDurableWait*>(handle.get());
-    return writer_->WaitDurable(wait->sequence_id,
-                                durable_wait_warning_interval_);
+    SpDiag::PerfPoint pt_wait(PerfKey::VSEGMENT_STATE_DURABLE_WAIT,
+                              SpDiag::PerfLevel::MODULE);
+    pt_wait.Start();
+    const auto result = writer_->WaitDurable(wait->sequence_id,
+                                             durable_wait_warning_interval_);
+    pt_wait.End(result == ErrorCode::OK ? 0 : -1);
+    return result;
 }
 
 ErrorCode ReplayVSegmentState(

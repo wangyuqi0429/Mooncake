@@ -65,8 +65,10 @@ class VSegmentStateCommitter {
     }
 };
 
-// Explicit ownership of accepted commits. Callers must flush
-// before publishing readiness or acknowledging a metadata handoff.
+// Explicit ownership of accepted commits. Topology publication and metadata
+// handoff must Flush(). Volatile data-path operations may discard the wait
+// after journal acceptance when they intentionally match ordinary memory Put
+// semantics.
 class VSegmentCommitBatch {
    public:
     void Add(std::shared_ptr<VSegmentStateCommitter> committer,
@@ -81,6 +83,7 @@ class VSegmentCommitBatch {
         commits_.clear();
         return ErrorCode::OK;
     }
+    void DiscardDurabilityWaits() { commits_.clear(); }
 
    private:
     std::unordered_map<std::shared_ptr<VSegmentStateCommitter>,

@@ -238,6 +238,8 @@ class Client {
      * @param key Object key
      * @param slices Vector of data slices to store
      * @param config Replication configuration
+     * @param enable_upsert_from_diagnostics Enable upsert_from-only SpDiag
+     *        points and sampled breakdown logging
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Put(const ObjectKey& key,
@@ -265,7 +267,9 @@ class Client {
      */
     tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
                                          std::vector<Slice>& slices,
-                                         const ReplicateConfig& config);
+                                         const ReplicateConfig& config,
+                                         bool enable_upsert_from_diagnostics =
+                                             false);
 
     /**
      * @brief Batch upsert data with replication

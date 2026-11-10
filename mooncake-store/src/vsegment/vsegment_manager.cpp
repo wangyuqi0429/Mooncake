@@ -7,6 +7,7 @@
 #include <set>
 #include <sstream>
 
+#include "master_perf.h"
 #include "vsegment/vsegment_metrics.h"
 
 namespace mooncake::vsegment {
@@ -178,7 +179,8 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                         "PutStart route epoch is stale"};
             auto existing_operation = operation_vsegments_.find(operation_id);
             if (existing_operation != operation_vsegments_.end()) {
-                // Reuse the reservation, but still wait for its submission.
+                // Reuse the reservation and propagate its latest accepted
+                // journal fence to the caller's durability policy.
                 auto managed = vsegments_.find(existing_operation->second);
                 if (managed == vsegments_.end())
                     return {ErrorCode::INTERNAL_ERROR, operation_id, {},
@@ -822,8 +824,13 @@ ErrorCode VSegmentManager::PersistDeferredLocked(
     std::shared_ptr<VSegmentDeferredCommitHandle> handle;
     // committer 不支持延迟（默认回退同步 Commit）时 handle 为空且 entry
     // 已 durable，语义与 PersistLocked 等价。
-    auto result = committer_->CommitDeferred(SnapshotLocked(), mutation,
-                                              &handle, detail);
+    SpDiag::PerfPoint pt_snapshot(PerfKey::VSEGMENT_STATE_SNAPSHOT,
+                                  SpDiag::PerfLevel::MODULE);
+    pt_snapshot.Start();
+    auto snapshot = SnapshotLocked();
+    pt_snapshot.End(0);
+    auto result =
+        committer_->CommitDeferred(snapshot, mutation, &handle, detail);
     if (result != ErrorCode::OK) {
         --metadata_revision_;
         VSegmentMetrics::Instance().IncPersistenceFailure();
