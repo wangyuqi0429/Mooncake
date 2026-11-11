@@ -10,6 +10,7 @@
 
 #include "utils.h"
 #include "io_pattern/runtime.h"
+#include "vsegment/vsegment_metrics.h"
 
 namespace mooncake {
 
@@ -2270,7 +2271,9 @@ std::string MasterMetricManager::get_summary_string(
     // --- Get current values ---
     int64_t mem_allocated = mem_allocated_size_.value();
     int64_t mem_capacity = mem_total_capacity_.value();
-    int64_t nof_allocated = nof_allocated_size_.value();
+    const auto nof_allocated = nof_allocated_size_.value() +
+        static_cast<int64_t>(
+            vsegment::VSegmentMetrics::Instance().nof_logical_used_bytes());
     int64_t nof_capacity = nof_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     [[maybe_unused]] int64_t file_capacity = file_total_capacity_.value();

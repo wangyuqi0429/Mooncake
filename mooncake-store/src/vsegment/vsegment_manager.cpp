@@ -1081,9 +1081,15 @@ VSegmentManagerStats VSegmentManager::Stats() const {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [id, managed] : vsegments_) {
-            stats.logical_capacity_bytes += managed.view.logical_capacity;
-            stats.logical_free_bytes +=
-                managed.logical_allocator->FreeBytes();
+            const auto capacity = managed.view.logical_capacity;
+            const auto free = managed.logical_allocator->FreeBytes();
+            stats.logical_capacity_bytes += capacity;
+            stats.logical_free_bytes += free;
+            const auto profile = profiles_.find(managed.profile_name);
+            if (profile != profiles_.end() &&
+                profile->second.required_medium == "nof") {
+                stats.nof_logical_used_bytes += capacity - free;
+            }
             switch (managed.lifecycle) {
                 case Lifecycle::PREPARING:
                     ++stats.preparing;

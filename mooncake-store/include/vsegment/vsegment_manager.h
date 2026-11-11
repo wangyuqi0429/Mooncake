@@ -99,6 +99,7 @@ YLT_REFL(VSegmentPutStartResult, error, operation_id, replica, detail);
 struct VSegmentManagerStats {
     uint64_t logical_capacity_bytes{0};
     uint64_t logical_free_bytes{0};
+    uint64_t nof_logical_used_bytes{0};
     size_t preparing{0};
     size_t active{0};
     size_t draining{0};

@@ -1,5 +1,6 @@
 #include "rpc_service.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <sstream>
@@ -2028,6 +2029,10 @@ std::string MasterService::GetVSegmentStatusLogLine() const {
     if (vsegment_service_) {
         const auto& snapshot = vsegment_service_->quota_snapshot();
         const auto& metrics = vsegment::VSegmentMetrics::Instance();
+        const auto logical_capacity = metrics.logical_capacity_bytes();
+        const auto logical_free = metrics.logical_free_bytes();
+        const auto logical_used =
+            logical_capacity - std::min(logical_capacity, logical_free);
         os << ", generation=" << snapshot.config_generation
            << ", profiles=" << snapshot.profile_specs.size()
            << ", partitions_installed="
@@ -2035,8 +2040,9 @@ std::string MasterService::GetVSegmentStatusLogLine() const {
            // metrics 读取均为锁外安全视图。
            << vsegment_service_->PartitionCount()
            << ", vsegments=" << vsegment_service_->VSegmentCount()
-           << ", logical_capacity=" << metrics.logical_capacity_bytes()
-           << ", logical_free=" << metrics.logical_free_bytes()
+           << ", logical_capacity=" << logical_capacity
+           << ", logical_free=" << logical_free
+           << ", logical_used=" << logical_used
            << " | pools=";
         bool first_pool = true;
         for (const auto& profile : snapshot.profile_specs) {

@@ -12,9 +12,11 @@ VSegmentMetrics& VSegmentMetrics::Instance() {
 void VSegmentMetrics::SetCapacity(uint64_t total, uint64_t free,
                                   uint64_t reservations,
                                   uint64_t committed,
-                                  uint64_t pending_creations) {
+                                  uint64_t pending_creations,
+                                  uint64_t nof_logical_used) {
     total_bytes_.store(total);
     free_bytes_.store(free);
+    nof_logical_used_bytes_.store(nof_logical_used);
     reservations_.store(reservations);
     committed_.store(committed);
     pending_creations_.store(pending_creations);
@@ -28,6 +30,9 @@ std::string VSegmentMetrics::Serialize() const {
         << "# TYPE mooncake_vsegment_logical_free_bytes gauge\n"
         << "mooncake_vsegment_logical_free_bytes " << free_bytes_.load()
         << '\n'
+        << "# TYPE mooncake_vsegment_nof_logical_used_bytes gauge\n"
+        << "mooncake_vsegment_nof_logical_used_bytes "
+        << nof_logical_used_bytes() << '\n'
         << "# TYPE mooncake_vsegment_reservations gauge\n"
         << "mooncake_vsegment_reservations " << reservations_.load() << '\n'
         << "# TYPE mooncake_vsegment_committed_allocations gauge\n"

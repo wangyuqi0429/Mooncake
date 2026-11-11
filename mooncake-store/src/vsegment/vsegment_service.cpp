@@ -78,16 +78,18 @@ void VSegmentService::RefreshMetrics(bool force) {
     }
     uint64_t total = 0, free = 0, reservations = 0, committed = 0,
              pending = 0;
+    uint64_t nof_logical_used = 0;
     for (const auto& manager : managers) {
         const auto stats = manager->Stats();
         total += stats.logical_capacity_bytes;
         free += stats.logical_free_bytes;
+        nof_logical_used += stats.nof_logical_used_bytes;
         reservations += stats.reservations;
         committed += stats.committed_allocations;
         pending += stats.pending_creations;
     }
     VSegmentMetrics::Instance().SetCapacity(total, free, reservations,
-                                            committed, pending);
+                                            committed, pending, nof_logical_used);
     last_metrics_refresh_ns_.store(SteadyClockNowNs(),
                                    std::memory_order_relaxed);
 }
