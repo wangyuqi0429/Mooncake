@@ -1051,6 +1051,23 @@ MasterService::TryVSegmentPutStart(
     std::vector<Replica::Descriptor> descriptors;
     for (const auto& replica : replicas)
         descriptors.push_back(replica.get_descriptor());
+    std::vector<std::pair<std::string, std::string>> vsegments;
+    std::unordered_set<std::string> vsegment_ids;
+    for (const auto& reservation : *reservations) {
+        const auto& replica = reservation.replica;
+        if (vsegment_ids.insert(replica.vsegment_id).second) {
+            vsegments.emplace_back(replica.partition_id, replica.vsegment_id);
+        }
+    }
+    auto layouts = BuildVSegmentLayoutTable(vsegments);
+    if (layouts.size() != vsegments.size()) {
+        LOG(WARNING) << "Incomplete VSegment PutStart layouts: partition="
+                     << partition_id << ", expected=" << vsegments.size()
+                     << ", resolved=" << layouts.size();
+        abort();
+        AbortTenantQuota(*normalized, quota_charge);
+        return tl::make_unexpected(ErrorCode::VSEGMENT_SERVICE_NOT_READY);
+    }
     const std::string group_id =
         config.group_ids && !config.group_ids->empty()
             ? config.group_ids->front()
@@ -1073,21 +1090,7 @@ MasterService::TryVSegmentPutStart(
     PutStartResult result{
         operation_ids.size() == 1 ? operation_ids.front() : std::string{},
         std::move(descriptors)};
-    {
-        std::vector<std::pair<std::string, std::string>> vsegments;
-        for (const auto& replica : result.replicas) {
-            if (!replica.is_vsegment_replica()) continue;
-            const auto& descriptor = replica.get_vsegment_descriptor();
-            vsegments.emplace_back(descriptor.partition_id,
-                                   descriptor.vsegment_id);
-        }
-        if (!vsegments.empty()) {
-            auto layouts = BuildVSegmentLayoutTable(vsegments);
-            if (!layouts.empty()) {
-                result.vsegment_layouts = std::move(layouts);
-            }
-        }
-    }
+    result.vsegment_layouts = std::move(layouts);
     return std::optional<PutStartResult>(std::move(result));
 }
 
@@ -7590,7 +7593,12 @@ std::vector<VSegmentLayoutEntry> MasterService::BuildVSegmentLayoutTable(
         }
         vsegment::VSegmentView view;
         auto rc = service->LoadView(partition_id, vsegment_id, &view);
-        if (rc != ErrorCode::OK) continue;
+        if (rc != ErrorCode::OK) {
+            VLOG(1) << "Cannot load VSegment layout view: partition="
+                    << partition_id << ", vsegment=" << vsegment_id
+                    << ", error=" << rc;
+            continue;
+        }
         VSegmentLayoutEntry entry;
         entry.vsegment_id = view.vsegment_id;
         entry.partition_id = view.partition_id;
@@ -7603,7 +7611,12 @@ std::vector<VSegmentLayoutEntry> MasterService::BuildVSegmentLayoutTable(
         bool cacheable = true;
         for (const auto& extent : view.members) {
             auto member = ResolveVSegmentLayoutMember(extent.segment_id);
-            if (!member) break;
+            if (!member) {
+                VLOG(1) << "Cannot resolve VSegment layout member: partition="
+                        << partition_id << ", vsegment=" << vsegment_id
+                        << ", segment=" << extent.segment_id;
+                break;
+            }
             member->base_offset = extent.base_offset;
             member->length = extent.length;
             cacheable = cacheable &&

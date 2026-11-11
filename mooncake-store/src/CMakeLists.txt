@@ -328,8 +328,7 @@ if(USE_NOF)
       ${SPDK_FUSE_LIB})
 
   # Modified By Yida (v3): URMA transport (UMDK)。libspdk_nvme.a 中的 URMA
-  # object 引用 liburma 符号，必须出现在链接列表（此处 SPDK_STATIC_LIBS 整体
-  # 挂到 mooncake_store 的 PUBLIC libs，位置在 nvme 之后满足符号解析）。
+  # object 引用 liburma 符号，必须在 SPDK_STATIC_LIBS 中排在 nvme 之后。
   # 通过 -DUMDK_ROOT=/path/to/umdk-prefix 指定 UMDK 安装前缀。
   if(USE_NOF_URMA)
     # Modified By Yida (v6): /usr/local 装的是不含 URMA transport 的 SPDK
@@ -419,6 +418,9 @@ endif()
 # Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g.,
 # vendor-specific hardware) to targets that don't need it (e.g.,
 # mooncake_master). Targets that need transfer_engine should link it explicitly.
+# Keep SPDK private so executables using a shared mooncake_store do not link
+# its whole-archived SPDK constructors a second time. Static consumers still
+# receive the libraries as link dependencies.
 target_link_libraries(
   mooncake_store
   PUBLIC cachelib_memory_allocator
@@ -426,11 +428,11 @@ target_link_libraries(
          glog::glog
          gflags::gflags
          ${EXTRA_LIBS}
-         ${SPDK_STATIC_LIBS}
          mooncake_common
          yaml-cpp
          asio_shared
-  PRIVATE transfer_engine)
+  PRIVATE ${SPDK_STATIC_LIBS}
+          transfer_engine)
 
 # SpDiag instrumentation
 include(${CMAKE_SOURCE_DIR}/mooncake-common/FindSpDiag.cmake)

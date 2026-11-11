@@ -313,6 +313,8 @@ DEFINE_string(scenario, "local_memory",
               "remove, batch_remove");
 DEFINE_string(role, "writer",
               "Node role: writer (prefill data) or reader (benchmark reads)");
+DEFINE_bool(segment_write_vsegment, false,
+            "Use the default VSegment profile for segment_write puts");
 DEFINE_uint64(value_size, 4 * MB, "Size of each value in bytes");
 DEFINE_bool(key_include_value_size, false,
             "Append the value size to segment keys so runs with different "
@@ -1180,6 +1182,21 @@ class StressBenchmark {
     }
 
     int RunSegmentWrite() {
+        if (FLAGS_segment_write_vsegment) {
+            if (FLAGS_replica_num == 0 || FLAGS_nof_replica_num != 0) {
+                LOG(ERROR) << "VSegment segment_write requires --replica_num>0 "
+                              "and --nof_replica_num=0";
+                return 1;
+            }
+            if (!FLAGS_segments.empty() || !FLAGS_nof_segments.empty() ||
+                FLAGS_require_gpu_direct) {
+                LOG(ERROR) << "VSegment segment_write selects placement by "
+                              "profile. Clear --segments, --nof_segments and "
+                              "--require_gpu_direct";
+                return 1;
+            }
+            return RunWriter();
+        }
         auto segments = DiscoverBenchmarkSegments();
         if (segments.empty()) {
             return -1;
@@ -3206,7 +3223,8 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "Requested benchmark sizes overflow buffer or byte counts";
         return 1;
     }
-    const bool segment_scenario = FLAGS_scenario == "segment_write" ||
+    const bool segment_scenario = (FLAGS_scenario == "segment_write" &&
+                                   !FLAGS_segment_write_vsegment) ||
                                   FLAGS_scenario == "segment_read" ||
                                   FLAGS_scenario == "remove" ||
                                   FLAGS_scenario == "batch_remove";
