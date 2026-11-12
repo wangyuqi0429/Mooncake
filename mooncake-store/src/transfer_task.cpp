@@ -1965,7 +1965,58 @@ void TransferEngineOperationState::check_task_status() {
         ec = ErrorCode::TRANSFER_FAIL;
     }
 
+    collect_ub_timing();
     set_result_internal(ec);
+}
+
+void TransferEngineOperationState::collect_ub_timing() {
+    UbTransferTiming timing;
+    bool has_any = false;
+    for (size_t i = 0; i < batch_size_; ++i) {
+        std::vector<Transport::SliceTiming> timings;
+        auto s = engine_.getSliceTimings(batch_id_, i, timings);
+        if (!s.ok()) continue;
+        for (const auto& t : timings) {
+            if (t.post_ts <= 0) continue;
+            has_any = true;
+            if (timing.submit_ts == 0 || t.post_ts < timing.submit_ts) {
+                // submit_ts is the task-level stamp; for multi-task batches
+                // take the earliest post as a lower-bound proxy.
+            }
+            if (timing.first_post_ts == 0 || t.post_ts < timing.first_post_ts)
+                timing.first_post_ts = t.post_ts;
+            if (t.done_ts > timing.last_done_ts)
+                timing.last_done_ts = t.done_ts;
+            const int64_t wire_ns =
+                (t.done_ts > 0) ? t.done_ts - t.post_ts : 0;
+            if (timing.slice_count == 0 || wire_ns > timing.wire_max_ns)
+                timing.wire_max_ns = wire_ns;
+            if (timing.slice_count == 0 || wire_ns < timing.wire_min_ns)
+                timing.wire_min_ns = wire_ns;
+            timing.wire_sum_ns += wire_ns;
+            timing.slice_count++;
+            timing.total_bytes += t.length;
+            timing.slices.push_back(UbSliceTiming{
+                t.offset, t.length, t.peer_nic_path, t.post_ts, t.done_ts});
+        }
+    }
+    if (has_any) {
+        // Pull submit_ts from the first task's TransferTask (via batch).
+        // getSliceTimings does not expose it; read it through the batch
+        // descriptor directly.  For single-task batches (the common case)
+        // this is exact.
+        auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        if (!batch_desc.task_list.empty()) {
+            timing.submit_ts = batch_desc.task_list[0].submit_ts;
+        }
+        timing.ready_ts = [] {
+            struct timespec now;
+            clock_gettime(CLOCK_REALTIME, &now);
+            return static_cast<int64_t>(now.tv_sec) * 1000000000ll +
+                   now.tv_nsec;
+        }();
+        ub_timing_ = std::move(timing);
+    }
 }
 
 void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
@@ -2120,6 +2171,10 @@ ErrorCode TransferFuture::get() { return wait(); }
 
 std::optional<NofTransferTiming> TransferFuture::nofTiming() const {
     return state_->nof_timing();
+}
+
+std::optional<UbTransferTiming> TransferFuture::ubTiming() const {
+    return state_->ub_timing();
 }
 
 TransferStrategy TransferFuture::strategy() const {

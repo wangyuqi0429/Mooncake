@@ -186,6 +186,7 @@ Status MultiTransport::submitTransfer(
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         task.transport_ = transport;
+        task.submit_ts = getCurrentTimeInNano();
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -232,6 +233,7 @@ Status MultiTransport::mp_submitTransfer(
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         task.transport_ = transport;
+        task.submit_ts = getCurrentTimeInNano();
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -341,12 +343,19 @@ Status MultiTransport::getSliceTimings(
     // concurrent mutation of slice_list can occur.
     auto& task = batch_desc.task_list[task_id];
     timings.reserve(task.slice_list.size());
+    const void* base_source = task.slice_list.empty()
+                                  ? nullptr
+                                  : task.slice_list.front()->source_addr;
     for (const auto* slice : task.slice_list) {
         Transport::SliceTiming timing;
         timing.peer_nic_path = slice->peer_nic_path;
         timing.length = slice->length;
         timing.post_ts = slice->ts;
         timing.done_ts = slice->done_ts;
+        timing.offset = base_source
+                            ? (uint64_t)slice->source_addr -
+                                  (uint64_t)base_source
+                            : 0;
         timings.push_back(std::move(timing));
     }
     return Status::OK();

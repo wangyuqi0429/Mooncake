@@ -46,6 +46,38 @@ enum class TransferStrategy {
     SPDK_NVMF = 4  // Spdk nvmf operation
 };
 
+// Per-slice record for the UB/transfer-engine path.  All timestamps are
+// CLOCK_REALTIME nanoseconds stamped by the TE (Slice::ts at post,
+// Slice::done_ts at completion processing, TransferTask::submit_ts at
+// submit entry).  wire_ns = done_ts - post_ts includes the CQE poll
+// pickup latency; the URMA completion record itself carries no hardware
+// timestamp.
+struct UbSliceTiming {
+    uint64_t offset = 0;  // byte offset within the request buffer
+    uint64_t bytes = 0;
+    std::string peer_nic_path;  // dst "ip:port@device"
+    int64_t post_ts = 0;
+    int64_t done_ts = 0;
+};
+
+// Batch-level aggregate for the UB/transfer-engine path.  Valid only after
+// the future completes; the store-side polling thread fills it at the
+// terminal-state point (check_task_status) before setting the result.
+struct UbTransferTiming {
+    int64_t submit_ts = 0;     // TE submit entry (first task)
+    int64_t first_post_ts = 0; // earliest slice post
+    int64_t last_done_ts = 0;  // latest slice completion
+    int64_t ready_ts = 0;      // result set (future signaled)
+    uint64_t slice_count = 0;
+    uint64_t total_bytes = 0;
+    // Per-slice wire time (done_ts - post_ts) in ns.
+    int64_t wire_max_ns = 0;
+    int64_t wire_min_ns = 0;
+    int64_t wire_sum_ns = 0;
+    // Per-slice records (offset, bytes, peer, timestamps).
+    std::vector<UbSliceTiming> slices;
+};
+
 // Per-object NoF timing, captured for sampled high-frequency traces or while
 // the opt-in all-task slow-path trace is enabled.
 // The first three phases form a non-overlapping decomposition of total_us:
@@ -187,6 +219,11 @@ class OperationState {
 
     // Available only for sampled SPDK NoF operations after completion.
     virtual std::optional<NofTransferTiming> nof_timing() const {
+        return std::nullopt;
+    }
+
+    // Per-batch UB transfer-engine timing.  Valid after completion.
+    virtual std::optional<UbTransferTiming> ub_timing() const {
         return std::nullopt;
     }
 
@@ -357,6 +394,10 @@ class TransferEngineOperationState : public OperationState {
         return TransferStrategy::TRANSFER_ENGINE;
     }
 
+    std::optional<UbTransferTiming> ub_timing() const override {
+        return ub_timing_;
+    }
+
    private:
     /**
      * @brief Check the current completion status of the task, make sure to lock
@@ -367,10 +408,13 @@ class TransferEngineOperationState : public OperationState {
 
     void set_result_internal(ErrorCode error_code);
 
+    void collect_ub_timing();
+
     TransferEngine& engine_;
     BatchID batch_id_;
     size_t batch_size_;
     const int64_t start_ts_;
+    std::optional<UbTransferTiming> ub_timing_;
 };
 
 /**
@@ -410,6 +454,11 @@ class TransferFuture {
 
     // Returns per-object NoF phase timings after get()/wait() completes.
     std::optional<NofTransferTiming> nofTiming() const;
+
+    // Returns per-batch UB transfer-engine timing after get()/wait()
+    // completes.  Contains submit/post/completion timestamps, per-slice
+    // wire-time aggregates and per-slice records (offset, bytes, peer).
+    std::optional<UbTransferTiming> ubTiming() const;
 
     /**
      * @brief Get the transfer strategy used by this operation

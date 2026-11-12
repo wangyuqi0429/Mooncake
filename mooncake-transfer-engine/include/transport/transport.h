@@ -370,6 +370,10 @@ class Transport {
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+        // CLOCK_REALTIME ns stamped when the task enters submitTransfer.
+        // Used with Slice::ts (post) and Slice::done_ts (completion) to
+        // derive per-request TE queue / wire / teardown segments.
+        volatile int64_t submit_ts = 0;
 
         // Pointer to the transport that handles this task, set by
         // MultiTransport::submitTransfer(). Used to delegate
@@ -409,6 +413,7 @@ class Transport {
         uint64_t length = 0;
         int64_t post_ts = 0;
         int64_t done_ts = 0;
+        uint64_t offset = 0;
     };
 
     struct BatchDesc {
