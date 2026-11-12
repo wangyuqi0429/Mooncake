@@ -6066,10 +6066,11 @@ ErrorCode Client::TransferData(
 
     // Only meaningful when timing was captured for this request; failures may
     // still emit at the real layer, so never publish a garbage value.
+    const auto submit_end = std::chrono::steady_clock::now();
     g_request_timing.read_submit_us =
         breakdown_log
             ? std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now() - transfer_start)
+                  submit_end - transfer_start)
                   .count()
             : 0;
     const TransferStrategy strategy = future->strategy();
