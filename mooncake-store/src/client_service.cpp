@@ -5,6 +5,7 @@
 #include "allocator.h"
 #include "segment.h"
 #include "store_diagnostics.h"
+#include "request_timing.h"
 
 #include <csignal>
 #include <algorithm>
@@ -6018,12 +6019,20 @@ ErrorCode Client::TransferData(
     const auto submit_end =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
+    g_request_timing.read_submit_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            submit_end - transfer_start)
+            .count();
     const TransferStrategy strategy = future->strategy();
     VLOG(1) << "Using transfer strategy: " << strategy;
 
     pt_wait.Start();
     if (is_vsegment) pt_vsegment_wait.Start();
     const ErrorCode transfer_result = future->get();
+    // Feed the per-request timing stash for the breakdown[op] line.
+    if (strategy == TransferStrategy::TRANSFER_ENGINE) {
+        g_request_timing.ub_timing = future->ubTiming();
+    }
     if (transfer_result != ErrorCode::OK && failed_endpoints) {
         for (const auto& endpoint : vsegment_plan_endpoints) {
             failed_endpoints->insert(endpoint);

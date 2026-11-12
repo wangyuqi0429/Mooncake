@@ -24,6 +24,7 @@
 
 #include "mooncake_logging.h"
 #include "mutex.h"
+#include "request_timing.h"
 #include "rpc_service.h"
 #include "store_diagnostics.h"
 #include "types.h"
@@ -1620,6 +1621,10 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
                  << "] backoff_count[" << timing.backoff_count << "] status["
                  << status << "]";
     pt_total.End(result ? 0 : -1);
+    // Feed the per-request timing stash for the breakdown[op] line.
+    // Overwritten per call; the request entry point resets the stash.
+    g_request_timing.query_route_us = switch_us;
+    g_request_timing.query_rpc_us = timing.rpc_first_us;
     return result;
 }
 

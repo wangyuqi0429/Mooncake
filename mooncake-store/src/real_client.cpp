@@ -10,6 +10,7 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <cerrno>   // for errno (env parsing)
 #include <cstdio>   // for snprintf (t0 wall-clock formatting)
 #include <ctime>    // for localtime_r / strftime (t0 wall-clock formatting)
 #include <iomanip>  // for hex dump debug
@@ -27,6 +28,7 @@
 #include <vector>
 
 #include "mooncake_logging.h"
+#include "request_timing.h"
 
 #include "real_client.h"
 #include "registered_pinned_memory.h"
@@ -74,6 +76,23 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+// Threshold above which a single transfer slice is considered slow and its
+// breakdown[op.slice] detail line is emitted regardless of sampling.
+// MC_UB_SLOW_SLICE_US overrides the default of 1000us.
+int64_t UbSlowSliceUs() {
+    static const int64_t value = [] {
+        constexpr int64_t kDefaultUs = 1000;
+        const char *env = std::getenv("MC_UB_SLOW_SLICE_US");
+        if (!env || !*env) return kDefaultUs;
+        char *end = nullptr;
+        errno = 0;
+        const long v = std::strtol(env, &end, 10);
+        if (errno || end == env || *end || v < 0) return kDefaultUs;
+        return static_cast<int64_t>(v);
+    }();
+    return value;
+}
 
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
     return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
@@ -3166,39 +3185,142 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
-    // both the breakdown timing capture and its emission below.
+    // Reset the per-request timing stash; inner layers (master_client,
+    // TransferData) write their segments and we read them at exit.
+    resetRequestTiming();
+
+    // Sampling gates successful emissions only; failures always emit.
     const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
         mooncake::logging::CurrentTraceId());
-    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::time_point{};
-    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
-                                 : std::chrono::system_clock::time_point{};
-    auto t_query = t0, t_local_endpoints = t0, t_select = t0, t_alloc = t0;
+    auto t0 = std::chrono::steady_clock::now();
+    auto t0_wall = std::chrono::system_clock::now();
+    auto t_query = t0, t_select = t0, t_alloc = t0;
     std::string replica_type;
     std::string remote_endpoint = "-";
+    size_t replica_count = 0;
+
+    // Emit the single breakdown[get_buffer] line (tree format) plus per-slice
+    // detail lines.  `status` is "ok" on success or the error name; `ok`
+    // selects the gating (failures are always emitted).  `read_us` is the
+    // wall-clock memread span (0 for paths that never transferred).
+    auto log_breakdown = [&](const char *status, bool ok,
+                             int64_t read_us) {
+        if (!breakdown_log && ok) return;
+        auto now = std::chrono::steady_clock::now();
+        auto us = [](auto d) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(d)
+                .count();
+        };
+        const int64_t query_total_us = us(t_query - t0);
+        const int64_t select_us = us(t_select - t_query);
+        const int64_t buf_alloc_us = us(t_alloc - t_select);
+        const int64_t total_us = us(now - t0);
+
+        int64_t read_submit_us = 0, read_queue_us = 0, read_urma_us = 0;
+        int64_t read_teardown_us = 0, read_urma_min_us = 0,
+                read_urma_avg_us = 0, read_bytes = 0, slice_count = 0;
+        if (g_request_timing.ub_timing.has_value()) {
+            const auto &ut = g_request_timing.ub_timing.value();
+            read_submit_us = g_request_timing.read_submit_us;
+            if (ut.submit_ts > 0 && ut.first_post_ts > 0)
+                read_queue_us = (ut.first_post_ts - ut.submit_ts) / 1000;
+            read_urma_us = ut.wire_max_ns / 1000;
+            read_urma_min_us = ut.wire_min_ns / 1000;
+            read_urma_avg_us =
+                ut.slice_count
+                    ? (ut.wire_sum_ns / (int64_t)ut.slice_count) / 1000
+                    : 0;
+            if (ut.ready_ts > 0 && ut.last_done_ts > 0)
+                read_teardown_us = (ut.ready_ts - ut.last_done_ts) / 1000;
+            read_bytes = (int64_t)ut.total_bytes;
+            slice_count = (int64_t)ut.slice_count;
+        }
+
+        MC_LOG(INFO) << "breakdown[get_buffer] key[" << key << "] status["
+                     << status << "] size[" << read_bytes << "] type["
+                     << replica_type << "] replica_count[" << replica_count
+                     << "] remote_endpoint["
+                     << remote_endpoint << "] local_endpoint["
+                     << client_->GetSegmentEndpoint() << "] start_time["
+                     << FormatWallClock(t0_wall) << "]"
+                     << " query_total_us[" << query_total_us
+                     << "] query_route_us[" << g_request_timing.query_route_us
+                     << "] query_rpc_us[" << g_request_timing.query_rpc_us
+                     << "] select_us[" << select_us << "] buf_alloc_us["
+                     << buf_alloc_us << "] memread_total_us[" << read_us
+                     << "] read_submit_us[" << read_submit_us
+                     << "] read_queue_us[" << read_queue_us
+                     << "] read_urma_us[" << read_urma_us
+                     << "] read_teardown_us[" << read_teardown_us
+                     << "] slice_count[" << slice_count
+                     << "] read_urma_min_us[" << read_urma_min_us
+                     << "] read_urma_avg_us[" << read_urma_avg_us
+                     << "] memcpy_us[0] total_us[" << total_us << "]";
+
+        // Per-slice detail lines: emitted when sampled, when the request
+        // failed, or when any slice exceeds the slow-slice threshold.
+        if (g_request_timing.ub_timing.has_value()) {
+            const auto &ut = g_request_timing.ub_timing.value();
+            const int64_t slow_us = UbSlowSliceUs();
+            bool slow = false;
+            for (const auto &s : ut.slices) {
+                if (s.done_ts > 0 && s.post_ts > 0 &&
+                    (s.done_ts - s.post_ts) / 1000 > slow_us) {
+                    slow = true;
+                    break;
+                }
+            }
+            if (breakdown_log || !ok || slow) {
+                const size_t n = ut.slices.size();
+                for (size_t i = 0; i < n; ++i) {
+                    const auto &s = ut.slices[i];
+                    const int64_t slice_urma_us =
+                        (s.done_ts > 0 && s.post_ts > 0)
+                            ? (s.done_ts - s.post_ts) / 1000
+                            : -1;
+                    const int64_t slice_queue_us =
+                        (s.post_ts > 0 && ut.submit_ts > 0)
+                            ? (s.post_ts - ut.submit_ts) / 1000
+                            : -1;
+                    MC_LOG(INFO)
+                        << "breakdown[get_buffer.slice] key[" << key
+                        << "] slice_idx[" << i << "/" << n << "] offset["
+                        << s.offset << "] bytes[" << s.bytes << "] src["
+                        << client_->GetSegmentEndpoint() << "] dst["
+                        << s.peer_nic_path << "] slice_queue_us["
+                        << slice_queue_us << "] slice_urma_us["
+                        << slice_urma_us << "] status[" << status << "]";
+                }
+            }
+        }
+    };
 
     // Query the object info
     SpDiag::PerfPoint pt_query(PerfKey::GET_INTERNAL_QUERY,
                                SpDiag::PerfLevel::MODULE);
     pt_query.Start();
     auto query_result = client_->Query(key);
-    if (breakdown_log) t_query = std::chrono::steady_clock::now();
+    t_query = std::chrono::steady_clock::now();
     pt_query.End(query_result ? 0 : -1);
     if (!query_result) {
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            // Miss: always emit (see the gating note in log_breakdown).
+            log_breakdown(toString(query_result.error()).c_str(), false, 0);
             return nullptr;
         }
         LOG(ERROR) << "Query failed for key: " << key
                    << " with error: " << toString(query_result.error());
+        log_breakdown(toString(query_result.error()).c_str(), false, 0);
         return nullptr;
     }
 
     const std::vector<Replica::Descriptor> &replica_list =
         query_result.value().replicas;
+    replica_count = replica_list.size();
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
+        log_breakdown("EMPTY_REPLICA_LIST", false, 0);
         return nullptr;
     }
 
@@ -3209,14 +3331,12 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                                 SpDiag::PerfLevel::MODULE);
     pt_select.Start();
     auto local_endpoints = client_->GetLocalEndpoints();
-    if (breakdown_log) {
-        t_local_endpoints = std::chrono::steady_clock::now();
-    }
     const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
-    if (breakdown_log) t_select = std::chrono::steady_clock::now();
+    t_select = std::chrono::steady_clock::now();
     pt_select.End(best_replica ? 0 : -1);
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
+        log_breakdown("NO_USABLE_REPLICA", false, 0);
         return nullptr;
     }
 
@@ -3229,6 +3349,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     remote_endpoint = replica_info.remote_endpoint;
 
     if (total_length == 0) {
+        log_breakdown("EMPTY_OBJECT", false, 0);
         return nullptr;
     }
 
@@ -3237,61 +3358,23 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                                SpDiag::PerfLevel::MODULE);
     pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(total_length);
-    if (breakdown_log) t_alloc = std::chrono::steady_clock::now();
+    t_alloc = std::chrono::steady_clock::now();
     pt_alloc.End(alloc_result ? 0 : -1);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
+        log_breakdown("ALLOC_FAILED", false, 0);
         return nullptr;
     }
 
     auto buffer_handle =
         std::make_shared<BufferHandle>(std::move(*alloc_result));
 
-    auto log_breakdown = [&](const char *status) {
-        if (!breakdown_log) return;
-        auto now = std::chrono::steady_clock::now();
-        auto query_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(t_query - t0)
-                .count();
-        auto select_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                             t_select - t_query)
-                             .count();
-        auto local_endpoints_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                t_local_endpoints - t_query)
-                .count();
-        auto select_replica_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                t_select - t_local_endpoints)
-                .count();
-        auto alloc_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                            t_alloc - t_select)
-                            .count();
-        auto read_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
-                .count();
-        auto total_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
-                .count();
-        MC_LOG(INFO) << "get_breakdown key[" << key << "] start_time["
-                     << FormatWallClock(t0_wall) << "] query_us[" << query_us
-                     << "] select_us[" << select_us
-                     << "] local_endpoints_us[" << local_endpoints_us
-                     << "] select_replica_us[" << select_replica_us
-                     << "] alloc_us[" << alloc_us
-                     << "] read_us[" << read_us << "] total_us[" << total_us
-                     << "] type[" << replica_type << "] replica_count["
-                     << replica_list.size() << "] selected_type["
-                     << replica_type << "] local_endpoint["
-                     << client_->GetSegmentEndpoint() << "] remote_endpoint["
-                     << remote_endpoint << "] status[" << status << "]";
-    };
-
     if (best_replica->is_local_disk_replica()) {
         // LOCAL_DISK: data is on remote node's SSD. Use offload RPC.
         SpDiag::PerfPoint pt_ssd(PerfKey::GET_INTERNAL_SSD_READ,
                                  SpDiag::PerfLevel::MODULE);
         pt_ssd.Start();
+        auto t_ssd = std::chrono::steady_clock::now();
         const auto &endpoint =
             best_replica->get_local_disk_descriptor().transport_endpoint;
         std::unordered_map<std::string, std::vector<Slice>> objects;
@@ -3300,10 +3383,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         auto read_result =
             batch_get_into_offload_object_internal(endpoint, objects);
         pt_ssd.End(read_result ? 0 : -1);
+        auto ssd_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t_ssd)
+                          .count();
         if (!read_result) {
             LOG(ERROR) << "SSD read failed for key '" << key
                        << "': " << toString(read_result.error());
-            log_breakdown("ssd_fail");
+            log_breakdown(toString(read_result.error()).c_str(), false,
+                          ssd_us);
             return nullptr;
         }
         auto checksum_result =
@@ -3312,9 +3399,11 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         if (!checksum_result) {
             LOG(ERROR) << "SSD checksum verification failed for key '" << key
                        << "': " << toString(checksum_result.error());
+            log_breakdown(toString(checksum_result.error()).c_str(), false,
+                          ssd_us);
             return nullptr;
         }
-        log_breakdown("ssd_ok");
+        log_breakdown("ok", true, ssd_us);
         return buffer_handle;
     }
 
@@ -3339,14 +3428,17 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     auto filtered_qr = FilterQueryResult(query_result.value(), replica);
     auto get_result = client_->Get(key, filtered_qr, slices);
     pt_read.End(get_result ? 0 : -1);
+    auto read_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - t_alloc)
+                       .count();
     if (!get_result) {
         LOG(ERROR) << "Get failed for key: " << key
                    << " with error: " << toString(get_result.error());
-        log_breakdown("read_fail");
+        log_breakdown(toString(get_result.error()).c_str(), false, read_us);
         return nullptr;
     }
 
-    log_breakdown("read_ok");
+    log_breakdown("ok", true, read_us);
     return buffer_handle;
 }
 
