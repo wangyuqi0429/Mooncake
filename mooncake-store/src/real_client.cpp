@@ -2526,7 +2526,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         const char *status = success_count == results.size() ? "ok"
                              : success_count == 0            ? "err"
                                                              : "partial";
-        MC_LOG(INFO) << "batch_put_breakdown num_keys[" << keys.size()
+        MC_LOG(INFO) << "breakdown[batch_put] num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] prep_us[" << prep_us << "] write_us[" << write_us
                      << "] total_us[" << total_us << "] size[" << total_bytes
@@ -4078,7 +4078,7 @@ RealClient::batch_get_buffer_internal(
         auto total_us =
             std::chrono::duration_cast<std::chrono::microseconds>(t_read - t0)
                 .count();
-        MC_LOG(INFO) << "batch_get_breakdown num_keys[" << keys.size()
+        MC_LOG(INFO) << "breakdown[batch_get] num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] query_us[" << query_us << "] prep_us[" << prep_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
@@ -4670,7 +4670,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
             auto total_us =
                 std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
                     .count();
-            MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
+            MC_LOG(INFO) << "breakdown[get_into] key[" << key << "] start_time["
                          << FormatWallClock(t0_wall)
                          << "] query_us[0] select_us[0] local_endpoints_us[0]"
                             " select_replica_us[0] read_us[0]"
@@ -4729,7 +4729,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
             read_us > static_cast<int64_t>(known_read_us)
                 ? static_cast<uint64_t>(read_us) - known_read_us
                 : 0;
-        MC_LOG(INFO) << "get_into_breakdown key[" << key << "] start_time["
+        MC_LOG(INFO) << "breakdown[get_into] key[" << key << "] start_time["
                      << FormatWallClock(t0_wall) << "] query_us["
                      << metadata.query_us << "] select_us["
                      << metadata.select_us << "] local_endpoints_us["
@@ -5132,7 +5132,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         const char *status = success_count == results.size() ? "ok"
                              : success_count == 0            ? "err"
                                                              : "partial";
-        MC_LOG(INFO) << "batch_put_into_breakdown num_keys[" << keys.size()
+        MC_LOG(INFO) << "breakdown[batch_put_into] num_keys[" << keys.size()
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] prep_us[" << prep_us << "] write_us[" << write_us
                      << "] total_us[" << total_us << "] size[" << total_bytes
@@ -6147,7 +6147,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     t_prep - start_time)
                     .count();
-            MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
+            MC_LOG(INFO) << "breakdown[batch_get_into] num_keys[" << num_keys
                          << "] start_time[" << FormatWallClock(t0_wall)
                          << "] query_us[" << query_us << "] prep_us[" << prep_us
                          << "] read_us[0] total_us[" << total_us
@@ -6360,7 +6360,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();
-        MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
+        MC_LOG(INFO) << "breakdown[batch_get_into] num_keys[" << num_keys
                      << "] start_time[" << FormatWallClock(t0_wall)
                      << "] query_us[" << query_us << "] prep_us[" << prep_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
@@ -7336,7 +7336,7 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         if (breakdown_log) {
             mooncake::logging::ScopedTraceId trace(trace_id);
             MC_LOG(INFO)
-                << "offload_rpc_server_breakdown mode=pull"
+                << "breakdown[offload_rpc_server] mode=pull"
                 << " num_keys=" << keys.size()
                 << " queue_us="
                 << std::chrono::duration_cast<std::chrono::microseconds>(
@@ -7386,7 +7386,7 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
             .count();
     if (breakdown_log) {
         mooncake::logging::ScopedTraceId trace(trace_id);
-        MC_LOG(INFO) << "offload_rpc_server_breakdown mode=pull"
+        MC_LOG(INFO) << "breakdown[offload_rpc_server] mode=pull"
                      << " num_keys=" << keys.size()
                      << " queue_us=" << queue_us
                      << " batch_get_us=" << batch_get_us
@@ -7507,7 +7507,7 @@ RealClient::batch_get_offload_object_push(
         if (breakdown_log) {
             mooncake::logging::ScopedTraceId trace(req.trace_id);
             MC_LOG(INFO)
-                << "offload_rpc_server_breakdown mode=push"
+                << "breakdown[offload_rpc_server] mode=push"
                 << " num_keys=" << req.keys.size()
                 << " queue_us="
                 << std::chrono::duration_cast<std::chrono::microseconds>(
@@ -7535,7 +7535,7 @@ RealClient::batch_get_offload_object_push(
     if (breakdown_log) {
         mooncake::logging::ScopedTraceId trace(req.trace_id);
         MC_LOG(INFO)
-            << "offload_rpc_server_breakdown mode=push"
+            << "breakdown[offload_rpc_server] mode=push"
             << " num_keys=" << req.keys.size()
             << " queue_us="
             << std::chrono::duration_cast<std::chrono::microseconds>(
@@ -7650,7 +7650,7 @@ RealClient::batch_get_into_offload_object_internal(
                                                                   start_time)
                 .count();
         if (breakdown_log) {
-            MC_LOG(INFO) << "offload_read_breakdown mode=push"
+            MC_LOG(INFO) << "breakdown[offload_read] mode=push"
                          << " endpoint=" << target_rpc_service_addr
                          << " num_keys=" << objects.size()
                          << " total_us=" << total_us << " status=ok";
@@ -7703,7 +7703,7 @@ RealClient::batch_get_into_offload_object_internal(
                                                               start_time)
             .count());
     if (breakdown_log) {
-        MC_LOG(INFO) << "offload_read_breakdown mode=pull"
+        MC_LOG(INFO) << "breakdown[offload_read] mode=pull"
                      << " endpoint=" << target_rpc_service_addr
                      << " num_keys=" << objects.size()
                      << " batch_id=" << batchGetResp->batch_id
@@ -7859,7 +7859,7 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
                    BatchGetOffloadObjectResponse>(
             client_addr, timing, keys, sizes, trace_id);
     if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
-        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=pull"
+        MC_LOG(INFO) << "breakdown[offload_rpc_client] mode=pull"
                      << " endpoint=" << client_addr
                      << " num_keys=" << keys.size()
                      << " pool_lookup_us=" << timing->pool_lookup_us
@@ -7886,7 +7886,7 @@ ClientRequester::batch_get_offload_object_push(
         client_addr, timing, req);
     if (timing && mooncake::logging::ShouldSampleHiFreqLog(req.trace_id)) {
         mooncake::logging::ScopedTraceId trace(req.trace_id);
-        MC_LOG(INFO) << "offload_rpc_client_breakdown mode=push"
+        MC_LOG(INFO) << "breakdown[offload_rpc_client] mode=push"
                      << " endpoint=" << client_addr
                      << " num_keys=" << req.keys.size()
                      << " pool_lookup_us=" << timing->pool_lookup_us
@@ -7912,7 +7912,7 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
     auto result = invoke_rpc<&RealClient::release_offload_buffer, bool>(
         client_addr, timing, batch_id, trace_id);
     if (timing && mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
-        MC_LOG(INFO) << "offload_release_client_breakdown endpoint="
+        MC_LOG(INFO) << "breakdown[offload_release_client] endpoint="
                      << client_addr << " batch_id=" << batch_id
                      << " pool_lookup_us=" << timing->pool_lookup_us
                      << " rpc_call_us=" << timing->rpc_call_us

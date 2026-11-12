@@ -1925,33 +1925,9 @@ void TransferEngineOperationState::check_task_status() {
         return;
     }
 
-    // All tasks have reached a terminal state.
-    // Per-member latency trace (sampled): durations come from
-    // Slice::ts (post) / Slice::done_ts (completion) of each stripe
-    // member's slices. Only multi-slice (striped) tasks are interesting;
-    // single-slice tasks are skipped to keep the log focused.
-    if (mooncake::logging::ShouldSampleHiFreqLog(trace_id())) {
-        for (size_t i = 0; i < batch_size_; ++i) {
-            std::vector<Transport::SliceTiming> timings;
-            auto s = engine_.getSliceTimings(batch_id_, i, timings);
-            if (!s.ok() || timings.size() < 2) continue;
-            std::ostringstream os;
-            os << "transfer_member_latency task=" << i
-               << ", members=[";
-            for (size_t m = 0; m < timings.size(); ++m) {
-                const auto& t = timings[m];
-                const int64_t dur_ns =
-                    (t.done_ts > 0 && t.post_ts > 0) ? t.done_ts - t.post_ts
-                                                     : 0;
-                if (m) os << ", ";
-                os << "{peer=" << t.peer_nic_path << ", bytes=" << t.length
-                   << ", us=" << (dur_ns > 0 ? dur_ns / 1000 : -1) << "}";
-            }
-            os << "]";
-            MC_LOG(INFO) << os.str();
-        }
-    }
-
+    // All tasks have reached a terminal state.  Per-slice latency is
+    // surfaced at the store layer via breakdown[op.slice] (UbTransferTiming),
+    // so the old transfer_member_latency line is no longer emitted here.
     ErrorCode ec = ErrorCode::OK;
     if (!failed_task_ids.empty()) {
         std::ostringstream oss;

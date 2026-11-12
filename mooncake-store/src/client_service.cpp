@@ -2441,7 +2441,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     nof_observe_delay_max_us,
                     timing->complete_to_observe_us);
                 MC_LOG(INFO)
-                    << "batch_get_nof_task_breakdown trace_id=" << trace_id
+                    << "breakdown[batch_get_nof_task] trace_id=" << trace_id
                     << " task_index=" << index << " lane=" << timing->lane
                     << " sub_io_count=" << timing->sub_io_count
                     << " tasks_ahead_at_enqueue="
@@ -2636,7 +2636,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 ++success_count;
             }
         }
-        MC_LOG(INFO) << "batch_get_data_breakdown trace_id=" << trace_id
+        MC_LOG(INFO) << "breakdown[batch_get_data] trace_id=" << trace_id
                      << " keys=" << object_keys.size()
                      << " pending=" << pending_transfers.size()
                      << " bytes=" << submitted_bytes
@@ -2654,7 +2654,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 return sum / static_cast<int64_t>(nof_timing_count);
             };
             MC_LOG(INFO)
-                << "batch_get_nof_wait_breakdown trace_id=" << trace_id
+                << "breakdown[batch_get_nof_wait] trace_id=" << trace_id
                 << " nof_tasks=" << nof_timing_count
                 << " sub_ios=" << nof_sub_io_count
                 << " ready_before_wait=" << ready_before_wait
@@ -3083,7 +3083,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                                                          begin)
                 .count();
         };
-        VLOG(1) << "client_put_breakdown trace_id=" << trace_id
+        VLOG(1) << "breakdown[put_client] trace_id=" << trace_id
                      << " key=" << key << " slices=" << slices.size()
                      << " replicas=" << start_result.value().replicas.size()
                      << " checksum_us="
@@ -3274,7 +3274,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                                                          begin)
                 .count();
         };
-        VLOG(1) << "upsert_from_breakdown trace_id=" << trace_id
+        VLOG(1) << "breakdown[upsert_from_client] trace_id=" << trace_id
                      << " key=" << key << " slices=" << slices.size()
                      << " replicas=" << upsert_start.replicas.size()
                      << " checksum_us="
@@ -4564,7 +4564,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                                                                          begin)
                 .count();
         };
-        MC_LOG(INFO) << "client_batch_put_breakdown trace_id=" << trace_id
+        MC_LOG(INFO) << "breakdown[batch_put_client] trace_id=" << trace_id
                      << " keys=" << keys.size() << " bytes=" << total_bytes
                      << " prepare_us="
                      << elapsed_us(breakdown_start, prepare_end)
@@ -6105,15 +6105,17 @@ ErrorCode Client::TransferData(
                                                                          begin)
                 .count();
         };
-        MC_LOG(INFO) << "transfer_data_breakdown trace_id=" << trace_id
-                     << " op="
-                     << (op_code == TransferRequest::WRITE ? "write" : "read")
-                     << " replica=" << replica_kind << " strategy=" << strategy
-                     << " slices=" << slices.size() << " bytes=" << bytes
-                     << " submit_us=" << elapsed_us(transfer_start, submit_end)
-                     << " wait_us=" << elapsed_us(submit_end, wait_end)
-                     << " total_us=" << elapsed_us(transfer_start, wait_end)
-                     << " status=" << static_cast<int>(transfer_result);
+        // Inner-layer detail; the outer breakdown[op] tree is the primary
+        // per-request record, so keep this at debug level.
+        VLOG(1) << "breakdown[transfer_data] trace_id=" << trace_id
+                << " op="
+                << (op_code == TransferRequest::WRITE ? "write" : "read")
+                << " replica=" << replica_kind << " strategy=" << strategy
+                << " slices=" << slices.size() << " bytes=" << bytes
+                << " submit_us=" << elapsed_us(transfer_start, submit_end)
+                << " wait_us=" << elapsed_us(submit_end, wait_end)
+                << " total_us=" << elapsed_us(transfer_start, wait_end)
+                << " status=" << static_cast<int>(transfer_result);
     }
 
     return transfer_result;

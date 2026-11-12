@@ -1191,3 +1191,136 @@ trace_id[xxx] {op}_slow num_keys[{n}] size[{size}] elapsed_us[{us}] rc[{rc}]
 当操作超过 3ms 时：
 - 单 key `get`/`put`：仅 real_client.cpp 输出慢日志
 - 批量 `get_batch`/`put_batch`：可能同时出现 `store_py.cpp` 的慢日志（无 trace_id）和 `real_client.cpp` 的慢日志（有 trace_id）
+
+---
+
+## 14. 统一 `breakdown[<op>]` 日志（C0–C3）
+
+> 本节是最新口径。第 1–7 节中的 `*_breakdown` 旧名称已统一改名为
+> `breakdown[<op>]`，字段含义不变；旧名称仅作历史参考。
+
+### 14.1 命名与发射约定
+
+- 每条日志形如 `breakdown[<op>] key[...] status[...] ...`，MC_LOG 自动带
+  `trace_id[...]` 前缀。
+- **发射点统一在最外层**（`real_client.cpp`）。内层
+  （`master_client.cpp`、`client_service.cpp`）通过线程本地
+  `RequestTimingStash`（`mooncake-store/include/request_timing.h`）贡献分段；
+  请求入口 `resetRequestTiming()`，出口读取并汇聚。
+- **门控**：成功请求按 `MC_HIFREQ_LOG_SAMPLE_RATE` 采样（默认 0.1）；
+  **失败/miss 一律发射**。`OBJECT_NOT_FOUND`、`REPLICA_IS_NOT_READY`、
+  `EMPTY_REPLICA_LIST`、`NO_USABLE_REPLICA` 等视为失败。
+- 内层 `breakdown[put_client]` / `breakdown[upsert_from_client]` /
+  `breakdown[transfer_data]` 为 VLOG(1) 调试明细，默认不出。
+
+### 14.2 树结构（时间可加和）
+
+`breakdown[get_buffer]`：
+
+```
+query_total_us = query_route_us + query_rpc_us
+total_us ≈ query_total_us + select_us + buf_alloc_us + memread_total_us
+memread_total_us = memread_submit_us + memread_queue_us
+                 + memread_urma_us + memread_teardown_us
+```
+
+`breakdown[put|put_from|upsert|upsert_from]`（put 族共享一套稳定字段，
+不适用阶段为 0）：
+
+```
+prep_total_us = prep_buf_alloc_us + prep_memcpy_us + prep_split_us
+total_us ≈ prep_total_us + checksum_us + prepare_us + query_us
+         + put_start_us + memwrite_total_us + put_end_us
+         + finalize_us + cache_invalidate_us + revoke_us
+memwrite_total_us = memwrite_submit_us + memwrite_queue_us
+                  + memwrite_urma_us + memwrite_teardown_us
+```
+
+多 slice 时 `memread_urma_us` / `memwrite_urma_us` 取 **max**，另给
+`*_urma_min_us` / `*_urma_avg_us` / `slice_count`（这些是分布辅助字段，
+不参与加和）。
+
+`breakdown[<op>.slice]`：每个 slice 一行明细，字段见下。
+
+### 14.3 字段表
+
+`breakdown[get_buffer]`：
+
+| 字段 | 含义 |
+|------|------|
+| `query_total_us` | 元数据查询总时长（= route + rpc） |
+| `query_route_us` | 端点解析 / submaster 选择 / 连接建立 |
+| `query_rpc_us` | 首次 RPC 网络往返 |
+| `select_us` | 本地端点匹配与副本选择 |
+| `buf_alloc_us` | 客户端 buffer 分配 |
+| `memread_total_us` | 传输总时长（提交+排队+URMA+收尾） |
+| `memread_submit_us` | 组 slice + TE 提交调用 |
+| `memread_queue_us` | 提交 → 首 slice post |
+| `memread_urma_us` | 纯 URMA 时延（post → done，取 max） |
+| `memread_teardown_us` | 末 slice done → future ready |
+| `memread_urma_min_us` / `_avg_us` | 纯 URMA 时延最小/平均 |
+| `slice_count` | slice 数量 |
+| `total_us` | 请求总耗时 |
+
+put 族额外字段：`prep_*`（real 层准备）、`checksum_us`、`prepare_us`、
+`query_us`（upsert 查询已有对象）、`put_start_us`、`put_end_us`、
+`finalize_us`、`cache_invalidate_us`、`revoke_us`、`replicas`、
+`memwrite_*`（与 `memread_*` 同构、方向为写）。
+
+`breakdown[<op>.slice]`：
+
+| 字段 | 含义 |
+|------|------|
+| `slice_idx` | 形如 `3/16` |
+| `offset` | slice 在本次传输中的字节偏移 |
+| `bytes` | slice 长度 |
+| `src` / `dst` | `ip:port@device` |
+| `slice_queue_us` | 提交 → 该 slice post |
+| `slice_urma_us` | 该 slice post → done |
+| `status` | 请求状态（ok / 错误码） |
+
+remove 族为薄行：`breakdown[remove]`、`breakdown[batchRemove]`，仅含
+`remove_rpc_us` / `total_us` / `status`。
+
+### 14.4 慢 slice 阈值 — `MC_UB_SLOW_SLICE_US`
+
+任一 slice 的 `slice_urma_us` 超过阈值时，即使请求未采样也会输出
+`breakdown[<op>.slice]` 明细行（主行仍受采样门控）。默认 `1000`（微秒），
+非法值回退默认。
+
+### 14.5 改名映射
+
+| 旧名称 | 新名称 |
+|--------|--------|
+| `get_breakdown` | `breakdown[get_buffer]` |
+| `batch_get_breakdown` | `breakdown[batch_get]` |
+| `get_into_breakdown` | `breakdown[get_into]` |
+| `batch_get_into_breakdown` | `breakdown[batch_get_into]` |
+| `batch_put_breakdown` / `client_batch_put_breakdown` | `breakdown[batch_put]` / `breakdown[batch_put_client]` |
+| `batch_put_into_breakdown` | `breakdown[batch_put_into]` |
+| `batch_get_data_breakdown` | `breakdown[batch_get_data]` |
+| `batch_get_nof_wait_breakdown` | `breakdown[batch_get_nof_wait]` |
+| `batch_get_nof_task_breakdown` | `breakdown[batch_get_nof_task]` |
+| `client_put_breakdown` | `breakdown[put_client]`（VLOG(1)） |
+| `upsert_from_breakdown` | `breakdown[upsert_from_client]`（VLOG(1)） |
+| `transfer_data_breakdown` | `breakdown[transfer_data]`（VLOG(1)） |
+| `offload_rpc_server_breakdown` | `breakdown[offload_rpc_server]` |
+| `offload_read_breakdown` | `breakdown[offload_read]` |
+| `offload_rpc_client_breakdown` | `breakdown[offload_rpc_client]` |
+| `offload_release_client_breakdown` | `breakdown[offload_release_client]` |
+
+服务端/工具类日志（`master_rpc_client_breakdown`、`query_rpc_breakdown`、
+`storage_*_breakdown`、`mount_segment_breakdown`、
+`memcpy_*_breakdown`、`*_urma_*_breakdown`）不属于逐请求 `breakdown[op]`
+体系，保持原样。
+
+### 14.6 时钟与时延口径
+
+- `submit_ts` / `post_ts` / `done_ts` / `ready_ts` 均为 CLOCK_REALTIME 纳秒
+  （`getCurrentTimeInNano()`），可跨字段相减。
+- 纯 URMA 时延用 `post_ts → done_ts`：`urma_cr_t` 不含硬件时间戳，这段
+  包含 CQE 轮询取件延迟，是当前可得的最近似值。
+- `memread_queue_us` = `submit_ts → first_post_ts`；`*_teardown_us` =
+  `last_done_ts → ready_ts`。
+- 旧的 `transfer_member_latency` 已删除，逐 slice 信息由
+  `breakdown[<op>.slice]` 提供。
