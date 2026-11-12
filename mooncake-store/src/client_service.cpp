@@ -2865,9 +2865,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           const ReplicateConfig& config) {
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
     const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
-    const auto breakdown_start =
-        breakdown_log ? std::chrono::steady_clock::now()
-                      : std::chrono::steady_clock::time_point{};
+    const auto breakdown_start = std::chrono::steady_clock::now();
     auto checksum_end = breakdown_start;
     auto prepare_end = breakdown_start;
     auto put_start_end = breakdown_start;
@@ -2888,7 +2886,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
         object_checksum = *checksum_result;
     }
-    if (breakdown_log) checksum_end = std::chrono::steady_clock::now();
+    checksum_end = std::chrono::steady_clock::now();
+    g_request_timing.checksum_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            checksum_end - breakdown_start)
+            .count();
 
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
@@ -2904,7 +2906,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
-    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
+    prepare_end = std::chrono::steady_clock::now();
+    g_request_timing.prepare_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            prepare_end - checksum_end)
+            .count();
 
     // Start put operation
     SpDiag::PerfPoint pt_start(PerfKey::PUT_SINGLE_PUT_START,
@@ -2912,7 +2918,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     pt_start.Start();
     auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     pt_start.End(start_result ? 0 : -1);
-    if (breakdown_log) put_start_end = std::chrono::steady_clock::now();
+    put_start_end = std::chrono::steady_clock::now();
+    g_request_timing.put_start_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            put_start_end - prepare_end)
+            .count();
+    if (start_result) {
+        g_request_timing.replicas = start_result.value().replicas.size();
+    }
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -3006,7 +3019,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us_put);
     }
-    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
+    transfer_end = std::chrono::steady_clock::now();
+    g_request_timing.transfer_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            transfer_end - put_start_end)
+            .count();
 
     // 方案二被动层：上报坏端点（不改变写语义——FLEXIBLE 部分成功仍成功）。
     // 放在 put_latency 指标采集之后，避免上报 RPC 耗时污染写延迟统计。
@@ -3030,7 +3047,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(err);
         }
     }
-    if (breakdown_log) put_end_end = std::chrono::steady_clock::now();
+    put_end_end = std::chrono::steady_clock::now();
+    g_request_timing.put_end_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            put_end_end - transfer_end)
+            .count();
 
     if (finalize_decision.revoke_type.has_value()) {
         SpDiag::PerfPoint pt_revoke(PerfKey::PUT_SINGLE_PUT_REVOKE,
@@ -3045,7 +3066,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return tl::unexpected(revoke_result.error());
         }
     }
-    if (breakdown_log) revoke_end = std::chrono::steady_clock::now();
+    revoke_end = std::chrono::steady_clock::now();
+    g_request_timing.revoke_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            revoke_end - put_end_end)
+            .count();
 
     if (!finalize_decision.success) {
         pt_full.End(-1);
@@ -3058,7 +3083,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                                                          begin)
                 .count();
         };
-        MC_LOG(INFO) << "client_put_breakdown trace_id=" << trace_id
+        VLOG(1) << "client_put_breakdown trace_id=" << trace_id
                      << " key=" << key << " slices=" << slices.size()
                      << " replicas=" << start_result.value().replicas.size()
                      << " checksum_us="
@@ -3087,9 +3112,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     const bool breakdown_log =
         enable_upsert_from_diagnostics &&
         mooncake::logging::ShouldSampleHiFreqLog(trace_id);
-    const auto breakdown_start =
-        breakdown_log ? std::chrono::steady_clock::now()
-                      : std::chrono::steady_clock::time_point{};
+    const auto breakdown_start = std::chrono::steady_clock::now();
     auto checksum_end = breakdown_start;
     auto prepare_end = breakdown_start;
     auto query_end = breakdown_start;
@@ -3106,7 +3129,11 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         }
         object_checksum = *checksum_result;
     }
-    if (breakdown_log) checksum_end = std::chrono::steady_clock::now();
+    checksum_end = std::chrono::steady_clock::now();
+    g_request_timing.checksum_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            checksum_end - breakdown_start)
+            .count();
 
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
@@ -3122,7 +3149,11 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
-    if (breakdown_log) prepare_end = std::chrono::steady_clock::now();
+    prepare_end = std::chrono::steady_clock::now();
+    g_request_timing.prepare_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            prepare_end - checksum_end)
+            .count();
 
     // Start upsert operation
     SpDiag::PerfPoint pt_query(PerfKey::UPSERT_FROM_INTERNAL_QUERY,
@@ -3133,7 +3164,11 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (enable_upsert_from_diagnostics) {
         pt_query.End(start_result ? 0 : -1);
     }
-    if (breakdown_log) query_end = std::chrono::steady_clock::now();
+    query_end = std::chrono::steady_clock::now();
+    g_request_timing.query_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            query_end - prepare_end)
+            .count();
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
@@ -3146,6 +3181,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
+    g_request_timing.replicas = start_result.value().replicas.size();
     // Record transfer latency
     PutStartResult& upsert_start = start_result.value();
     auto t0 = std::chrono::steady_clock::now();
@@ -3199,13 +3235,21 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (metrics_) {
         metrics_->transfer_metric.put_latency_us.observe(us);
     }
-    if (breakdown_log) transfer_end = std::chrono::steady_clock::now();
+    transfer_end = std::chrono::steady_clock::now();
+    g_request_timing.transfer_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            transfer_end - query_end)
+            .count();
 
     // End upsert operation
     auto end_result = master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
                                                ReplicaType::MEMORY,
                                                upsert_start.operation_id);
-    if (breakdown_log) finalize_end = std::chrono::steady_clock::now();
+    finalize_end = std::chrono::steady_clock::now();
+    g_request_timing.finalize_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            finalize_end - transfer_end)
+            .count();
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -3219,14 +3263,18 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (hot_cache_) {
         hot_cache_->RemoveHotKey(key);
     }
+    cache_invalidate_end = std::chrono::steady_clock::now();
+    g_request_timing.cache_invalidate_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            cache_invalidate_end - finalize_end)
+            .count();
     if (breakdown_log) {
-        cache_invalidate_end = std::chrono::steady_clock::now();
         auto elapsed_us = [](auto begin, auto end) {
             return std::chrono::duration_cast<std::chrono::microseconds>(end -
                                                                          begin)
                 .count();
         };
-        MC_LOG(INFO) << "upsert_from_breakdown trace_id=" << trace_id
+        VLOG(1) << "upsert_from_breakdown trace_id=" << trace_id
                      << " key=" << key << " slices=" << slices.size()
                      << " replicas=" << upsert_start.replicas.size()
                      << " checksum_us="
@@ -6016,13 +6064,14 @@ ErrorCode Client::TransferData(
         return ErrorCode::TRANSFER_FAIL;
     }
 
-    const auto submit_end =
-        breakdown_log ? std::chrono::steady_clock::now()
-                      : std::chrono::steady_clock::time_point{};
+    // Only meaningful when timing was captured for this request; failures may
+    // still emit at the real layer, so never publish a garbage value.
     g_request_timing.read_submit_us =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            submit_end - transfer_start)
-            .count();
+        breakdown_log
+            ? std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - transfer_start)
+                  .count()
+            : 0;
     const TransferStrategy strategy = future->strategy();
     VLOG(1) << "Using transfer strategy: " << strategy;
 

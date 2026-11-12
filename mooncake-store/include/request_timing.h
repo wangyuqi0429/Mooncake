@@ -45,6 +45,18 @@ struct RequestTimingStash {
     // Client-side submit time (slices + TE submit call), from TransferData.
     int64_t read_submit_us = 0;
 
+    // Put-family segments (written by Client::Put / Client::Upsert).
+    int64_t checksum_us = 0;    // checksum computation (put/upsert)
+    int64_t prepare_us = 0;     // slice prep before PutStart/UpsertStart
+    int64_t put_start_us = 0;   // PutStart RPC (routing + wire)
+    int64_t transfer_us = 0;    // TE submit + wait (client-side span)
+    int64_t put_end_us = 0;     // PutEnd RPC (routing + wire)
+    int64_t revoke_us = 0;      // PutRevoke RPC on failure
+    int64_t query_us = 0;       // upsert: existing-object query
+    int64_t finalize_us = 0;    // upsert: finalize
+    int64_t cache_invalidate_us = 0;  // upsert: hot-cache invalidate
+    uint64_t replicas = 0;      // replica count from PutStart/UpsertStart
+
     void reset() { *this = {}; }
 };
 

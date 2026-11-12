@@ -94,6 +94,121 @@ int64_t UbSlowSliceUs() {
     return value;
 }
 
+std::string FormatWallClock(std::chrono::system_clock::time_point tp);
+
+void EmitUbSliceBreakdown(const char *op, const std::string &key,
+                          const char *status, bool ok, bool sampled,
+                          const RequestTimingStash &stash,
+                          const std::string &local_endpoint);
+
+// Put-family phase timing captured at the real_client layer (prep phases).
+struct PutPhaseTiming {
+    int64_t total_us = 0;
+    int64_t prep_total_us = 0;
+    int64_t prep_buf_alloc_us = 0;
+    int64_t prep_memcpy_us = 0;
+    int64_t prep_split_us = 0;
+};
+
+// Emit the single breakdown[op] line for the put/upsert family.  All ops
+// share one stable field schema so scripts can parse them uniformly; phases
+// that do not apply to an op simply report 0.  Successful requests are
+// sample-gated; failures always emit.
+void EmitPutFamilyBreakdown(const char *op, const std::string &key,
+                            const char *status, bool ok, bool sampled,
+                            uint64_t payload_bytes,
+                            std::chrono::system_clock::time_point t0_wall,
+                            const PutPhaseTiming &pt,
+                            const RequestTimingStash &st,
+                            const std::string &local_endpoint) {
+    if (!sampled && ok) return;
+    int64_t mw_submit = 0, mw_queue = 0, mw_urma = 0, mw_teardown = 0,
+            mw_min = 0, mw_avg = 0, slice_count = 0;
+    if (st.ub_timing.has_value()) {
+        const auto &ut = st.ub_timing.value();
+        mw_submit = st.read_submit_us;
+        if (ut.submit_ts > 0 && ut.first_post_ts > 0)
+            mw_queue = (ut.first_post_ts - ut.submit_ts) / 1000;
+        mw_urma = ut.wire_max_ns / 1000;
+        mw_min = ut.wire_min_ns / 1000;
+        mw_avg = ut.slice_count
+                     ? (ut.wire_sum_ns / (int64_t)ut.slice_count) / 1000
+                     : 0;
+        if (ut.ready_ts > 0 && ut.last_done_ts > 0)
+            mw_teardown = (ut.ready_ts - ut.last_done_ts) / 1000;
+        slice_count = (int64_t)ut.slice_count;
+    }
+    const int64_t memwrite_total_us =
+        st.ub_timing.has_value() ? st.transfer_us : 0;
+    MC_LOG(INFO) << "breakdown[" << op << "] key[" << key << "] status["
+                 << status << "] size[" << payload_bytes << "] replicas["
+                 << st.replicas << "] start_time[" << FormatWallClock(t0_wall)
+                 << "]"
+                 << " prep_total_us[" << pt.prep_total_us
+                 << "] prep_buf_alloc_us[" << pt.prep_buf_alloc_us
+                 << "] prep_memcpy_us[" << pt.prep_memcpy_us
+                 << "] prep_split_us[" << pt.prep_split_us
+                 << "] checksum_us[" << st.checksum_us
+                 << "] prepare_us[" << st.prepare_us
+                 << "] query_us[" << st.query_us
+                 << "] put_start_us[" << st.put_start_us
+                 << "] memwrite_total_us[" << memwrite_total_us
+                 << "] memwrite_submit_us[" << mw_submit
+                 << "] memwrite_queue_us[" << mw_queue
+                 << "] memwrite_urma_us[" << mw_urma
+                 << "] memwrite_teardown_us[" << mw_teardown
+                 << "] slice_count[" << slice_count
+                 << "] memwrite_urma_min_us[" << mw_min
+                 << "] memwrite_urma_avg_us[" << mw_avg
+                 << "] put_end_us[" << st.put_end_us
+                 << "] finalize_us[" << st.finalize_us
+                 << "] cache_invalidate_us[" << st.cache_invalidate_us
+                 << "] revoke_us[" << st.revoke_us
+                 << "] total_us[" << pt.total_us << "]";
+    EmitUbSliceBreakdown(op, key, status, ok, sampled, st, local_endpoint);
+}
+
+// Emit per-slice detail lines for the UB path.  Lines are emitted when the
+// request was sampled, when it failed, or when any slice exceeds the
+// slow-slice threshold.  `op` is the interface name (get_buffer/put/upsert).
+void EmitUbSliceBreakdown(const char *op, const std::string &key,
+                          const char *status, bool ok, bool sampled,
+                          const RequestTimingStash &stash,
+                          const std::string &local_endpoint) {
+    if (!stash.ub_timing.has_value()) return;
+    const auto &ut = stash.ub_timing.value();
+    const int64_t slow_us = UbSlowSliceUs();
+    bool slow = false;
+    for (const auto &s : ut.slices) {
+        if (s.done_ts > 0 && s.post_ts > 0 &&
+            (s.done_ts - s.post_ts) / 1000 > slow_us) {
+            slow = true;
+            break;
+        }
+    }
+    if (sampled || !ok || slow) {
+        const size_t n = ut.slices.size();
+        for (size_t i = 0; i < n; ++i) {
+            const auto &s = ut.slices[i];
+            const int64_t slice_urma_us =
+                (s.done_ts > 0 && s.post_ts > 0)
+                    ? (s.done_ts - s.post_ts) / 1000
+                    : -1;
+            const int64_t slice_queue_us =
+                (s.post_ts > 0 && ut.submit_ts > 0)
+                    ? (s.post_ts - ut.submit_ts) / 1000
+                    : -1;
+            MC_LOG(INFO) << "breakdown[" << op << ".slice] key[" << key
+                         << "] slice_idx[" << i << "/" << n << "] offset["
+                         << s.offset << "] bytes[" << s.bytes << "] src["
+                         << local_endpoint << "] dst[" << s.peer_nic_path
+                         << "] slice_queue_us[" << slice_queue_us
+                         << "] slice_urma_us[" << slice_urma_us
+                         << "] status[" << status << "]";
+        }
+    }
+}
+
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
     return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
            protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
@@ -2199,23 +2314,42 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
-    // both the breakdown timing capture and its emission below.
+    // Reset the per-request timing stash; inner layers write their segments.
+    resetRequestTiming();
+    // Sampling gates successful emissions only; failures always emit.
     const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
         mooncake::logging::CurrentTraceId());
-    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::time_point{};
-    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
-                                 : std::chrono::system_clock::time_point{};
-    auto t_alloc = t0;
+    auto t0 = std::chrono::steady_clock::now();
+    auto t0_wall = std::chrono::system_clock::now();
+    auto t_alloc_done = t0, t_memcpy_done = t0, t_split_done = t0;
+    const size_t payload_bytes = value.size_bytes();
+
+    auto log_put = [&](const char *status, bool ok) {
+        auto us = [](auto d) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(d)
+                .count();
+        };
+        PutPhaseTiming pt;
+        pt.total_us = us(std::chrono::steady_clock::now() - t0);
+        pt.prep_buf_alloc_us = us(t_alloc_done - t0);
+        pt.prep_memcpy_us = us(t_memcpy_done - t_alloc_done);
+        pt.prep_split_us = us(t_split_done - t_memcpy_done);
+        pt.prep_total_us = us(t_split_done - t0);
+        EmitPutFamilyBreakdown("put", key, status, ok, breakdown_log,
+                               payload_bytes, t0_wall, pt, g_request_timing,
+                               client_->GetSegmentEndpoint());
+    };
+
     SpDiag::PerfPoint pt_alloc(PerfKey::PUT_INTERNAL_ALLOC_BUFFER,
                                SpDiag::PerfLevel::MODULE);
     pt_alloc.Start();
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
+    t_alloc_done = std::chrono::steady_clock::now();
     pt_alloc.End(alloc_result ? 0 : -1);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
                    << key << ", value size: " << value.size();
+        log_put("ALLOC_FAILED", false);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
@@ -2224,7 +2358,9 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     pt_memcpy.Start();
     auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
+    t_memcpy_done = std::chrono::steady_clock::now();
     if (!scatter_result) {
+        log_put(toString(scatter_result.error()).c_str(), false);
         return tl::unexpected(scatter_result.error());
     }
     pt_memcpy.End(0);
@@ -2233,36 +2369,17 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
                                SpDiag::PerfLevel::MODULE);
     pt_split.Start();
     std::vector<Slice> slices = split_into_slices(buffer_handle);
+    t_split_done = std::chrono::steady_clock::now();
     pt_split.End(0);
-    if (breakdown_log) t_alloc = std::chrono::steady_clock::now();
 
     auto put_result = client_->Put(key, slices, config);
 
-    auto log_put = [&](const char *status) {
-        if (!breakdown_log) return;
-        auto now = std::chrono::steady_clock::now();
-        auto alloc_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(t_alloc - t0)
-                .count();
-        auto write_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now - t_alloc)
-                .count();
-        auto total_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
-                .count();
-        MC_LOG(INFO) << "put_breakdown key[" << key << "] start_time["
-                     << FormatWallClock(t0_wall) << "] alloc_us[" << alloc_us
-                     << "] write_us[" << write_us << "] total_us[" << total_us
-                     << "] size[" << value.size_bytes() << "] status[" << status
-                     << "]";
-    };
-
     if (!put_result) {
-        log_put(toString(put_result.error()).c_str());
+        log_put(toString(put_result.error()).c_str(), false);
         return tl::unexpected(put_result.error());
     }
 
-    log_put("ok");
+    log_put("ok", true);
     return {};
 }
 
@@ -2560,8 +2677,26 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    resetRequestTiming();
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = std::chrono::steady_clock::now();
+    auto t0_wall = std::chrono::system_clock::now();
     auto remove_result = client_->Remove(key, force);
-    if (!remove_result) {
+    const bool ok = remove_result.has_value();
+    if (!breakdown_log && ok) {
+        // successes sample-gated; failures fall through to emit
+    } else {
+        auto rpc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+        MC_LOG(INFO) << "breakdown[remove] key[" << key << "] status["
+                     << (ok ? "ok" : toString(remove_result.error()).c_str())
+                     << "] force[" << force << "] start_time["
+                     << FormatWallClock(t0_wall) << "] remove_rpc_us[" << rpc_us
+                     << "] total_us[" << rpc_us << "]";
+    }
+    if (!ok) {
         return tl::unexpected(remove_result.error());
     }
     // SSD tombstone is handled by the storage node via RemoveObjectHeartbeat.
@@ -2604,7 +2739,25 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batchRemove_internal(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = std::chrono::steady_clock::now();
+    auto t0_wall = std::chrono::system_clock::now();
     auto results = client_->BatchRemove(keys, force);
+    size_t failed = 0;
+    for (const auto& r : results) {
+        if (!r) ++failed;
+    }
+    if (breakdown_log || failed > 0) {
+        auto rpc_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+        MC_LOG(INFO) << "breakdown[batchRemove] num_keys[" << keys.size()
+                     << "] failed[" << failed << "] force[" << force
+                     << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] remove_rpc_us[" << rpc_us << "] total_us[" << rpc_us
+                     << "] status[" << (failed ? "partial_fail" : "ok") << "]";
+    }
     // SSD tombstone is handled by the storage node via RemoveObjectHeartbeat.
     return results;
 }
@@ -3259,40 +3412,9 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
         // Per-slice detail lines: emitted when sampled, when the request
         // failed, or when any slice exceeds the slow-slice threshold.
-        if (g_request_timing.ub_timing.has_value()) {
-            const auto &ut = g_request_timing.ub_timing.value();
-            const int64_t slow_us = UbSlowSliceUs();
-            bool slow = false;
-            for (const auto &s : ut.slices) {
-                if (s.done_ts > 0 && s.post_ts > 0 &&
-                    (s.done_ts - s.post_ts) / 1000 > slow_us) {
-                    slow = true;
-                    break;
-                }
-            }
-            if (breakdown_log || !ok || slow) {
-                const size_t n = ut.slices.size();
-                for (size_t i = 0; i < n; ++i) {
-                    const auto &s = ut.slices[i];
-                    const int64_t slice_urma_us =
-                        (s.done_ts > 0 && s.post_ts > 0)
-                            ? (s.done_ts - s.post_ts) / 1000
-                            : -1;
-                    const int64_t slice_queue_us =
-                        (s.post_ts > 0 && ut.submit_ts > 0)
-                            ? (s.post_ts - ut.submit_ts) / 1000
-                            : -1;
-                    MC_LOG(INFO)
-                        << "breakdown[get_buffer.slice] key[" << key
-                        << "] slice_idx[" << i << "/" << n << "] offset["
-                        << s.offset << "] bytes[" << s.bytes << "] src["
-                        << client_->GetSegmentEndpoint() << "] dst["
-                        << s.peer_nic_path << "] slice_queue_us["
-                        << slice_queue_us << "] slice_urma_us["
-                        << slice_urma_us << "] status[" << status << "]";
-                }
-            }
-        }
+        EmitUbSliceBreakdown("get_buffer", key, status, ok, breakdown_log,
+                             g_request_timing,
+                             client_->GetSegmentEndpoint());
     };
 
     // Query the object info
@@ -5040,45 +5162,40 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
         return {};
     }
 
-    // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
-    // both the breakdown timing capture and its emission below.
+    resetRequestTiming();
+    // Sampling gates successful emissions only; failures always emit.
     const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
         mooncake::logging::CurrentTraceId());
-    auto t0 = breakdown_log ? std::chrono::steady_clock::now()
-                            : std::chrono::steady_clock::time_point{};
-    auto t0_wall = breakdown_log ? std::chrono::system_clock::now()
-                                 : std::chrono::system_clock::time_point{};
-    auto t_prep = t0;
+    auto t0 = std::chrono::steady_clock::now();
+    auto t0_wall = std::chrono::system_clock::now();
+    auto t_split_done = t0;
+
+    auto log_put = [&](const char *status, bool ok) {
+        auto us = [](auto d) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(d)
+                .count();
+        };
+        PutPhaseTiming pt;
+        pt.total_us = us(std::chrono::steady_clock::now() - t0);
+        pt.prep_split_us = us(t_split_done - t0);
+        pt.prep_total_us = pt.prep_split_us;
+        EmitPutFamilyBreakdown("put_from", key, status, ok, breakdown_log,
+                               size, t0_wall, pt, g_request_timing,
+                               client_->GetSegmentEndpoint());
+    };
 
     // Create slices directly from the user buffer
     std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
+    t_split_done = std::chrono::steady_clock::now();
 
     auto put_result = client_->Put(key, slices, config);
 
-    auto log_put = [&](const char *status) {
-        if (!breakdown_log) return;
-        auto now = std::chrono::steady_clock::now();
-        auto prep_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(t_prep - t0)
-                .count();
-        auto write_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now - t_prep)
-                .count();
-        auto total_us =
-            std::chrono::duration_cast<std::chrono::microseconds>(now - t0)
-                .count();
-        MC_LOG(INFO) << "put_into_breakdown key[" << key << "] start_time["
-                     << FormatWallClock(t0_wall) << "] prep_us[" << prep_us
-                     << "] write_us[" << write_us << "] total_us[" << total_us
-                     << "] size[" << size << "] status[" << status << "]";
-    };
-
     if (!put_result) {
-        log_put(toString(put_result.error()).c_str());
+        log_put(toString(put_result.error()).c_str(), false);
         return tl::unexpected(put_result.error());
     }
 
-    log_put("ok");
+    log_put("ok", true);
     return {};
 }
 
@@ -5113,25 +5230,57 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    resetRequestTiming();
+    // Sampling gates successful emissions only; failures always emit.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = std::chrono::steady_clock::now();
+    auto t0_wall = std::chrono::system_clock::now();
+    auto t_alloc_done = t0, t_memcpy_done = t0, t_split_done = t0;
+    const uint64_t payload_bytes = value.size_bytes();
+
+    auto log_upsert = [&](const char *status, bool ok) {
+        auto us = [](auto d) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(d)
+                .count();
+        };
+        PutPhaseTiming pt;
+        pt.total_us = us(std::chrono::steady_clock::now() - t0);
+        pt.prep_buf_alloc_us = us(t_alloc_done - t0);
+        pt.prep_memcpy_us = us(t_memcpy_done - t_alloc_done);
+        pt.prep_split_us = us(t_split_done - t_memcpy_done);
+        pt.prep_total_us = us(t_split_done - t0);
+        EmitPutFamilyBreakdown("upsert", key, status, ok, breakdown_log,
+                               payload_bytes, t0_wall, pt, g_request_timing,
+                               client_->GetSegmentEndpoint());
+    };
+
     auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
+    t_alloc_done = std::chrono::steady_clock::now();
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for upsert operation, key: "
                    << key << ", value size: " << value.size();
+        log_upsert("ALLOC_FAILED", false);
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
     auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "upsert:" + key);
+    t_memcpy_done = std::chrono::steady_clock::now();
     if (!scatter_result) {
+        log_upsert(toString(scatter_result.error()).c_str(), false);
         return tl::unexpected(scatter_result.error());
     }
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
+    t_split_done = std::chrono::steady_clock::now();
 
     auto result = client_->Upsert(key, slices, config);
     if (!result) {
+        log_upsert(toString(result.error()).c_str(), false);
         return tl::unexpected(result.error());
     }
+    log_upsert("ok", true);
     return {};
 }
 
@@ -5180,13 +5329,38 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
         return {};
     }
 
+    resetRequestTiming();
+    // Sampling gates successful emissions only; failures always emit.
+    const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
+        mooncake::logging::CurrentTraceId());
+    auto t0 = std::chrono::steady_clock::now();
+    auto t0_wall = std::chrono::system_clock::now();
+    auto t_split_done = t0;
+
+    auto log_upsert = [&](const char *status, bool ok) {
+        auto us = [](auto d) {
+            return std::chrono::duration_cast<std::chrono::microseconds>(d)
+                .count();
+        };
+        PutPhaseTiming pt;
+        pt.total_us = us(std::chrono::steady_clock::now() - t0);
+        pt.prep_split_us = us(t_split_done - t0);
+        pt.prep_total_us = pt.prep_split_us;
+        EmitPutFamilyBreakdown("upsert_from", key, status, ok, breakdown_log,
+                               size, t0_wall, pt, g_request_timing,
+                               client_->GetSegmentEndpoint());
+    };
+
     std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
+    t_split_done = std::chrono::steady_clock::now();
 
     auto result = client_->Upsert(key, slices, config,
                                   /*enable_upsert_from_diagnostics=*/true);
     if (!result) {
+        log_upsert(toString(result.error()).c_str(), false);
         return tl::unexpected(result.error());
     }
+    log_upsert("ok", true);
     return {};
 }
 
