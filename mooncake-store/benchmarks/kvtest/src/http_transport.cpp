@@ -202,8 +202,7 @@ bool HttpPost(const std::string &url, const std::string &path,
             socket, resolver.resolve(endpoint.host, endpoint.port),
             [&](const asio::error_code &ec, const asio::ip::tcp::endpoint &) {
                 connect_error = ec;
-                asio::error_code ignored;
-                timer.cancel(ignored);
+                timer.cancel();
             });
         io.run();
         if (connect_error) {
