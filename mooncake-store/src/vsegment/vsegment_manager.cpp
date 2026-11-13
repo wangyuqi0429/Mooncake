@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -178,6 +179,12 @@ VSegmentPutStartResult VSegmentManager::StartPut(
             (route_epoch_ != 0 && expected_route_epoch != route_epoch_))
                 return {ErrorCode::STALE_ROUTE, operation_id, {},
                         "PutStart route epoch is stale"};
+            if (degraded_) {
+                // Reconcile failed for this partition: the in-memory allocator
+                // may overlap live objects, so refuse new reservations.
+                return {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, operation_id,
+                        {}, "vsegment partition degraded: reconcile failed"};
+            }
             auto existing_operation = operation_vsegments_.find(operation_id);
             if (existing_operation != operation_vsegments_.end()) {
                 // Reuse the reservation and propagate its latest accepted
@@ -208,7 +215,10 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 if (managed.lifecycle != Lifecycle::ACTIVE ||
                     managed.profile_name != profile_name)
                     continue;
-                const auto before = managed.logical_allocator->Snapshot();
+                // No full allocator Snapshot here: Reserve() touches only
+                // free_ranges_/reservations_, so CancelReservation() below is
+                // the exact inverse. A Snapshot per put costs O(completed
+                // operations) and grows with the number of objects.
                 auto reservation =
                     managed.logical_allocator->Reserve(operation_id, length);
                 if (!reservation) {
@@ -235,7 +245,14 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                 }
                 if (persisted != ErrorCode::OK) {
                     operation_vsegments_.erase(operation_id);
-                    managed.logical_allocator->Restore(before);
+                    // Undo exactly the reservation we just made; restoring a
+                    // full snapshot is unnecessary and O(objects).
+                    if (managed.logical_allocator->CancelReservation(
+                            operation_id) != ErrorCode::OK) {
+                        LOG(WARNING) << "vsegment reservation rollback failed, "
+                                        "operation="
+                                     << operation_id;
+                    }
                     return {persisted, operation_id, {}, std::move(detail)};
                 }
                 allocated_result = {ErrorCode::OK,
@@ -542,25 +559,17 @@ ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
             return ErrorCode::STALE_ROUTE;
         auto managed = vsegments_.find(vsegment_id);
         if (managed == vsegments_.end()) return ErrorCode::SEGMENT_NOT_FOUND;
-        const auto before = managed->second.logical_allocator->Snapshot();
+        // Only the legacy (non-aligned) persist path can fail and therefore
+        // needs a full allocator snapshot for rollback. The aligned path
+        // persists a single O(1) reservation/commit record and never restores,
+        // so avoid the O(objects) copy that used to run on every PutEnd.
+        std::optional<LogicalAllocationSnapshot> before;
+        if (!VSegmentOplogAlignedMode())
+            before = managed->second.logical_allocator->Snapshot();
         if (expected_range) {
-            auto reservation = std::find_if(
-                before.reservations.begin(), before.reservations.end(),
-                [&](const auto& candidate) {
-                    return candidate.operation_id == operation_id;
-                });
-            auto completed = std::find_if(
-                before.completed_operations.begin(),
-                before.completed_operations.end(), [&](const auto& candidate) {
-                    return candidate.operation_id == operation_id &&
-                           candidate.outcome == OperationOutcome::COMMITTED;
-                });
-            const LogicalRange* actual =
-                reservation != before.reservations.end()
-                    ? &reservation->range
-                    : (completed != before.completed_operations.end()
-                           ? &completed->range
-                           : nullptr);
+            const auto actual =
+                managed->second.logical_allocator->FindOperationRange(
+                    operation_id);
             if (!actual || actual->offset != expected_range->offset ||
                 actual->length != expected_range->length)
                 return ErrorCode::INVALID_VERSION;
@@ -575,7 +584,8 @@ ErrorCode VSegmentManager::CommitPut(const std::string& vsegment_id,
                 ? ErrorCode::OK
                 : PersistDeferredLocked("logical_commit", nullptr, &fence);
         if (persisted != ErrorCode::OK) {
-            managed->second.logical_allocator->Restore(before);
+            if (before.has_value())
+                managed->second.logical_allocator->Restore(*before);
             return persisted;
         }
     }
@@ -1077,6 +1087,13 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
                     if (snapshot != before.end())
                         state.logical_allocator->Restore(snapshot->second);
                 }
+                // Rebuilt state cannot be trusted: refuse new allocations
+                // (fail-closed) until a later reconcile succeeds.
+                degraded_ = true;
+                LOG(ERROR) << "vsegment reconcile failed for partition "
+                           << partition_id_
+                           << " (overlapping or out-of-range reference); "
+                              "partition degraded, writes rejected";
                 return ErrorCode::INVALID_PARAMS;
             }
             if (range.offset > cursor)
@@ -1090,6 +1107,11 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
         if (result != ErrorCode::OK) {
             for (auto& [id, state] : vsegments_)
                 state.logical_allocator->Restore(before.at(id));
+            degraded_ = true;
+            LOG(ERROR) << "vsegment reconcile failed for partition "
+                       << partition_id_
+                       << " (allocator restore rejected); "
+                          "partition degraded, writes rejected";
             return result;
         }
     }
@@ -1099,6 +1121,16 @@ ErrorCode VSegmentManager::ReconcileObjectReferences(
         for (auto& [id, state] : vsegments_)
             state.logical_allocator->Restore(before.at(id));
         operation_vsegments_ = operations_before;
+        degraded_ = true;
+        LOG(ERROR) << "vsegment reconcile failed for partition " << partition_id_
+                   << " (checkpoint persist failed); "
+                      "partition degraded, writes rejected";
+        return result;
+    }
+    if (degraded_) {
+        LOG(INFO) << "vsegment partition " << partition_id_
+                  << " recovered: reconcile succeeded, leaving degraded state";
+        degraded_ = false;
     }
     return result;
 }

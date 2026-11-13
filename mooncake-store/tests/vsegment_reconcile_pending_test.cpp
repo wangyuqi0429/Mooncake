@@ -8,6 +8,7 @@
 
 #include "vsegment/vsegment_ha.h"
 #include "vsegment/vsegment_manager.h"
+#include "vsegment/vsegment_oplog_mode.h"
 #include "vsegment/vsegment_runtime.h"
 
 namespace mooncake::vsegment {
@@ -24,6 +25,21 @@ class SyncCommitter : public VSegmentStateCommitter {
     }
     std::vector<std::string> mutations;
     PartitionVSegmentSnapshot last_state;
+
+    // aligned mode (default): O(1) reservation records instead of full state.
+    ErrorCode CommitReservation(const std::string& /*partition_id*/,
+                                const std::string& /*operation_id*/,
+                                const std::string& /*vsegment_id*/,
+                                const LogicalRange& /*range*/,
+                                uint64_t /*route_epoch*/) override {
+        return ErrorCode::OK;
+    }
+
+    ErrorCode CommitRelease(const std::string& /*partition_id*/,
+                            const std::string& /*operation_id*/,
+                            uint64_t /*route_epoch*/) override {
+        return ErrorCode::OK;
+    }
 };
 
 std::shared_ptr<SyncCommitter> Committer() {

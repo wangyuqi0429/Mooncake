@@ -271,6 +271,10 @@ class VSegmentManager {
     std::mutex initial_creation_mutex_;
     bool owned_{true};
     size_t max_operation_tombstones_{4096};
+    // aligned 模式下分配器状态只能由 ReconcileObjectReferences 重建。reconcile
+    // 失败时内存状态不可信，必须拒绝新的分配（fail-closed），否则可能重复分配
+    // 已有对象的区间。读路径不受影响；下一次 reconcile 成功会自动解除。
+    bool degraded_{false};
     mutable std::mutex pending_mutex_;
     std::unordered_map<std::string,
                        std::shared_future<VSegmentAllocationResult>>
