@@ -97,3 +97,5 @@ endif()
 
 if(STORE_USE_ETCD)
 endif()
+
+add_subdirectory(kvtest)

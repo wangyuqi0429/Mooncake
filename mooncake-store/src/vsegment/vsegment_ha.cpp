@@ -176,6 +176,90 @@ ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
     return ErrorCode::OK;
 }
 
+ErrorCode OrderedOpLogVSegmentCommitter::CommitReservation(
+    const std::string& partition_id, const std::string& operation_id,
+    const std::string& vsegment_id, const LogicalRange& range,
+    uint64_t route_epoch) {
+    if (writer_ == nullptr || partition_id.empty() || operation_id.empty() ||
+        vsegment_id.empty() || range.length == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    VSegmentReservationPayload reservation;
+    reservation.vsegment_id = vsegment_id;
+    reservation.offset = range.offset;
+    reservation.length = range.length;
+
+    PartitionOpLogEntry record;
+    record.partition_id = partition_id;
+    record.route_epoch = route_epoch;
+    record.metadata_revision = 0;  // reservation 不参与 metadata_revision
+    record.operation_id = operation_id;
+    record.event_type = static_cast<int32_t>(PartitionOpEventType::kReserve);
+    struct_json::to_json(reservation, record.payload);
+
+    std::string payload;
+    struct_json::to_json(record, payload);
+
+    OpLogEntry entry;
+    entry.op_type = OpType::VSEGMENT_RESERVE;
+    entry.object_key = partition_id;
+    entry.payload = std::move(payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    entry.prefix_hash = 0;
+
+    std::string validation_detail;
+    if (!ValidateOpLogEntrySize(entry, &validation_detail)) {
+        LOG(WARNING) << "vsegment reservation record rejected: "
+                     << validation_detail;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto slot = writer_->Reserve();
+    if (!slot) return slot.error();
+    auto pending = writer_->Commit(std::move(*slot), std::move(entry), {});
+    if (!pending) return pending.error();
+    return ErrorCode::OK;
+}
+
+ErrorCode OrderedOpLogVSegmentCommitter::CommitRelease(
+    const std::string& partition_id, const std::string& operation_id,
+    uint64_t route_epoch) {
+    if (writer_ == nullptr || partition_id.empty() || operation_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    PartitionOpLogEntry record;
+    record.partition_id = partition_id;
+    record.route_epoch = route_epoch;
+    record.metadata_revision = 0;
+    record.operation_id = operation_id;
+    record.event_type = static_cast<int32_t>(PartitionOpEventType::kAbort);
+
+    std::string payload;
+    struct_json::to_json(record, payload);
+
+    OpLogEntry entry;
+    entry.op_type = OpType::VSEGMENT_RELEASE;
+    entry.object_key = partition_id;
+    entry.payload = std::move(payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    entry.prefix_hash = 0;
+
+    std::string validation_detail;
+    if (!ValidateOpLogEntrySize(entry, &validation_detail)) {
+        LOG(WARNING) << "vsegment release record rejected: "
+                     << validation_detail;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto slot = writer_->Reserve();
+    if (!slot) return slot.error();
+    auto pending = writer_->Commit(std::move(*slot), std::move(entry), {});
+    if (!pending) return pending.error();
+    return ErrorCode::OK;
+}
+
 ErrorCode OrderedOpLogVSegmentCommitter::WaitDurable(
     const std::shared_ptr<VSegmentDeferredCommitHandle>& handle,
     std::string* detail) {

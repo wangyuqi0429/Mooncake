@@ -52,6 +52,24 @@ uint64_t WorkerDiagnosticIntervalNs() {
     return interval;
 }
 
+uint64_t WorkerIdleSpinNs() {
+    static const uint64_t idle_spin_ns = [] {
+        constexpr uint64_t kDefaultIdleSpinUs = 100000;  // 100 ms
+        const char* value = std::getenv("MC_UB_WORKER_IDLE_SPIN_US");
+        if (!value) return kDefaultIdleSpinUs * 1000;
+        char* end = nullptr;
+        errno = 0;
+        const auto us = std::strtoull(value, &end, 10);
+        if (errno || end == value || *end || *value == '-' || us > 1000000) {
+            LOG(WARNING) << "Invalid MC_UB_WORKER_IDLE_SPIN_US; using "
+                         << kDefaultIdleSpinUs;
+            return kDefaultIdleSpinUs * 1000;
+        }
+        return static_cast<uint64_t>(us) * 1000;
+    }();
+    return idle_spin_ns;
+}
+
 std::unique_ptr<mooncake::logging::ScopedTraceId> RestoreTraceIfMissing(
     uint64_t trace_id) {
     if (trace_id == 0 || mooncake::logging::CurrentTraceId() != 0) {
@@ -215,7 +233,8 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
     for (auto& i : slice_queue_count_) i.store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
     LOG(INFO) << "UB worker scheduling: per-worker wait, workers="
-              << kTransferWorkerCount << " jfcs=" << context_.jfcCount();
+              << kTransferWorkerCount << " jfcs=" << context_.jfcCount()
+              << " idle_spin_us=" << WorkerIdleSpinNs() / 1000;
     for (int i = 0; i < kTransferWorkerCount; ++i) {
         worker_thread_.emplace_back([this, i] { transferWorker(i); });
     }
@@ -764,10 +783,12 @@ void UbWorkerPool::wakePollingWorkers(int posting_thread_id) {
 void UbWorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const bool diagnostics = UbWorkerDiagnosticsEnabled();
+    const uint64_t idle_spin_ns = WorkerIdleSpinNs();
     UbWorkerMetrics metrics;
     current_worker_metrics = diagnostics ? &metrics : nullptr;
     uint64_t last_report_ns = diagnostics ? getCurrentTimeInNano() : 0;
     uint64_t last_active_ns = 0;
+    uint64_t idle_since_ns = getCurrentTimeInNano();
     const auto report = [&](uint64_t now_ns, bool final) {
         size_t assigned_shards = 0, assigned_jfcs = 0;
         for (int s = thread_id; s < kShardCount; s += kTransferWorkerCount) {
@@ -855,6 +876,12 @@ void UbWorkerPool::transferWorker(int thread_id) {
             }
         }
         if (!hasWorkerWork(thread_id)) {
+            const auto now = getCurrentTimeInNano();
+            // Keep recently active workers polling so sparse foreground reads
+            // do not pay a scheduler wakeup before their first post/poll.
+            if (now >= idle_since_ns && now - idle_since_ns < idle_spin_ns) {
+                continue;
+            }
             last_active_ns = 0;
             const auto ready = [&] {
                 return !workers_running_.load(std::memory_order_relaxed) ||
@@ -871,6 +898,7 @@ void UbWorkerPool::transferWorker(int thread_id) {
             } else {
                 worker_signals_[thread_id].wait(ready);
             }
+            idle_since_ns = getCurrentTimeInNano();
             continue;
         }
         if (diagnostics) last_active_ns = getCurrentTimeInNano();
@@ -878,6 +906,7 @@ void UbWorkerPool::transferWorker(int thread_id) {
 #ifndef USE_FAKE_POST_SEND
         performPoll(thread_id);
 #endif
+        idle_since_ns = getCurrentTimeInNano();
     }
     if (diagnostics) report(getCurrentTimeInNano(), true);
     current_worker_metrics = nullptr;

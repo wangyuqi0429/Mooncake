@@ -4,6 +4,7 @@
 
 #include "allocator.h"
 #include "segment.h"
+#include "store_diagnostics.h"
 
 #include <csignal>
 #include <algorithm>
@@ -2089,8 +2090,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    const bool breakdown_log =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
 #ifdef USE_NOF
     const int64_t nof_slow_trace_threshold_us =
         GetSpdkNofSlowTraceThresholdUs();
@@ -2863,8 +2863,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    const bool breakdown_log =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
     const auto breakdown_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -4405,8 +4404,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    const bool breakdown_log =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
     const auto breakdown_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};
@@ -5930,11 +5928,10 @@ ErrorCode Client::TransferData(
         SpDiag::PerfLevel::MODULE);
     pt_full.Start();
 
-    // merge(nof): 保留 nof 侧逐笔 breakdown 日志（replica/strategy 维度，
-    // hi-freq 采样，未采样时零开销），与上游 pt_* 埋点并存。
+    // NoF per-transfer breakdown is opt-in because emitting it before this
+    // function returns directly inflates caller-observed read latency.
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    const bool breakdown_log =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+    const bool breakdown_log = ShouldSampleStoreTransferDiagnostics(trace_id);
     const auto transfer_start =
         breakdown_log ? std::chrono::steady_clock::now()
                       : std::chrono::steady_clock::time_point{};

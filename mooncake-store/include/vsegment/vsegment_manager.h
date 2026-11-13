@@ -36,6 +36,14 @@ struct PartitionVSegmentSnapshot {
 YLT_REFL(PartitionVSegmentSnapshot, partition_id, config_generation,
          route_epoch, metadata_revision, vsegments, operation_vsegments);
 
+// aligned 模式：从 oplog 的 VSEGMENT_RESERVE 记录重放出来的「在飞 reservation」。
+// ReconcileObjectReferences 需要把它并入重建结果，否则重启后 pending 会丢失。
+struct PendingReservation {
+    std::string vsegment_id;
+    std::string operation_id;
+    LogicalRange range;
+};
+
 // An accepted journal submission; storage durability may be awaited separately.
 class VSegmentDeferredCommitHandle {
    public:
@@ -62,6 +70,24 @@ class VSegmentStateCommitter {
         std::string* /*detail*/) {
         (void)handle;
         return ErrorCode::OK;
+    }
+    // aligned 模式（MC_VSEGMENT_OPLOG_MODE=aligned）：写一条 O(1) 的
+    // reservation 生命周期记录，替代热路径上的全量状态提交。
+    // 默认实现返回 UNAVAILABLE_IN_CURRENT_MODE，因此只有支持 OpLog 的
+    // committer（OrderedOpLogVSegmentCommitter）才启用该路径。
+    virtual ErrorCode CommitReservation(const std::string& /*partition_id*/,
+                                        const std::string& /*operation_id*/,
+                                        const std::string& /*vsegment_id*/,
+                                        const LogicalRange& /*range*/,
+                                        uint64_t /*route_epoch*/) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+    }
+    // aligned 模式：写一条 O(1) 的 VSEGMENT_RELEASE 记录（abort / rollback）。
+    // commit 不写（对象 PUT_END 已带 operation_id，重放时可判定为已解决）。
+    virtual ErrorCode CommitRelease(const std::string& /*partition_id*/,
+                                    const std::string& /*operation_id*/,
+                                    uint64_t /*route_epoch*/) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
     }
 };
 
@@ -191,7 +217,8 @@ class VSegmentManager {
                       std::string* detail = nullptr);
     ErrorCode ReconcileObjectReferences(
         const std::vector<VSegmentObjectReference>& references,
-        std::string* detail = nullptr);
+        std::string* detail = nullptr,
+        const std::vector<PendingReservation>& pending_reservations = {});
     bool FindView(const std::string& vsegment_id, VSegmentView* view) const;
     VSegmentManagerStats Stats() const;
     // 注入运行时坏端点排除集提供者（te_endpoint 与 segment_name 双形式）。
@@ -244,6 +271,10 @@ class VSegmentManager {
     std::mutex initial_creation_mutex_;
     bool owned_{true};
     size_t max_operation_tombstones_{4096};
+    // aligned 模式下分配器状态只能由 ReconcileObjectReferences 重建。reconcile
+    // 失败时内存状态不可信，必须拒绝新的分配（fail-closed），否则可能重复分配
+    // 已有对象的区间。读路径不受影响；下一次 reconcile 成功会自动解除。
+    bool degraded_{false};
     mutable std::mutex pending_mutex_;
     std::unordered_map<std::string,
                        std::shared_future<VSegmentAllocationResult>>

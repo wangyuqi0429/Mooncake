@@ -18,6 +18,13 @@ enum class OpType : uint8_t {
     SEGMENT_UNMOUNT = 6,
     SEGMENT_UPDATE = 7,
     VSEGMENT_STATE = 8,
+    // aligned 模式（MC_VSEGMENT_OPLOG_MODE=aligned）下 put 热路径的 reservation
+    // 生命周期记录。payload 为序列化的 PartitionOpLogEntry：
+    //   VSEGMENT_RESERVE -> event_type = kReserve，payload = {vsegment_id, offset, length}
+    //   VSEGMENT_RELEASE -> event_type = kAbort，仅用于 abort / timeout（commit 不写）
+    // 未启用 aligned 模式下这两类记录不会被产生。
+    VSEGMENT_RESERVE = 9,
+    VSEGMENT_RELEASE = 10,
     OP_TYPE_MAX,
 };
 
@@ -96,6 +103,16 @@ struct PartitionOpLogEntry {
 };
 YLT_REFL(PartitionOpLogEntry, partition_id, route_epoch, metadata_revision,
          operation_id, event_type, payload);
+
+// aligned 模式下 VSEGMENT_RESERVE 记录的 payload：
+// 记录被预留的逻辑区间与所属 vsegment，重放时据此恢复 reservations_ 与
+// operation_vsegments_（operation_id 在 PartitionOpLogEntry 里）。
+struct VSegmentReservationPayload {
+    std::string vsegment_id;
+    uint64_t offset{0};
+    uint64_t length{0};
+};
+YLT_REFL(VSegmentReservationPayload, vsegment_id, offset, length);
 
 // psegment 物理分配 OpLog 条目。allocation_id 为幂等键，payload 为序列化后的
 // PSegmentExtent 等详情。

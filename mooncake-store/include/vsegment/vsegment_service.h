@@ -51,7 +51,8 @@ class VSegmentService final {
     ErrorCode ReconcileObjectReferences(
         const std::string& partition_id,
         const std::vector<VSegmentObjectReference>& references,
-        std::string* detail = nullptr);
+        std::string* detail = nullptr,
+        const std::vector<PendingReservation>& pending_reservations = {});
     const PartitionPhysicalQuotaSnapshot& quota_snapshot() const {
         return quota_snapshot_;
     }

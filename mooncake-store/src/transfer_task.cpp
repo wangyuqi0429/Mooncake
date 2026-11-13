@@ -16,6 +16,7 @@
 #include <vector>
 #include "device/accelerator_registry.h"
 #include "mooncake_logging.h"
+#include "store_diagnostics.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_NOF
@@ -23,6 +24,18 @@
 #endif
 
 namespace {
+bool IsTruthyEnv(const char* value) {
+    if (!value) {
+        return false;
+    }
+    std::string normalized(value);
+    std::transform(
+        normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return normalized == "1" || normalized == "true" || normalized == "yes" ||
+           normalized == "on";
+}
+
 #ifndef USE_EVENT_DRIVEN_COMPLETION
 // UB has dedicated posting/polling workers. Long Store-side busy waits can
 // compete with those workers; retain a short spin for fast completions first.
@@ -45,25 +58,15 @@ int UbPollSpinUs() {
 }
 
 int UbPollSleepUs() {
-    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SLEEP_US", 50);
+    // Latency-sensitive Store reads busy poll by default. Deployments that
+    // prefer lower CPU usage can explicitly opt into completion backoff.
+    static const int value = ReadUbPollDelayUs("MC_STORE_UB_POLL_SLEEP_US", 0);
     return value;
 }
 #endif
 }  // namespace
 
 #ifdef USE_NOF
-static bool IsTruthyEnv(const char* value) {
-    if (!value) {
-        return false;
-    }
-    std::string normalized(value);
-    std::transform(
-        normalized.begin(), normalized.end(), normalized.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return normalized == "1" || normalized == "true" || normalized == "yes" ||
-           normalized == "on";
-}
-
 static bool IsSpdkNofDebugEnabled() {
     static const bool enabled = IsTruthyEnv(std::getenv("MC_NOF_DEBUG"));
     return enabled;
@@ -1733,7 +1736,7 @@ void MemcpyWorkerPool::workerThread() {
         if (task.state) {
             mooncake::logging::ScopedTraceId trace(task.trace_id);
             const bool breakdown_log =
-                mooncake::logging::ShouldSampleHiFreqLog(task.trace_id);
+                ShouldSampleStoreTransferDiagnostics(task.trace_id);
             const auto worker_start =
                 breakdown_log ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{};
@@ -2372,7 +2375,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         future = submitTransfer(requests, hint);
     }
 
-    if (mooncake::logging::ShouldSampleHiFreqLog(trace_id)) {
+    if (ShouldSampleStoreTransferDiagnostics(trace_id)) {
         MC_LOG(INFO) << "batch_transfer_strategy trace_id=" << trace_id
                      << " strategy="
                      << (use_local_memcpy ? TransferStrategy::LOCAL_MEMCPY
@@ -2520,7 +2523,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
     auto state = std::make_shared<MemcpyOperationState>(trace_id);
     if (IsInlineHostMemcpyEnabled()) {
         const bool breakdown_log =
-            mooncake::logging::ShouldSampleHiFreqLog(trace_id);
+            ShouldSampleStoreTransferDiagnostics(trace_id);
         const auto inline_start =
             breakdown_log ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};
@@ -2782,9 +2785,8 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     }
 
     const uint64_t trace_id = mooncake::logging::CurrentTraceId();
-    const bool track_timing =
-        mooncake::logging::ShouldSampleHiFreqLog(trace_id) ||
-        GetSpdkNofSlowTraceThresholdUs() > 0;
+    const bool track_timing = ShouldSampleStoreTransferDiagnostics(trace_id) ||
+                              GetSpdkNofSlowTraceThresholdUs() > 0;
     auto state =
         std::make_shared<SpdkNofOperationState>(trace_id, track_timing);
     SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,

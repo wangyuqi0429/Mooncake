@@ -890,8 +890,18 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 
 tl::expected<PutStartResult, ErrorCode> WrappedMasterService::UpsertStart(
     const UUID& client_id, const std::string& key, const uint64_t slice_length,
-    const ReplicateConfig& config, const std::string& tenant_id) {
-    return execute_rpc(
+    const ReplicateConfig& config, const std::string& tenant_id,
+    uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "UpsertStart", PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
             return WithWriteTenant(
@@ -915,13 +925,35 @@ tl::expected<PutStartResult, ErrorCode> WrappedMasterService::UpsertStart(
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "UpsertStart host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " size=" << slice_length << " latency_us=" << latency_us
+                     << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id,
-    const std::string& operation_id) {
-    return execute_rpc(
+    uint64_t client_trace_id, const std::string& operation_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "UpsertEnd",
         PerfKey::MASTER_RPC_UPSERT_END,
         [&] {
@@ -941,12 +973,35 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "UpsertEnd host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << object_meta.key << " tenant=" << tenant_id
+                     << " replica_type=" << replica_type
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id, const std::string& operation_id) {
-    return execute_rpc(
+    const std::string& tenant_id, uint64_t client_trace_id,
+    const std::string& operation_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "UpsertRevoke",
         PerfKey::MASTER_RPC_UPSERT_REVOKE,
         [&] {
@@ -965,6 +1020,19 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
         },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "UpsertRevoke host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " replica_type=" << replica_type
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 std::vector<tl::expected<PutStartResult, ErrorCode>>

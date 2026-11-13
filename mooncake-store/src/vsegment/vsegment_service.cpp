@@ -292,10 +292,12 @@ VSegmentService::SnapshotAllPartitions() {
 ErrorCode VSegmentService::ReconcileObjectReferences(
     const std::string& partition_id,
     const std::vector<VSegmentObjectReference>& references,
-    std::string* detail) {
+    std::string* detail,
+    const std::vector<PendingReservation>& pending_reservations) {
     auto manager = FindPartition(partition_id);
     if (!manager) return ErrorCode::STALE_ROUTE;
-    const auto result = manager->ReconcileObjectReferences(references, detail);
+    const auto result = manager->ReconcileObjectReferences(
+        references, detail, pending_reservations);
     if (result != ErrorCode::OK)
         VSegmentMetrics::Instance().IncRecoveryFailure();
     RefreshMetrics(true);
