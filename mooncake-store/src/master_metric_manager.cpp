@@ -2256,15 +2256,22 @@ void MasterMetricManager::add_stat_to_dict(
 
 // --- Human-Readable Summary ---
 std::string MasterMetricManager::get_summary_string() {
-    return get_summary_string(false);
+    return get_summary_string(false, static_cast<uint32_t>(
+                                         MasterMetricsSection::kAll));
 }
 
 std::string MasterMetricManager::get_summary_string_and_update_snapshot() {
-    return get_summary_string(true);
+    return get_summary_string(true, static_cast<uint32_t>(
+                                        MasterMetricsSection::kAll));
+}
+
+std::string MasterMetricManager::get_summary_string_and_update_snapshot(
+    uint32_t sections) {
+    return get_summary_string(true, sections);
 }
 
 std::string MasterMetricManager::get_summary_string(
-    bool update_summary_snapshot) {
+    bool update_summary_snapshot, uint32_t sections) {
     std::stringstream ss;
 
     // --- Get current values ---
@@ -2558,260 +2565,307 @@ std::string MasterMetricManager::get_summary_string(
     };
 
     // --- Format the summary string ---
-    ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
-       << byte_size_to_string(mem_capacity);
-    if (mem_capacity > 0) {
-        ss << " (" << std::fixed << std::setprecision(1)
-           << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
+    // Sections are gated by `sections`. `begin_section` emits the " | "
+    // separator between enabled sections (never a leading or trailing one)
+    // and returns false when the section should be skipped entirely. The
+    // rate-counter snapshot above always advances regardless of these bits.
+    bool first_section = true;
+    auto begin_section = [&](uint32_t flag) {
+        if (!(sections & flag)) {
+            return false;
+        }
+        if (!first_section) {
+            ss << " | ";
+        }
+        first_section = false;
+        return true;
+    };
+
+    if (begin_section(static_cast<uint32_t>(MasterMetricsSection::kOverview))) {
+        ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
+           << byte_size_to_string(mem_capacity);
+        if (mem_capacity > 0) {
+            ss << " (" << std::fixed << std::setprecision(1)
+               << ((double)mem_allocated / (double)mem_capacity * 100.0)
+               << "%)";
+        }
+        int64_t file_display_capacity = get_total_file_capacity();
+        ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
+           << byte_size_to_string(nof_capacity);
+        if (nof_capacity > 0) {
+            ss << " (" << std::fixed << std::setprecision(1)
+               << ((double)nof_allocated / (double)nof_capacity * 100.0)
+               << "%)";
+        }
+        ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
+           << byte_size_to_string(file_display_capacity);
+        ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
+        ss << " | Clients: " << active_clients;
     }
-    int64_t file_display_capacity = get_total_file_capacity();
-    ss << " | NVMe-oF SSD: " << byte_size_to_string(nof_allocated) << " / "
-       << byte_size_to_string(nof_capacity);
-    if (nof_capacity > 0) {
-        ss << " (" << std::fixed << std::setprecision(1)
-           << ((double)nof_allocated / (double)nof_capacity * 100.0) << "%)";
-    }
-    ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
-       << byte_size_to_string(file_display_capacity);
-    ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
-    ss << " | Clients: " << active_clients;
 
     // Request summary - rate per second of the last window
-    ss << " | Requests (Success/Total per sec): ";
-    ss << "PutStart="
-       << format_rate_pair(delta(&SummaryCounters::put_starts) -
-                               delta(&SummaryCounters::put_start_fails),
-                           delta(&SummaryCounters::put_starts))
-       << ", ";
-    ss << "PutEnd="
-       << format_rate_pair(delta(&SummaryCounters::put_ends) -
-                               delta(&SummaryCounters::put_end_fails),
-                           delta(&SummaryCounters::put_ends))
-       << ", ";
-    ss << "PutRevoke="
-       << format_rate_pair(delta(&SummaryCounters::put_revoke_requests) -
-                               delta(&SummaryCounters::put_revoke_fails),
-                           delta(&SummaryCounters::put_revoke_requests))
-       << ", ";
-    ss << "Get="
-       << format_rate_pair(delta(&SummaryCounters::get_replicas) -
-                               delta(&SummaryCounters::get_replica_fails),
-                           delta(&SummaryCounters::get_replicas))
-       << ", ";
-    ss << "Exist="
-       << format_rate_pair(delta(&SummaryCounters::exist_keys) -
-                               delta(&SummaryCounters::exist_key_fails),
-                           delta(&SummaryCounters::exist_keys))
-       << ", ";
-    ss << "Del="
-       << format_rate_pair(delta(&SummaryCounters::removes) -
-                               delta(&SummaryCounters::remove_fails),
-                           delta(&SummaryCounters::removes))
-       << ", ";
-    ss << "DelAll="
-       << format_rate_pair(delta(&SummaryCounters::remove_all) -
-                               delta(&SummaryCounters::remove_all_fails),
-                           delta(&SummaryCounters::remove_all))
-       << ", ";
-    ss << "Ping="
-       << format_rate_pair(delta(&SummaryCounters::ping) -
-                               delta(&SummaryCounters::ping_fails),
-                           delta(&SummaryCounters::ping))
-       << ", ";
-    ss << "CopyStart="
-       << format_rate_pair(delta(&SummaryCounters::copy_starts) -
-                               delta(&SummaryCounters::copy_start_fails),
-                           delta(&SummaryCounters::copy_starts))
-       << ", ";
-    ss << "CopyEnd="
-       << format_rate_pair(delta(&SummaryCounters::copy_ends) -
-                               delta(&SummaryCounters::copy_end_fails),
-                           delta(&SummaryCounters::copy_ends))
-       << ", ";
-    ss << "CopyRevoke="
-       << format_rate_pair(delta(&SummaryCounters::copy_revokes) -
-                               delta(&SummaryCounters::copy_revoke_fails),
-                           delta(&SummaryCounters::copy_revokes))
-       << ", ";
-    ss << "MoveStart="
-       << format_rate_pair(delta(&SummaryCounters::move_starts) -
-                               delta(&SummaryCounters::move_start_fails),
-                           delta(&SummaryCounters::move_starts))
-       << ", ";
-    ss << "MoveEnd="
-       << format_rate_pair(delta(&SummaryCounters::move_ends) -
-                               delta(&SummaryCounters::move_end_fails),
-                           delta(&SummaryCounters::move_ends))
-       << ", ";
-    ss << "MoveRevoke="
-       << format_rate_pair(delta(&SummaryCounters::move_revokes) -
-                               delta(&SummaryCounters::move_revoke_fails),
-                           delta(&SummaryCounters::move_revokes))
-       << ", ";
-    ss << "EvictDiskReplica="
-       << format_rate_pair(
-              delta(&SummaryCounters::evict_disk_replicas) -
-                  delta(&SummaryCounters::evict_disk_replica_fails),
-              delta(&SummaryCounters::evict_disk_replicas));
+    if (begin_section(
+            static_cast<uint32_t>(MasterMetricsSection::kRequests))) {
+        ss << "Requests (Success/Total per sec): ";
+        ss << "PutStart="
+           << format_rate_pair(delta(&SummaryCounters::put_starts) -
+                                   delta(&SummaryCounters::put_start_fails),
+                               delta(&SummaryCounters::put_starts))
+           << ", ";
+        ss << "PutEnd="
+           << format_rate_pair(delta(&SummaryCounters::put_ends) -
+                                   delta(&SummaryCounters::put_end_fails),
+                               delta(&SummaryCounters::put_ends))
+           << ", ";
+        ss << "PutRevoke="
+           << format_rate_pair(delta(&SummaryCounters::put_revoke_requests) -
+                                   delta(&SummaryCounters::put_revoke_fails),
+                               delta(&SummaryCounters::put_revoke_requests))
+           << ", ";
+        ss << "Get="
+           << format_rate_pair(delta(&SummaryCounters::get_replicas) -
+                                   delta(&SummaryCounters::get_replica_fails),
+                               delta(&SummaryCounters::get_replicas))
+           << ", ";
+        ss << "Exist="
+           << format_rate_pair(delta(&SummaryCounters::exist_keys) -
+                                   delta(&SummaryCounters::exist_key_fails),
+                               delta(&SummaryCounters::exist_keys))
+           << ", ";
+        ss << "Del="
+           << format_rate_pair(delta(&SummaryCounters::removes) -
+                                   delta(&SummaryCounters::remove_fails),
+                               delta(&SummaryCounters::removes))
+           << ", ";
+        ss << "DelAll="
+           << format_rate_pair(delta(&SummaryCounters::remove_all) -
+                                   delta(&SummaryCounters::remove_all_fails),
+                               delta(&SummaryCounters::remove_all))
+           << ", ";
+        ss << "Ping="
+           << format_rate_pair(delta(&SummaryCounters::ping) -
+                                   delta(&SummaryCounters::ping_fails),
+                               delta(&SummaryCounters::ping))
+           << ", ";
+        ss << "CopyStart="
+           << format_rate_pair(delta(&SummaryCounters::copy_starts) -
+                                   delta(&SummaryCounters::copy_start_fails),
+                               delta(&SummaryCounters::copy_starts))
+           << ", ";
+        ss << "CopyEnd="
+           << format_rate_pair(delta(&SummaryCounters::copy_ends) -
+                                   delta(&SummaryCounters::copy_end_fails),
+                               delta(&SummaryCounters::copy_ends))
+           << ", ";
+        ss << "CopyRevoke="
+           << format_rate_pair(delta(&SummaryCounters::copy_revokes) -
+                                   delta(&SummaryCounters::copy_revoke_fails),
+                               delta(&SummaryCounters::copy_revokes))
+           << ", ";
+        ss << "MoveStart="
+           << format_rate_pair(delta(&SummaryCounters::move_starts) -
+                                   delta(&SummaryCounters::move_start_fails),
+                               delta(&SummaryCounters::move_starts))
+           << ", ";
+        ss << "MoveEnd="
+           << format_rate_pair(delta(&SummaryCounters::move_ends) -
+                                   delta(&SummaryCounters::move_end_fails),
+                               delta(&SummaryCounters::move_ends))
+           << ", ";
+        ss << "MoveRevoke="
+           << format_rate_pair(delta(&SummaryCounters::move_revokes) -
+                                   delta(&SummaryCounters::move_revoke_fails),
+                               delta(&SummaryCounters::move_revokes))
+           << ", ";
+        ss << "EvictDiskReplica="
+           << format_rate_pair(
+                  delta(&SummaryCounters::evict_disk_replicas) -
+                      delta(&SummaryCounters::evict_disk_replica_fails),
+                  delta(&SummaryCounters::evict_disk_replicas));
+    }
 
     // Batch request summary
-    ss << " | Batch Requests "
-          "(per sec, Req=Success/PartialSuccess/Total, "
-          "Item=Success/Total): ";
-    ss << "PutStart:(Req="
-       << format_rate_triple(
-              delta(&SummaryCounters::batch_put_start_requests) -
-                  delta(&SummaryCounters::batch_put_start_fails) -
-                  delta(&SummaryCounters::batch_put_start_partial_successes),
-              delta(&SummaryCounters::batch_put_start_partial_successes),
-              delta(&SummaryCounters::batch_put_start_requests))
-       << ", Item="
-       << format_rate_pair(
-              delta(&SummaryCounters::batch_put_start_items) -
-                  delta(&SummaryCounters::batch_put_start_failed_items),
-              delta(&SummaryCounters::batch_put_start_items))
-       << "), ";
-    ss << "PutEnd:(Req="
-       << format_rate_triple(
-              delta(&SummaryCounters::batch_put_end_requests) -
-                  delta(&SummaryCounters::batch_put_end_fails) -
+    if (begin_section(
+            static_cast<uint32_t>(MasterMetricsSection::kRequests))) {
+        ss << "Batch Requests "
+              "(per sec, Req=Success/PartialSuccess/Total, "
+              "Item=Success/Total): ";
+        ss << "PutStart:(Req="
+           << format_rate_triple(
+                  delta(&SummaryCounters::batch_put_start_requests) -
+                      delta(&SummaryCounters::batch_put_start_fails) -
+                      delta(&SummaryCounters::
+                            batch_put_start_partial_successes),
+                  delta(&SummaryCounters::
+                            batch_put_start_partial_successes),
+                  delta(&SummaryCounters::batch_put_start_requests))
+           << ", Item="
+           << format_rate_pair(
+                  delta(&SummaryCounters::batch_put_start_items) -
+                      delta(&SummaryCounters::batch_put_start_failed_items),
+                  delta(&SummaryCounters::batch_put_start_items))
+           << "), ";
+        ss << "PutEnd:(Req="
+           << format_rate_triple(
+                  delta(&SummaryCounters::batch_put_end_requests) -
+                      delta(&SummaryCounters::batch_put_end_fails) -
+                      delta(&SummaryCounters::batch_put_end_partial_successes),
                   delta(&SummaryCounters::batch_put_end_partial_successes),
-              delta(&SummaryCounters::batch_put_end_partial_successes),
-              delta(&SummaryCounters::batch_put_end_requests))
-       << ", Item="
-       << format_rate_pair(
-              delta(&SummaryCounters::batch_put_end_items) -
-                  delta(&SummaryCounters::batch_put_end_failed_items),
-              delta(&SummaryCounters::batch_put_end_items))
-       << "), ";
-    ss << "PutRevoke:(Req="
-       << format_rate_triple(
-              delta(&SummaryCounters::batch_put_revoke_requests) -
-                  delta(&SummaryCounters::batch_put_revoke_fails) -
-                  delta(&SummaryCounters::batch_put_revoke_partial_successes),
-              delta(&SummaryCounters::batch_put_revoke_partial_successes),
-              delta(&SummaryCounters::batch_put_revoke_requests))
-       << ", Item="
-       << format_rate_pair(
-              delta(&SummaryCounters::batch_put_revoke_items) -
-                  delta(&SummaryCounters::batch_put_revoke_failed_items),
-              delta(&SummaryCounters::batch_put_revoke_items))
-       << "), ";
-    ss << "Get:(Req="
-       << format_rate_triple(
-              delta(&SummaryCounters::batch_get_replica_list_requests) -
-                  delta(&SummaryCounters::batch_get_replica_list_fails) -
+                  delta(&SummaryCounters::batch_put_end_requests))
+           << ", Item="
+           << format_rate_pair(
+                  delta(&SummaryCounters::batch_put_end_items) -
+                      delta(&SummaryCounters::batch_put_end_failed_items),
+                  delta(&SummaryCounters::batch_put_end_items))
+           << "), ";
+        ss << "PutRevoke:(Req="
+           << format_rate_triple(
+                  delta(&SummaryCounters::batch_put_revoke_requests) -
+                      delta(&SummaryCounters::batch_put_revoke_fails) -
+                      delta(&SummaryCounters::
+                            batch_put_revoke_partial_successes),
+                  delta(&SummaryCounters::
+                            batch_put_revoke_partial_successes),
+                  delta(&SummaryCounters::batch_put_revoke_requests))
+           << ", Item="
+           << format_rate_pair(
+                  delta(&SummaryCounters::batch_put_revoke_items) -
+                      delta(&SummaryCounters::batch_put_revoke_failed_items),
+                  delta(&SummaryCounters::batch_put_revoke_items))
+           << "), ";
+        ss << "Get:(Req="
+           << format_rate_triple(
+                  delta(&SummaryCounters::batch_get_replica_list_requests) -
+                      delta(&SummaryCounters::batch_get_replica_list_fails) -
+                      delta(&SummaryCounters::
+                                batch_get_replica_list_partial_successes),
                   delta(&SummaryCounters::
                             batch_get_replica_list_partial_successes),
-              delta(&SummaryCounters::batch_get_replica_list_partial_successes),
-              delta(&SummaryCounters::batch_get_replica_list_requests))
-       << ", Item="
-       << format_rate_pair(
-              delta(&SummaryCounters::batch_get_replica_list_items) -
-                  delta(&SummaryCounters::batch_get_replica_list_failed_items),
-              delta(&SummaryCounters::batch_get_replica_list_items))
-       << "), ";
-    ss << "ExistKey:(Req="
-       << format_rate_triple(
-              delta(&SummaryCounters::batch_exist_key_requests) -
-                  delta(&SummaryCounters::batch_exist_key_fails) -
-                  delta(&SummaryCounters::batch_exist_key_partial_successes),
-              delta(&SummaryCounters::batch_exist_key_partial_successes),
-              delta(&SummaryCounters::batch_exist_key_requests))
-       << ", Item="
-       << format_rate_pair(
-              delta(&SummaryCounters::batch_exist_key_items) -
-                  delta(&SummaryCounters::batch_exist_key_failed_items),
-              delta(&SummaryCounters::batch_exist_key_items))
-       << "), ";
-    ss << "QueryIp:(Req="
-       << format_rate_triple(
-              delta(&SummaryCounters::batch_query_ip_requests) -
-                  delta(&SummaryCounters::batch_query_ip_fails) -
+                  delta(&SummaryCounters::batch_get_replica_list_requests))
+           << ", Item="
+           << format_rate_pair(
+                  delta(&SummaryCounters::batch_get_replica_list_items) -
+                      delta(&SummaryCounters::
+                                batch_get_replica_list_failed_items),
+                  delta(&SummaryCounters::batch_get_replica_list_items))
+           << "), ";
+        ss << "ExistKey:(Req="
+           << format_rate_triple(
+                  delta(&SummaryCounters::batch_exist_key_requests) -
+                      delta(&SummaryCounters::batch_exist_key_fails) -
+                      delta(&SummaryCounters::
+                            batch_exist_key_partial_successes),
+                  delta(&SummaryCounters::
+                            batch_exist_key_partial_successes),
+                  delta(&SummaryCounters::batch_exist_key_requests))
+           << ", Item="
+           << format_rate_pair(
+                  delta(&SummaryCounters::batch_exist_key_items) -
+                      delta(&SummaryCounters::batch_exist_key_failed_items),
+                  delta(&SummaryCounters::batch_exist_key_items))
+           << "), ";
+        ss << "QueryIp:(Req="
+           << format_rate_triple(
+                  delta(&SummaryCounters::batch_query_ip_requests) -
+                      delta(&SummaryCounters::batch_query_ip_fails) -
+                      delta(&SummaryCounters::batch_query_ip_partial_successes),
                   delta(&SummaryCounters::batch_query_ip_partial_successes),
-              delta(&SummaryCounters::batch_query_ip_partial_successes),
-              delta(&SummaryCounters::batch_query_ip_requests))
-       << ", Item="
-       << format_rate_pair(
-              delta(&SummaryCounters::batch_query_ip_items) -
-                  delta(&SummaryCounters::batch_query_ip_failed_items),
-              delta(&SummaryCounters::batch_query_ip_items))
-       << "), ";
-    ss << "Clear:(Req="
-       << format_rate_triple(
-              delta(&SummaryCounters::batch_replica_clear_requests) -
-                  delta(&SummaryCounters::batch_replica_clear_fails) -
-                  delta(
-                      &SummaryCounters::batch_replica_clear_partial_successes),
-              delta(&SummaryCounters::batch_replica_clear_partial_successes),
-              delta(&SummaryCounters::batch_replica_clear_requests))
-       << ", Item="
-       << format_rate_pair(
-              delta(&SummaryCounters::batch_replica_clear_items) -
-                  delta(&SummaryCounters::batch_replica_clear_failed_items),
-              delta(&SummaryCounters::batch_replica_clear_items))
-       << "), ";
+                  delta(&SummaryCounters::batch_query_ip_requests))
+           << ", Item="
+           << format_rate_pair(
+                  delta(&SummaryCounters::batch_query_ip_items) -
+                      delta(&SummaryCounters::batch_query_ip_failed_items),
+                  delta(&SummaryCounters::batch_query_ip_items))
+           << "), ";
+        ss << "Clear:(Req="
+           << format_rate_triple(
+                  delta(&SummaryCounters::batch_replica_clear_requests) -
+                      delta(&SummaryCounters::batch_replica_clear_fails) -
+                      delta(
+                          &SummaryCounters::
+                              batch_replica_clear_partial_successes),
+                  delta(&SummaryCounters::
+                            batch_replica_clear_partial_successes),
+                  delta(&SummaryCounters::batch_replica_clear_requests))
+           << ", Item="
+           << format_rate_pair(
+                  delta(&SummaryCounters::batch_replica_clear_items) -
+                      delta(&SummaryCounters::batch_replica_clear_failed_items),
+                  delta(&SummaryCounters::batch_replica_clear_items))
+           << "), ";
 
-    ss << "CreateMoveTask:(Req="
-       << format_rate_pair(delta(&SummaryCounters::create_move_tasks) -
-                               delta(&SummaryCounters::create_move_task_fails),
-                           delta(&SummaryCounters::create_move_tasks))
-       << "), ";
-    ss << "CreateCopyTask:(Req="
-       << format_rate_pair(delta(&SummaryCounters::create_copy_tasks) -
-                               delta(&SummaryCounters::create_copy_task_fails),
-                           delta(&SummaryCounters::create_copy_tasks))
-       << "), ";
-    ss << "QueryTask:(Req="
-       << format_rate_pair(delta(&SummaryCounters::query_tasks) -
-                               delta(&SummaryCounters::query_task_fails),
-                           delta(&SummaryCounters::query_tasks))
-       << "), ";
-    ss << "FetchTasks:(Req="
-       << format_rate_pair(delta(&SummaryCounters::fetch_tasks) -
-                               delta(&SummaryCounters::fetch_task_fails),
-                           delta(&SummaryCounters::fetch_tasks))
-       << "), ";
-    ss << "MarkTaskToComplete:(Req="
-       << format_rate_pair(
-              delta(&SummaryCounters::mark_task_to_complete_requests) -
-                  delta(&SummaryCounters::mark_task_to_complete_fails),
-              delta(&SummaryCounters::mark_task_to_complete_requests))
-       << ")";
+        ss << "CreateMoveTask:(Req="
+           << format_rate_pair(delta(&SummaryCounters::create_move_tasks) -
+                                   delta(&SummaryCounters::
+                                             create_move_task_fails),
+                               delta(&SummaryCounters::create_move_tasks))
+           << "), ";
+        ss << "CreateCopyTask:(Req="
+           << format_rate_pair(delta(&SummaryCounters::create_copy_tasks) -
+                                   delta(&SummaryCounters::
+                                             create_copy_task_fails),
+                               delta(&SummaryCounters::create_copy_tasks))
+           << "), ";
+        ss << "QueryTask:(Req="
+           << format_rate_pair(delta(&SummaryCounters::query_tasks) -
+                                   delta(&SummaryCounters::query_task_fails),
+                               delta(&SummaryCounters::query_tasks))
+           << "), ";
+        ss << "FetchTasks:(Req="
+           << format_rate_pair(delta(&SummaryCounters::fetch_tasks) -
+                                   delta(&SummaryCounters::fetch_task_fails),
+                               delta(&SummaryCounters::fetch_tasks))
+           << "), ";
+        ss << "MarkTaskToComplete:(Req="
+           << format_rate_pair(
+                  delta(&SummaryCounters::mark_task_to_complete_requests) -
+                      delta(&SummaryCounters::mark_task_to_complete_fails),
+                  delta(&SummaryCounters::mark_task_to_complete_requests))
+           << ")";
+    }
     // Eviction counters are cumulative. Request counters above are reported as
     // window rates, but eviction totals are used to track long-running pressure
     // and should not reset after each admin metrics snapshot.
-    ss << " | Eviction: "
-       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
-       << ", "
-       << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails) << ", "
-       << "PartialAlloc=" << delta(&SummaryCounters::put_start_partial_allocs)
-       << ", "
-       << "keys=" << evicted_key_count << ", "
-       << "size=" << byte_size_to_string(evicted_size);
-    // mem eviction
-    ss << " | Mem Eviction: "
-       << "Success/Attempts=" << mem_eviction_success << "/"
-       << mem_eviction_attempts << ", "
-       << "keys=" << mem_evicted_key_count << ", "
-       << "size=" << byte_size_to_string(mem_evicted_size);
-    // nof eviction
-    ss << " | NoF Eviction: "
-       << "Success/Attempts=" << nof_eviction_success << "/"
-       << nof_eviction_attempts << ", "
-       << "keys=" << nof_evicted_key_count << ", "
-       << "size=" << byte_size_to_string(nof_evicted_size);
+    if (begin_section(
+            static_cast<uint32_t>(MasterMetricsSection::kEviction))) {
+        ss << "Eviction: "
+           << "Success/Attempts=" << eviction_success << "/"
+           << eviction_attempts
+           << ", "
+           << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails)
+           << ", "
+           << "PartialAlloc="
+           << delta(&SummaryCounters::put_start_partial_allocs)
+           << ", "
+           << "keys=" << evicted_key_count << ", "
+           << "size=" << byte_size_to_string(evicted_size);
+        // mem eviction
+        ss << " | Mem Eviction: "
+           << "Success/Attempts=" << mem_eviction_success << "/"
+           << mem_eviction_attempts << ", "
+           << "keys=" << mem_evicted_key_count << ", "
+           << "size=" << byte_size_to_string(mem_evicted_size);
+        // nof eviction
+        ss << " | NoF Eviction: "
+           << "Success/Attempts=" << nof_eviction_success << "/"
+           << nof_eviction_attempts << ", "
+           << "keys=" << nof_evicted_key_count << ", "
+           << "size=" << byte_size_to_string(nof_evicted_size);
+    }
 
     // Report-driven IO Pattern policy execution summary (cumulative)
-    ss << " | IO Pattern (report-driven): "
-       << "cycles=" << io_pattern_report_cycles_.value() << ", "
-       << "evict=" << io_pattern_report_evictions_.value() << "/"
-       << io_pattern_report_eviction_failures_.value() << ", "
-       << "prefetch=" << io_pattern_report_prefetches_.value() << "/"
-       << io_pattern_report_prefetch_failures_.value() << ", "
-       << "admit=" << io_pattern_report_admissions_.value() << "/"
-       << io_pattern_report_admission_failures_.value() << ", "
-       << "degraded=" << io_pattern_report_degraded_.value();
+    if (begin_section(
+            static_cast<uint32_t>(MasterMetricsSection::kIoPattern))) {
+        ss << "IO Pattern (report-driven): "
+           << "cycles=" << io_pattern_report_cycles_.value() << ", "
+           << "evict=" << io_pattern_report_evictions_.value() << "/"
+           << io_pattern_report_eviction_failures_.value() << ", "
+           << "prefetch=" << io_pattern_report_prefetches_.value() << "/"
+           << io_pattern_report_prefetch_failures_.value() << ", "
+           << "admit=" << io_pattern_report_admissions_.value() << "/"
+           << io_pattern_report_admission_failures_.value() << ", "
+           << "degraded=" << io_pattern_report_degraded_.value();
+    }
 
     std::optional<io_pattern::IoPatternObservabilitySnapshot> observation;
     io_pattern::PolicyFeedbackStats feedback;
@@ -2825,12 +2879,14 @@ std::string MasterMetricManager::get_summary_string(
             feedback = runtime->FeedbackSnapshot();
         }
     }
-    if (observation) {
+    if (observation &&
+        begin_section(
+            static_cast<uint32_t>(MasterMetricsSection::kIoPattern))) {
         // Keep precision local: small deltas must remain visible without
         // changing the formatting of the rest of the admin summary.
         std::ostringstream io_summary;
         io_summary
-            << std::setprecision(6) << " | IO Pattern (runtime, lifetime): "
+            << std::setprecision(6) << "IO Pattern (runtime, lifetime): "
             << "collect_latency_max_us=" << observation->collect_latency_us
             << ", analyze_latency_max_us=" << observation->analyze_latency_us
             << ", policy_decision_qps=" << observation->policy_decision_qps
@@ -2849,30 +2905,36 @@ std::string MasterMetricManager::get_summary_string(
     }
 
     // Discard summary
-    ss << " | Discard: "
-       << "Released/Total=" << put_start_release_cnt << "/"
-       << put_start_discard_cnt << ", StagingSize="
-       << byte_size_to_string(put_start_discarded_staging_size);
+    if (begin_section(
+            static_cast<uint32_t>(MasterMetricsSection::kEviction))) {
+        ss << "Discard: "
+           << "Released/Total=" << put_start_release_cnt << "/"
+           << put_start_discard_cnt << ", StagingSize="
+           << byte_size_to_string(put_start_discarded_staging_size);
+    }
 
     // Promotion-on-hit summary (counters are cumulative, not deltas; the
     // gauge is current-state).
-    ss << " | Promotion: "
-       << "in_flight=" << promotion_in_flight_metric_.value() << ", "
-       << "admitted=" << promotion_admitted_.value() << ", "
-       << "completed=" << promotion_completed_.value() << ", "
-       << "failed=" << promotion_failed_.value() << ", "
-       << "cancelled=" << promotion_cancelled_.value() << ", "
-       << "expired=" << promotion_expired_.value() << ", "
-       << "bytes=" << byte_size_to_string(promotion_completed_bytes_.value())
-       << ", "
-       << "rejected(freq/wm/cap)=" << promotion_rejected_frequency_.value()
-       << "/" << promotion_rejected_watermark_.value() << "/"
-       << promotion_rejected_cap_.value();
+    if (begin_section(
+            static_cast<uint32_t>(MasterMetricsSection::kPromotion))) {
+        ss << "Promotion: "
+           << "in_flight=" << promotion_in_flight_metric_.value() << ", "
+           << "admitted=" << promotion_admitted_.value() << ", "
+           << "completed=" << promotion_completed_.value() << ", "
+           << "failed=" << promotion_failed_.value() << ", "
+           << "cancelled=" << promotion_cancelled_.value() << ", "
+           << "expired=" << promotion_expired_.value() << ", "
+           << "bytes="
+           << byte_size_to_string(promotion_completed_bytes_.value()) << ", "
+           << "rejected(freq/wm/cap)=" << promotion_rejected_frequency_.value()
+           << "/" << promotion_rejected_watermark_.value() << "/"
+           << promotion_rejected_cap_.value();
 
-    // Snapshot summary
-    ss << " | Snapshots: "
-       << "Success=" << snapshot_success_.value() << ", "
-       << "Fail=" << snapshot_fail_.value();
+        // Snapshot summary
+        ss << " | Snapshots: "
+           << "Success=" << snapshot_success_.value() << ", "
+           << "Fail=" << snapshot_fail_.value();
+    }
 
     return ss.str();
 }

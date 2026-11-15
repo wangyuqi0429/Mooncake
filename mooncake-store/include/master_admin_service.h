@@ -124,6 +124,12 @@ class MasterAdminServer {
     uint16_t http_port_;
     bool enable_metric_reporting_ = false;
     uint64_t metrics_log_interval_sec_ = kMetricReportIntervalSeconds;
+    // Bitmask selecting which sections of the periodic "Master Admin Metrics"
+    // line are emitted. Read once from the MC_MASTER_METRICS_* environment
+    // variables; the bit layout matches MasterMetricsSection in
+    // master_metric_manager.h. Default = kOverview | kHa (bits 0 and 5). Kept
+    // as a plain integer to avoid pulling the metric manager header in here.
+    uint32_t metrics_sections_{(1u << 0) | (1u << 5)};
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};

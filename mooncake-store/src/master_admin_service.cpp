@@ -1,8 +1,10 @@
 #include "master_admin_service.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <sstream>
@@ -35,6 +37,52 @@ std::string AppendMetricSections(std::string primary, std::string secondary) {
     }
     primary += secondary;
     return primary;
+}
+
+// Parses a boolean environment variable with an explicit default. Unset ->
+// `default_value`; "1/true/yes/on" -> true; "0/false/no/off" -> false. Any
+// other value logs a warning and falls back to the default.
+bool ParseBoolEnv(const char* name, bool default_value) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    if (value == "1" || value == "true" || value == "yes" || value == "on") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "no" || value == "off") {
+        return false;
+    }
+    LOG(WARNING) << "Invalid " << name << "='" << raw
+                 << "'; using default " << (default_value ? "on" : "off");
+    return default_value;
+}
+
+// Reads the MC_MASTER_METRICS_* environment variables once and returns the
+// section bitmask for the periodic "Master Admin Metrics" line.
+uint32_t ReadMetricsSectionsFromEnv() {
+    uint32_t sections = 0;
+    auto set = [&](const char* name, MasterMetricsSection bit,
+                   bool default_on) {
+        if (ParseBoolEnv(name, default_on)) {
+            sections |= static_cast<uint32_t>(bit);
+        }
+    };
+    set("MC_MASTER_METRICS_OVERVIEW", MasterMetricsSection::kOverview, true);
+    set("MC_MASTER_METRICS_REQUESTS", MasterMetricsSection::kRequests, false);
+    set("MC_MASTER_METRICS_EVICTION", MasterMetricsSection::kEviction, false);
+    set("MC_MASTER_METRICS_IO_PATTERN", MasterMetricsSection::kIoPattern,
+        false);
+    set("MC_MASTER_METRICS_PROMOTION", MasterMetricsSection::kPromotion,
+        false);
+    set("MC_MASTER_METRICS_HA", MasterMetricsSection::kHa, true);
+    set("MC_MASTER_METRICS_VSEGMENT", MasterMetricsSection::kVsegment, false);
+    return sections;
 }
 
 struct HttpErrorResponse {
@@ -261,7 +309,9 @@ MasterAdminServer::MasterAdminServer(uint16_t http_port,
           metrics_log_interval_sec == 0
               ? kMetricReportIntervalSeconds
               : std::max<uint64_t>(1, metrics_log_interval_sec)),
-      http_server_(4, http_port) {}
+      http_server_(4, http_port) {
+    metrics_sections_ = ReadMetricsSectionsFromEnv();
+}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
 
@@ -285,42 +335,81 @@ bool MasterAdminServer::Start() {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_.load()) {
                 const auto snapshot = SnapshotState();
-                std::ostringstream log_stream;
-                log_stream << "Master Admin Metrics: role="
+                const uint32_t mask = metrics_sections_;
+                const bool overview =
+                    (mask & static_cast<uint32_t>(
+                                 MasterMetricsSection::kOverview)) != 0;
+                const bool ha_enabled =
+                    (mask &
+                     static_cast<uint32_t>(MasterMetricsSection::kHa)) != 0;
+
+                // Assemble the outer fields into a list and join with ", " so
+                // that hidden sections never leave dangling separators.
+                std::vector<std::string> pieces;
+                if (overview) {
+                    std::ostringstream header;
+                    header << "role="
                            << ha::MasterRuntimeRoleToString(snapshot.state)
                            << ", state="
                            << ha::MasterRuntimeStateToString(snapshot.state)
                            << ", service_ready="
-                           << (snapshot.service_available ? "true" : "false")
-                           << ", master={"
-                           << MasterMetricManager::instance()
-                                  .get_summary_string_and_update_snapshot()
-                           << "}"
-                           << ", ha={"
-                           << HAMetricManager::instance().get_summary_string()
-                           << "}";
-                if (snapshot.leader_view.has_value()) {
-                    log_stream
-                        << ", leader=" << snapshot.leader_view->leader_address
-                        << ", view_version="
-                        << snapshot.leader_view->view_version;
+                           << (snapshot.service_available ? "true" : "false");
+                    pieces.push_back(header.str());
+                }
+                pieces.push_back(
+                    "master={" +
+                    MasterMetricManager::instance()
+                        .get_summary_string_and_update_snapshot(mask) +
+                    "}");
+                if (ha_enabled) {
+                    pieces.push_back(
+                        "ha={" +
+                        HAMetricManager::instance().get_summary_string() +
+                        "}");
+                }
+                if (overview && snapshot.leader_view.has_value()) {
+                    std::ostringstream leader;
+                    leader << "leader="
+                           << snapshot.leader_view->leader_address
+                           << ", view_version="
+                           << snapshot.leader_view->view_version;
+                    pieces.push_back(leader.str());
                 }
                 // standby 覆盖率（§16.18.2 满配缺口可观测化）：provider
-                // 拷贝于锁内、调用在锁外（live etcd 读不持 state_mutex_）；
-                // 行尾 owned_slots 槽位约定不变。
-                log_stream << ", standby_coverage={"
-                           << (snapshot.standby_coverage_provider
-                                   ? snapshot.standby_coverage_provider()
-                                   : std::string("n/a"))
-                           << "}";
-                log_stream << ", owned_slots="
-                           << (snapshot.service
-                                   ? snapshot.service->GetOwnedSlotCount()
-                                   : 0u);
+                // 拷贝于锁内、调用在锁外（live etcd 读不持 state_mutex_）。
+                if (ha_enabled) {
+                    pieces.push_back(
+                        "standby_coverage={" +
+                        std::string(
+                            snapshot.standby_coverage_provider
+                                ? snapshot.standby_coverage_provider()
+                                : std::string("n/a")) +
+                        "}");
+                }
+                if (overview) {
+                    pieces.push_back(
+                        "owned_slots=" +
+                        std::to_string(
+                            snapshot.service
+                                ? snapshot.service->GetOwnedSlotCount()
+                                : 0u));
+                }
+
+                std::ostringstream log_stream;
+                log_stream << "Master Admin Metrics: ";
+                for (size_t i = 0; i < pieces.size(); ++i) {
+                    if (i > 0) {
+                        log_stream << ", ";
+                    }
+                    log_stream << pieces[i];
+                }
                 LOG(INFO) << log_stream.str();
                 // vsegment/psegment 术语的周期状态行（独立于 Master Admin
                 // Metrics 巨行；enabled=0 时同样输出以显式表达"未启用"）。
-                if (snapshot.service) {
+                if ((mask &
+                     static_cast<uint32_t>(MasterMetricsSection::kVsegment)) !=
+                        0 &&
+                    snapshot.service) {
                     LOG(INFO) << snapshot.service->GetVSegmentStatusLogLine();
                 }
                 if (metric_report_stop_sem_.try_acquire_for(

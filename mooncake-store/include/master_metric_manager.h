@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <mutex>
 #include <memory>
 #include <string>
@@ -16,6 +17,32 @@ namespace mooncake {
 namespace io_pattern {
 class IoPatternRuntime;
 }
+
+// Bitmask selecting which sections of the periodic "Master Admin Metrics" log
+// line are emitted. Each bit is interpreted by the owner of the corresponding
+// snippet: kOverview/kHa/kVsegment are consumed by MasterAdminServer (outer
+// fields), while kOverview/kRequests/kEviction/kIoPattern/kPromotion gate the
+// inner `master={...}` content assembled by MasterMetricManager. The snapshot
+// advance for rate counters is independent of these bits and always runs.
+enum class MasterMetricsSection : uint32_t {
+    kNone = 0,
+    // header (role/state/service_ready) + leader/view_version + owned_slots +
+    // the master storage/Keys/Clients block.
+    kOverview = 1u << 0,
+    // Requests + Batch Requests (per-second window rates).
+    kRequests = 1u << 1,
+    // Eviction + Mem Eviction + NoF Eviction + Discard.
+    kEviction = 1u << 2,
+    // The three IO Pattern blocks (report-driven / runtime / feedback).
+    kIoPattern = 1u << 3,
+    // Promotion + Snapshots.
+    kPromotion = 1u << 4,
+    // ha={...} + standby_coverage={...}.
+    kHa = 1u << 5,
+    // The independent "VSegment Status" line.
+    kVsegment = 1u << 6,
+    kAll = (1u << 7) - 1,
+};
 
 class MasterMetricManager {
    public:
@@ -450,6 +477,10 @@ class MasterMetricManager {
      */
     std::string get_summary_string();
     std::string get_summary_string_and_update_snapshot();
+    // Like get_summary_string_and_update_snapshot(), but emits only the
+    // sections selected by `sections`. The rate-counter snapshot still
+    // advances exactly once regardless of which sections are emitted.
+    std::string get_summary_string_and_update_snapshot(uint32_t sections);
 
    private:
     // --- Private Constructor & Destructor ---
@@ -459,7 +490,8 @@ class MasterMetricManager {
     // Update all metrics once to ensure zero values are serialized
     void update_metrics_for_zero_output();
     std::string serialize_io_pattern_metrics();
-    std::string get_summary_string(bool update_summary_snapshot);
+    std::string get_summary_string(bool update_summary_snapshot,
+                                   uint32_t sections);
 
     struct SummaryCounters {
         int64_t exist_keys = 0;
