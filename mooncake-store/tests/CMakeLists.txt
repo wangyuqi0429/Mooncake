@@ -54,6 +54,7 @@ endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(vsegment_test vsegment_test.cpp)
+add_store_test(vsegment_reconcile_pending_test vsegment_reconcile_pending_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)

@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -97,6 +98,12 @@ class LogicalRangeAllocator {
     // a terminal operation outcome, so the same operation id may be retried.
     ErrorCode CancelReservation(const std::string& operation_id);
     ErrorCode Release(const std::string& allocation_id, LogicalRange range);
+    // O(1) lookup used to validate an expected range before Commit, replacing
+    // a full Snapshot(). Priority matches the former snapshot scan exactly:
+    // an outstanding reservation wins, otherwise a COMMITTED completion
+    // record; ABORTED/RELEASED operations are treated as absent.
+    std::optional<LogicalRange> FindOperationRange(
+        const std::string& operation_id) const;
 
     LogicalAllocationSnapshot Snapshot() const;
     ErrorCode Restore(const LogicalAllocationSnapshot& snapshot,
@@ -148,9 +155,15 @@ struct ResolveResult {
 
 // Splits on both stripe and Client Slice boundaries. The output preserves
 // logical order, while execution may complete in any order.
+// `prevalidated` lets a caller that already ran ValidateViewStructure on this
+// exact view skip the duplicate check. VSegmentTransferPlanner::Plan does that
+// and keeps its own CHECKSUM_MISMATCH contract, so the production error code
+// and detail are unchanged. The default preserves the standalone contract for
+// other callers and for unit tests.
 ResolveResult ResolveTransfer(const VSegmentView& view,
                               uint64_t logical_offset, uint64_t length,
-                              const std::vector<ClientSlice>& slices);
+                              const std::vector<ClientSlice>& slices,
+                              bool prevalidated = false);
 
 // Serializes overlapping creation calls for the same creation_key. The owner
 // stores durable results and calls Forget after publishing them.

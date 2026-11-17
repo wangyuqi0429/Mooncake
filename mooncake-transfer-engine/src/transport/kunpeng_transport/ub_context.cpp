@@ -52,6 +52,24 @@ uint64_t WorkerDiagnosticIntervalNs() {
     return interval;
 }
 
+uint64_t WorkerIdleSpinNs() {
+    static const uint64_t idle_spin_ns = [] {
+        constexpr uint64_t kDefaultIdleSpinUs = 100000;  // 100 ms
+        const char* value = std::getenv("MC_UB_WORKER_IDLE_SPIN_US");
+        if (!value) return kDefaultIdleSpinUs * 1000;
+        char* end = nullptr;
+        errno = 0;
+        const auto us = std::strtoull(value, &end, 10);
+        if (errno || end == value || *end || *value == '-' || us > 1000000) {
+            LOG(WARNING) << "Invalid MC_UB_WORKER_IDLE_SPIN_US; using "
+                         << kDefaultIdleSpinUs;
+            return kDefaultIdleSpinUs * 1000;
+        }
+        return static_cast<uint64_t>(us) * 1000;
+    }();
+    return idle_spin_ns;
+}
+
 std::unique_ptr<mooncake::logging::ScopedTraceId> RestoreTraceIfMissing(
     uint64_t trace_id) {
     if (trace_id == 0 || mooncake::logging::CurrentTraceId() != 0) {
@@ -215,7 +233,8 @@ UbWorkerPool::UbWorkerPool(UbContext& context, int numa_socket_id)
     for (auto& i : slice_queue_count_) i.store(0, std::memory_order_relaxed);
     collective_slice_queue_.resize(kTransferWorkerCount);
     LOG(INFO) << "UB worker scheduling: per-worker wait, workers="
-              << kTransferWorkerCount << " jfcs=" << context_.jfcCount();
+              << kTransferWorkerCount << " jfcs=" << context_.jfcCount()
+              << " idle_spin_us=" << WorkerIdleSpinNs() / 1000;
     for (int i = 0; i < kTransferWorkerCount; ++i) {
         worker_thread_.emplace_back([this, i] { transferWorker(i); });
     }
@@ -270,16 +289,11 @@ int UbWorkerPool::submitPostSend(
 #endif  // CONFIG_CACHE_SEGMENT_DESC
     SliceList slice_list_map[kShardCount];
     uint64_t submitted_slice_count = 0;
-    thread_local std::unordered_map<int, uint64_t> failed_target_ids;
     for (auto& slice : slice_list) {
-        if (failed_target_ids.count(slice->target_id)) {
-            auto ts = failed_target_ids[slice->target_id];
-            if (getCurrentTimeInNano() - ts < 100000000ull) {
-                slice->markFailed();
-                continue;
-            } else {
-                failed_target_ids.erase(slice->target_id);
-            }
+        if (isTargetSuppressed(slice->target_id)) {
+            import_suppressed_.fetch_add(1, std::memory_order_relaxed);
+            slice->markFailed();
+            continue;
         }
         auto& peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
@@ -295,7 +309,7 @@ int UbWorkerPool::submitPostSend(
                 LOG(ERROR) << "Cannot reload target segment #"
                            << slice->target_id;
                 slice->markFailed();
-                failed_target_ids[slice->target_id] = getCurrentTimeInNano();
+                markTargetFailed(slice->target_id);
                 continue;
             }
 
@@ -316,11 +330,33 @@ int UbWorkerPool::submitPostSend(
             slice->markFailed();
             continue;
         }
-        auto targetSegment =
-            peer_segment_desc->buffers[buffer_id].tseg[device_id];
-        slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+        const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+        import_attempts_.fetch_add(1, std::memory_order_relaxed);
+        if (device_id < 0 || device_id >= (int)peer_buf.tseg_ctx.size()) {
+            import_failures_.fetch_add(1, std::memory_order_relaxed);
+            LOG(ERROR) << "[UB] target segment has no context blob for "
+                          "target_id="
+                       << slice->target_id << " buffer_id=" << buffer_id
+                       << " device_id=" << device_id
+                       << " trace_id=" << slice->trace_id;
+            slice->markFailed();
+            markTargetFailed(slice->target_id);
+            continue;
+        }
+        slice->ub.r_seg =
+            context_.retrieveRemoteSeg(peer_buf.tseg_ctx[device_id]);
+        if (!slice->ub.r_seg) {
+            import_failures_.fetch_add(1, std::memory_order_relaxed);
+            LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
+                       << slice->target_id << " buffer_id=" << buffer_id
+                       << " device_id=" << device_id
+                       << " dest_addr=" << slice->ub.dest_addr
+                       << " trace_id=" << slice->trace_id;
+            slice->markFailed();
+            markTargetFailed(slice->target_id);
+            continue;
+        }
         if (context_.numa_affinity()) {
-            const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
             int data_numa = parseCpuNumaNode(peer_buf.name);
             if (peer_buf.chip_id >= 0) {
                 slice->ub.dst_chip_id = (uint8_t)peer_buf.chip_id;
@@ -343,12 +379,6 @@ int UbWorkerPool::submitPostSend(
                         << " dst_chip=" << (int)slice->ub.dst_chip_id
                         << " remote_name=" << peer_buf.name;
             }
-        }
-        if (!slice->ub.r_seg) {
-            LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
-                       << slice->target_id << " buffer_id=" << buffer_id
-                       << " device_id" << device_id
-                       << " dest_addr=" << slice->ub.dest_addr;
         }
         auto peer_nic_path =
             MakeNicPath(peer_segment_desc->nicPathServerName(),
@@ -616,6 +646,21 @@ void UbWorkerPool::performPoll(int thread_id) {
         processed_slice_count_.fetch_add(processed_slice_count);
 }
 
+bool UbWorkerPool::isTargetSuppressed(int target_id) {
+    std::lock_guard<std::mutex> guard(failed_target_mutex_);
+    auto it = failed_target_ids_.find(target_id);
+    if (it == failed_target_ids_.end()) return false;
+    if (getCurrentTimeInNano() - it->second < kFailedTargetCooldownNs)
+        return true;
+    failed_target_ids_.erase(it);
+    return false;
+}
+
+void UbWorkerPool::markTargetFailed(int target_id) {
+    std::lock_guard<std::mutex> guard(failed_target_mutex_);
+    failed_target_ids_[target_id] = getCurrentTimeInNano();
+}
+
 void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                               int thread_id) {
     std::unordered_map<Transport::SegmentID,
@@ -643,11 +688,31 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                 processed_slice_count_++;
                 continue;
             }
-            auto targetSegment =
-                peer_segment_desc->buffers[buffer_id].tseg[device_id];
-            slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+            const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
+            import_attempts_.fetch_add(1, std::memory_order_relaxed);
+            if (device_id < 0 || device_id >= (int)peer_buf.tseg_ctx.size()) {
+                import_failures_.fetch_add(1, std::memory_order_relaxed);
+                slice->markFailed();
+                processed_slice_count_++;
+                markTargetFailed(slice->target_id);
+                continue;
+            }
+            slice->ub.r_seg =
+                context_.retrieveRemoteSeg(peer_buf.tseg_ctx[device_id]);
+            if (!slice->ub.r_seg) {
+                import_failures_.fetch_add(1, std::memory_order_relaxed);
+                LOG(ERROR) << "[UB] retrieveRemoteSeg failed while "
+                              "redispatching target_id="
+                           << slice->target_id << " buffer_id=" << buffer_id
+                           << " device_id=" << device_id
+                           << " dest_addr=" << slice->ub.dest_addr
+                           << " trace_id=" << slice->trace_id;
+                slice->markFailed();
+                processed_slice_count_++;
+                markTargetFailed(slice->target_id);
+                continue;
+            }
             if (context_.numa_affinity()) {
-                const auto& peer_buf = peer_segment_desc->buffers[buffer_id];
                 int data_numa = parseCpuNumaNode(peer_buf.name);
                 if (peer_buf.chip_id >= 0) {
                     slice->ub.dst_chip_id = (uint8_t)peer_buf.chip_id;
@@ -672,9 +737,9 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                         << " remote_name=" << peer_buf.name;
                 }
             }
-            auto peer_nic_path =
-                MakeNicPath(peer_segment_desc->nicPathServerName(),
-                            peer_segment_desc->devices[device_id].name);
+            auto peer_nic_path = MakeNicPath(
+                peer_segment_desc->nicPathServerName(),
+                peer_segment_desc->devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);
             if (auto* metrics = CurrentUbWorkerMetrics()) {
@@ -718,10 +783,12 @@ void UbWorkerPool::wakePollingWorkers(int posting_thread_id) {
 void UbWorkerPool::transferWorker(int thread_id) {
     bindToSocket(numa_socket_id_);
     const bool diagnostics = UbWorkerDiagnosticsEnabled();
+    const uint64_t idle_spin_ns = WorkerIdleSpinNs();
     UbWorkerMetrics metrics;
     current_worker_metrics = diagnostics ? &metrics : nullptr;
     uint64_t last_report_ns = diagnostics ? getCurrentTimeInNano() : 0;
     uint64_t last_active_ns = 0;
+    uint64_t idle_since_ns = getCurrentTimeInNano();
     const auto report = [&](uint64_t now_ns, bool final) {
         size_t assigned_shards = 0, assigned_jfcs = 0;
         for (int s = thread_id; s < kShardCount; s += kTransferWorkerCount) {
@@ -784,6 +851,15 @@ void UbWorkerPool::transferWorker(int thread_id) {
                      << " idle_wait_us=" << metrics.idle_wait_ns / 1000
                      << " pending_context_slices=" << pendingSliceCount()
                      << " final=" << final;
+        if (thread_id == 0) {
+            MC_LOG(INFO) << "ub_import_breakdown nic=" << context_.nicPath()
+                         << " import_attempts_total="
+                         << import_attempts_.load(std::memory_order_relaxed)
+                         << " import_failures_total="
+                         << import_failures_.load(std::memory_order_relaxed)
+                         << " import_suppressed_total="
+                         << import_suppressed_.load(std::memory_order_relaxed);
+        }
         metrics = {};
         last_report_ns = now_ns;
     };
@@ -800,6 +876,12 @@ void UbWorkerPool::transferWorker(int thread_id) {
             }
         }
         if (!hasWorkerWork(thread_id)) {
+            const auto now = getCurrentTimeInNano();
+            // Keep recently active workers polling so sparse foreground reads
+            // do not pay a scheduler wakeup before their first post/poll.
+            if (now >= idle_since_ns && now - idle_since_ns < idle_spin_ns) {
+                continue;
+            }
             last_active_ns = 0;
             const auto ready = [&] {
                 return !workers_running_.load(std::memory_order_relaxed) ||
@@ -816,6 +898,7 @@ void UbWorkerPool::transferWorker(int thread_id) {
             } else {
                 worker_signals_[thread_id].wait(ready);
             }
+            idle_since_ns = getCurrentTimeInNano();
             continue;
         }
         if (diagnostics) last_active_ns = getCurrentTimeInNano();
@@ -823,6 +906,7 @@ void UbWorkerPool::transferWorker(int thread_id) {
 #ifndef USE_FAKE_POST_SEND
         performPoll(thread_id);
 #endif
+        idle_since_ns = getCurrentTimeInNano();
     }
     if (diagnostics) report(getCurrentTimeInNano(), true);
     current_worker_metrics = nullptr;

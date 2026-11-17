@@ -9,6 +9,7 @@ go.sum
 *.so
 bin
 mod
+.agents/
 
 # python
 # Byte-compiled / optimized / DLL files

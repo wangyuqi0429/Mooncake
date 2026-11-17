@@ -135,26 +135,28 @@ class WrappedMasterService {
     tl::expected<PutStartResult, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,
-        const std::string& tenant_id = "default");
+        const std::string& tenant_id = "default",
+        uint64_t client_trace_id = 0);
 
     tl::expected<void, ErrorCode> UpsertEnd(
         const UUID& client_id, const ObjectMeta& object_meta,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default",
+        uint64_t client_trace_id = 0,
         const std::string& operation_id = "");
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default",
+        uint64_t client_trace_id = 0,
         const std::string& operation_id = "");
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchUpsertStart(const UUID& client_id,
-                     const std::vector<std::string>& keys,
-                     const std::vector<uint64_t>& slice_lengths,
-                     const ReplicateConfig& config,
-                     const std::string& tenant_id = "default");
+    std::vector<tl::expected<PutStartResult, ErrorCode>> BatchUpsertStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& slice_lengths,
+        const ReplicateConfig& config,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const UUID& client_id, const std::vector<ObjectMeta>& object_metas,

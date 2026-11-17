@@ -218,8 +218,10 @@ class MasterService {
         const std::vector<std::pair<std::string, std::string>>& vsegments);
     // Attaches the runtime layout table for the vsegment replicas contained in
     // `response`. No-op when the response has no vsegment replica or when the
-    // table cannot be resolved (best-effort; the client falls back).
+    // table cannot be resolved (best-effort; hard-C clients reject a
+    // vsegment transfer without the table).
     void EnrichVSegmentLayouts(GetReplicaListResponse* response);
+    void EnrichVSegmentLayouts(PutStartResult* response);
     void InvalidateVSegmentLayoutCache();
     vsegment::VSegmentPutStartResult VSegmentPutStart(
         const std::string& partition_id, uint64_t route_epoch,

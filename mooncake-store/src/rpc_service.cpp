@@ -894,14 +894,21 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     return results;
 }
 
-tl::expected<PutStartResult, ErrorCode>
-WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
-                                  const uint64_t slice_length,
-                                  const ReplicateConfig& config,
-                                  const std::string& tenant_id) {
-    return execute_rpc(
-        "UpsertStart",
-        PerfKey::MASTER_RPC_UPSERT_START,
+tl::expected<PutStartResult, ErrorCode> WrappedMasterService::UpsertStart(
+    const UUID& client_id, const std::string& key, const uint64_t slice_length,
+    const ReplicateConfig& config, const std::string& tenant_id,
+    uint64_t client_trace_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
+        "UpsertStart", PerfKey::MASTER_RPC_UPSERT_START,
         [&] {
             return WithWriteTenant(
                 tenant_id, master_service_.IsTenantQuotaEnabled(),
@@ -913,8 +920,9 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!descriptors) {
                         return tl::make_unexpected(descriptors.error());
                     }
-                    return PutStartResult{{},
-                                          std::move(descriptors.value())};
+                    PutStartResult response{{}, std::move(descriptors.value())};
+                    master_service_.EnrichVSegmentLayouts(&response);
+                    return response;
                 });
         },
         [&](auto& timer) {
@@ -923,13 +931,35 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "UpsertStart host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " size=" << slice_length << " latency_us=" << latency_us
+                     << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const ObjectMeta& object_meta,
     ReplicaType replica_type, const std::string& tenant_id,
-    const std::string& operation_id) {
-    return execute_rpc(
+    uint64_t client_trace_id, const std::string& operation_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "UpsertEnd",
         PerfKey::MASTER_RPC_UPSERT_END,
         [&] {
@@ -949,12 +979,35 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "UpsertEnd host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << object_meta.key << " tenant=" << tenant_id
+                     << " replica_type=" << replica_type
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id, const std::string& operation_id) {
-    return execute_rpc(
+    const std::string& tenant_id, uint64_t client_trace_id,
+    const std::string& operation_id) {
+    std::unique_ptr<mooncake::logging::ScopedTraceId> trace_scope_;
+    if (client_trace_id != 0) {
+        trace_scope_ =
+            std::make_unique<mooncake::logging::ScopedTraceId>(client_trace_id);
+    }
+    const bool sample =
+        mooncake::logging::ShouldSampleHiFreqLog(client_trace_id);
+    const auto t0 = sample ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+    auto result = execute_rpc(
         "UpsertRevoke",
         PerfKey::MASTER_RPC_UPSERT_REVOKE,
         [&] {
@@ -973,9 +1026,22 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
         },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
+    if (sample) {
+        const auto latency_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        MC_LOG(INFO) << "UpsertRevoke host="
+                     << ResolveClientHost(master_service_, client_id)
+                     << " key=" << key << " tenant=" << tenant_id
+                     << " replica_type=" << replica_type
+                     << " latency_us=" << latency_us << " status="
+                     << (result.has_value() ? "ok" : toString(result.error()));
+    }
+    return result;
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<PutStartResult, ErrorCode>>
 WrappedMasterService::BatchUpsertStart(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
@@ -985,8 +1051,7 @@ WrappedMasterService::BatchUpsertStart(
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
+    std::vector<tl::expected<PutStartResult, ErrorCode>> results;
     if (keys.size() != slice_lengths.size()) {
         LOG(ERROR) << "BatchUpsertStart: keys.size()=" << keys.size()
                    << " != slice_lengths.size()=" << slice_lengths.size();
@@ -1005,8 +1070,18 @@ WrappedMasterService::BatchUpsertStart(
         results.assign(keys.size(),
                        tl::make_unexpected(resolved_tenant_id.error()));
     } else {
-        results = master_service_.BatchUpsertStart(
+        auto descriptor_results = master_service_.BatchUpsertStart(
             client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
+        results.reserve(descriptor_results.size());
+        for (auto& descriptors : descriptor_results) {
+            if (!descriptors) {
+                results.emplace_back(tl::make_unexpected(descriptors.error()));
+                continue;
+            }
+            PutStartResult response{{}, std::move(descriptors.value())};
+            master_service_.EnrichVSegmentLayouts(&response);
+            results.emplace_back(std::move(response));
+        }
     }
 
     size_t failure_count = 0;

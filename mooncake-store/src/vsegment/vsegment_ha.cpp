@@ -4,6 +4,7 @@
 #include <mutex>
 #include <unordered_set>
 
+#include "master_perf.h"
 #include "mooncake_logging.h"
 
 namespace mooncake::vsegment {
@@ -122,6 +123,9 @@ ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
     record.route_epoch = state.route_epoch;
     record.metadata_revision = state.metadata_revision;
     record.mutation = mutation;
+    SpDiag::PerfPoint pt_delta(PerfKey::VSEGMENT_STATE_DELTA,
+                               SpDiag::PerfLevel::MODULE);
+    pt_delta.Start();
     auto previous = last_states_.find(state.partition_id);
     if (previous == last_states_.end() ||
         previous->second.metadata_revision + 1 != state.metadata_revision) {
@@ -131,6 +135,10 @@ ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
         record.full_state = false;
         record.delta = BuildDelta(previous->second, state);
     }
+    pt_delta.End(0);
+    SpDiag::PerfPoint pt_serialize(PerfKey::VSEGMENT_STATE_SERIALIZE,
+                                   SpDiag::PerfLevel::MODULE);
+    pt_serialize.Start();
     std::string payload;
     struct_json::to_json(record, payload);
     OpLogEntry entry;
@@ -141,22 +149,114 @@ ErrorCode OrderedOpLogVSegmentCommitter::CommitDeferred(
     std::string validation_detail;
     if (!ValidateOpLogEntrySize(entry, &validation_detail)) {
         if (detail) *detail = std::move(validation_detail);
+        pt_serialize.End(-1);
         return ErrorCode::INVALID_PARAMS;
     }
+    pt_serialize.End(0);
+    SpDiag::PerfPoint pt_enqueue(PerfKey::VSEGMENT_STATE_ENQUEUE,
+                                 SpDiag::PerfLevel::MODULE);
+    pt_enqueue.Start();
     auto reservation = writer_->Reserve();
     if (!reservation) {
         if (detail) *detail = "OpLog writer is not accepting vsegment state";
+        pt_enqueue.End(-1);
         return reservation.error();
     }
     auto wait = std::make_shared<DeferredDurableWait>();
     auto pending = writer_->Commit(std::move(*reservation), std::move(entry), {});
     if (!pending) {
         if (detail) *detail = "failed to enqueue vsegment OpLog entry";
+        pt_enqueue.End(-1);
         return pending.error();
     }
+    pt_enqueue.End(0);
     wait->sequence_id = pending->sequence_id();
     last_states_[state.partition_id] = state;
     *handle = std::move(wait);
+    return ErrorCode::OK;
+}
+
+ErrorCode OrderedOpLogVSegmentCommitter::CommitReservation(
+    const std::string& partition_id, const std::string& operation_id,
+    const std::string& vsegment_id, const LogicalRange& range,
+    uint64_t route_epoch) {
+    if (writer_ == nullptr || partition_id.empty() || operation_id.empty() ||
+        vsegment_id.empty() || range.length == 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    VSegmentReservationPayload reservation;
+    reservation.vsegment_id = vsegment_id;
+    reservation.offset = range.offset;
+    reservation.length = range.length;
+
+    PartitionOpLogEntry record;
+    record.partition_id = partition_id;
+    record.route_epoch = route_epoch;
+    record.metadata_revision = 0;  // reservation 不参与 metadata_revision
+    record.operation_id = operation_id;
+    record.event_type = static_cast<int32_t>(PartitionOpEventType::kReserve);
+    struct_json::to_json(reservation, record.payload);
+
+    std::string payload;
+    struct_json::to_json(record, payload);
+
+    OpLogEntry entry;
+    entry.op_type = OpType::VSEGMENT_RESERVE;
+    entry.object_key = partition_id;
+    entry.payload = std::move(payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    entry.prefix_hash = 0;
+
+    std::string validation_detail;
+    if (!ValidateOpLogEntrySize(entry, &validation_detail)) {
+        LOG(WARNING) << "vsegment reservation record rejected: "
+                     << validation_detail;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto slot = writer_->Reserve();
+    if (!slot) return slot.error();
+    auto pending = writer_->Commit(std::move(*slot), std::move(entry), {});
+    if (!pending) return pending.error();
+    return ErrorCode::OK;
+}
+
+ErrorCode OrderedOpLogVSegmentCommitter::CommitRelease(
+    const std::string& partition_id, const std::string& operation_id,
+    uint64_t route_epoch) {
+    if (writer_ == nullptr || partition_id.empty() || operation_id.empty()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    PartitionOpLogEntry record;
+    record.partition_id = partition_id;
+    record.route_epoch = route_epoch;
+    record.metadata_revision = 0;
+    record.operation_id = operation_id;
+    record.event_type = static_cast<int32_t>(PartitionOpEventType::kAbort);
+
+    std::string payload;
+    struct_json::to_json(record, payload);
+
+    OpLogEntry entry;
+    entry.op_type = OpType::VSEGMENT_RELEASE;
+    entry.object_key = partition_id;
+    entry.payload = std::move(payload);
+    entry.checksum = ComputeOpLogChecksum(entry.payload);
+    entry.prefix_hash = 0;
+
+    std::string validation_detail;
+    if (!ValidateOpLogEntrySize(entry, &validation_detail)) {
+        LOG(WARNING) << "vsegment release record rejected: "
+                     << validation_detail;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    auto slot = writer_->Reserve();
+    if (!slot) return slot.error();
+    auto pending = writer_->Commit(std::move(*slot), std::move(entry), {});
+    if (!pending) return pending.error();
     return ErrorCode::OK;
 }
 
@@ -168,8 +268,13 @@ ErrorCode OrderedOpLogVSegmentCommitter::WaitDurable(
         return ErrorCode::INVALID_PARAMS;
     }
     auto* wait = static_cast<DeferredDurableWait*>(handle.get());
-    return writer_->WaitDurable(wait->sequence_id,
-                                durable_wait_warning_interval_);
+    SpDiag::PerfPoint pt_wait(PerfKey::VSEGMENT_STATE_DURABLE_WAIT,
+                              SpDiag::PerfLevel::MODULE);
+    pt_wait.Start();
+    const auto result = writer_->WaitDurable(wait->sequence_id,
+                                             durable_wait_warning_interval_);
+    pt_wait.End(result == ErrorCode::OK ? 0 : -1);
+    return result;
 }
 
 ErrorCode ReplayVSegmentState(

@@ -20,10 +20,12 @@ namespace mooncake::vsegment {
 // routed to that SubMaster; Partition migration removes/adds the whole manager.
 class VSegmentService final {
    public:
-    explicit VSegmentService(
-        PartitionPhysicalQuotaSnapshot quota_snapshot,
-        std::chrono::milliseconds metrics_refresh_interval =
-            std::chrono::seconds(1));
+    // Reads MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS, defaulting to
+    // 1000 ms. A value of 0 disables refresh throttling.
+    explicit VSegmentService(PartitionPhysicalQuotaSnapshot quota_snapshot);
+    // Explicit interval injection is retained for tests.
+    VSegmentService(PartitionPhysicalQuotaSnapshot quota_snapshot,
+                    std::chrono::milliseconds metrics_refresh_interval);
 
     ErrorCode AddPartition(
         const std::string& partition_id, uint64_t route_epoch,
@@ -49,7 +51,8 @@ class VSegmentService final {
     ErrorCode ReconcileObjectReferences(
         const std::string& partition_id,
         const std::vector<VSegmentObjectReference>& references,
-        std::string* detail = nullptr);
+        std::string* detail = nullptr,
+        const std::vector<PendingReservation>& pending_reservations = {});
     const PartitionPhysicalQuotaSnapshot& quota_snapshot() const {
         return quota_snapshot_;
     }

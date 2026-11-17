@@ -74,6 +74,7 @@ class TransferMetadata {
         std::string shm_name;               // for nvlink and hip
         uint64_t offset;                    // for cxl
         std::vector<std::string> tseg;      // for ub/urma
+        std::vector<std::string> tseg_ctx;  // for ub/urma segment context
         std::vector<uint32_t> l_seg_index;  // for ub/urma
         // for ub: NUMA->chip id of this buffer, computed once by the owner at
         // registration and published. -1 = not provided (consumer falls back
@@ -170,6 +171,9 @@ class TransferMetadata {
         uint64_t trace_id = 0;
 #ifdef USE_UB
         std::vector<uint32_t> jetty_num;  // for ub/urma
+        // Serialized remote-jetty descriptors (urma_get_rjetty blobs) that let
+        // the peer resolve the jetty in user space.
+        std::vector<std::string> rjetty_blobs;
 #endif
 #ifdef USE_BAREX
         uint16_t barex_port;

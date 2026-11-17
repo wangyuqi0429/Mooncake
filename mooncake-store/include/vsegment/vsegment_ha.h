@@ -62,6 +62,21 @@ class OrderedOpLogVSegmentCommitter final : public VSegmentStateCommitter {
         const std::shared_ptr<VSegmentDeferredCommitHandle>& handle,
         std::string* detail) override;
 
+    // aligned 模式：写一条 O(1) 的 VSEGMENT_RESERVE 记录。
+    // payload = serialize(PartitionOpLogEntry{event_type=kReserve,
+    //                    payload=serialize(VSegmentReservationPayload)})。
+    // 不做全量状态序列化，也不等待 durable。
+    ErrorCode CommitReservation(const std::string& partition_id,
+                                const std::string& operation_id,
+                                const std::string& vsegment_id,
+                                const LogicalRange& range,
+                                uint64_t route_epoch) override;
+
+    // aligned 模式：写 VSEGMENT_RELEASE（abort / rollback 用）。
+    ErrorCode CommitRelease(const std::string& partition_id,
+                            const std::string& operation_id,
+                            uint64_t route_epoch) override;
+
    private:
     OrderedOpLogWriter* writer_;
     std::chrono::milliseconds durable_wait_warning_interval_;
