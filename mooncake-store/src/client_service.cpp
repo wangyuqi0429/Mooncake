@@ -2247,9 +2247,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             SpDiag::PerfPoint pt_vsegment_plan(
                 PerfKey::VSEGMENT_READ_PLAN, SpDiag::PerfLevel::MODULE);
             pt_vsegment_plan.Start();
+            const auto resolve_start = current_read_phases
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
             auto plan = vsegment_transfer_planner_->Plan(
                 replica.get_vsegment_descriptor(), client_slices,
                 query_result.vsegment_layouts.get());
+            AddReadPhase(&ReadPhaseDiagnostics::resolve_us, resolve_start);
             pt_vsegment_plan.End(plan ? 0 : -1);
             if (!plan) {
                 results[i] = tl::unexpected(plan.error);
@@ -2320,12 +2324,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             ++blocked_futures;
         }
         const auto wait_start =
-            breakdown_log ? std::chrono::steady_clock::now()
+            (breakdown_log || current_read_phases) ? std::chrono::steady_clock::now()
                           : std::chrono::steady_clock::time_point{};
         SpDiag::PerfPoint wait_point(PerfKey::GET_BATCH_WAIT,
                                      SpDiag::PerfLevel::MODULE);
         wait_point.Start();
         ErrorCode result = future.get();
+        AddReadPhase(&ReadPhaseDiagnostics::wait_us, wait_start);
         wait_point.End(result == ErrorCode::OK ? 0 : -1);
         if (is_vsegment) {
             pt_vsegment_wait.End(result == ErrorCode::OK ? 0 : -1);
@@ -5977,9 +5982,13 @@ ErrorCode Client::TransferData(
                     : PerfKey::VSEGMENT_WRITE_PLAN,
             SpDiag::PerfLevel::MODULE);
         pt_vsegment_plan.Start();
+        const auto resolve_start = current_read_phases
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         auto plan = vsegment_transfer_planner_->Plan(
             replica_descriptor.get_vsegment_descriptor(), client_slices,
             layouts);
+        AddReadPhase(&ReadPhaseDiagnostics::resolve_us, resolve_start);
         pt_vsegment_plan.End(plan ? 0 : -1);
         if (!plan) {
             LOG(ERROR) << "Failed to plan vsegment transfer: " << plan.detail;
@@ -6036,7 +6045,11 @@ ErrorCode Client::TransferData(
 
     pt_wait.Start();
     if (is_vsegment) pt_vsegment_wait.Start();
+    const auto wait_start = current_read_phases
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     const ErrorCode transfer_result = future->get();
+    AddReadPhase(&ReadPhaseDiagnostics::wait_us, wait_start);
     if (transfer_result != ErrorCode::OK && failed_endpoints &&
         (!file_write || transfer_result != ErrorCode::INVALID_WRITE)) {
         for (const auto& endpoint : vsegment_plan_endpoints) {
@@ -6107,8 +6120,12 @@ ErrorCode Client::TransferReadInternal(
         SpDiag::PerfPoint pt_vsegment_plan(
             PerfKey::VSEGMENT_READ_PLAN, SpDiag::PerfLevel::MODULE);
         pt_vsegment_plan.Start();
+        const auto resolve_start = current_read_phases
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         auto plan =
             vsegment_transfer_planner_->Plan(replica, client_slices, layouts);
+        AddReadPhase(&ReadPhaseDiagnostics::resolve_us, resolve_start);
         pt_vsegment_plan.End(plan ? 0 : -1);
         if (!plan) return plan.error;
         SpDiag::PerfPoint pt_vsegment_submit(
@@ -6121,7 +6138,11 @@ ErrorCode Client::TransferReadInternal(
         SpDiag::PerfPoint pt_vsegment_wait(
             PerfKey::VSEGMENT_READ_WAIT, SpDiag::PerfLevel::MODULE);
         pt_vsegment_wait.Start();
+        const auto wait_start = current_read_phases
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         const ErrorCode result = future->get();
+        AddReadPhase(&ReadPhaseDiagnostics::wait_us, wait_start);
         pt_vsegment_wait.End(result == ErrorCode::OK ? 0 : -1);
         return result;
     }
@@ -6135,7 +6156,12 @@ ErrorCode Client::TransferReadInternal(
 
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
-    return future->get();
+    const auto wait_start = current_read_phases
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const auto result = future->get();
+    AddReadPhase(&ReadPhaseDiagnostics::wait_us, wait_start);
+    return result;
 }
 
 ErrorCode Client::TransferWrite(

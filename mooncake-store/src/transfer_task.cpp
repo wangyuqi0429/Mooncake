@@ -384,7 +384,7 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
         if (timing.has_value() &&
             ((slow_threshold > 0 && timing->total_us >= slow_threshold) ||
              (task->timing->vsegment_op_id &&
-              mooncake::logging::ShouldSampleHiFreqLog(task->state->trace_id())))) {
+              mooncake::ShouldSampleStoreTransferDiagnostics(task->state->trace_id())))) {
             MC_LOG(INFO)
                 << "nof_slow_task trace_id=" << task->state->trace_id()
                 << " worker_idx=" << timing->worker_index
@@ -514,6 +514,22 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     if (task->timing) {
         const int64_t sub_io_latency_us =
             ElapsedMicros(sub_task->submitted_at, completion_now);
+        if (mooncake::ShouldSampleStoreTransferDiagnostics(task->state->trace_id())) {
+            MC_LOG(INFO) << "nof_sub_io trace_id=" << task->state->trace_id()
+                         << " vsegment_op_id=" << task->timing->vsegment_op_id
+                         << " child_idx=" << task->timing->vsegment_child_index
+                         << " capsule_seq=" << sub_task->sub_io_index
+                         << " worker_idx=" << task->worker_index
+                         << " lane=" << task->io_lane_index
+                         << " qpair_id="
+                         << mooncake::SpdkWrapper::GetInstance().GetIoLaneQpairId(task->io_lane)
+                         << " cid=" << cpl->cid
+                         << " lba=" << sub_task->submit_lba
+                         << " blocks=" << sub_task->submit_lba_count
+                         << " submit_mono_ns=" << SteadyNanos(sub_task->submitted_at)
+                         << " complete_mono_ns=" << SteadyNanos(completion_now)
+                         << " submit_to_callback_us=" << sub_io_latency_us;
+        }
         if (sub_io_latency_us > task->timing->max_sub_io_latency_us) {
             task->timing->max_sub_io_latency_us = sub_io_latency_us;
             task->timing->max_sub_io_index = sub_task->sub_io_index;
@@ -2433,8 +2449,14 @@ class VSegmentOperationState final : public OperationState {
         std::lock_guard<std::mutex> lock(mutex_);
         if (result_) return;
         auto error = submission_failed ? ErrorCode::INVALID_PARAMS : ErrorCode::OK;
+        const bool sampled = ShouldSampleStoreTransferDiagnostics(parent_trace_id);
+        std::vector<std::pair<int64_t, int64_t>> observations;
+        if (sampled) observations.reserve(children.size());
         for (auto& child : children) {
+            const auto begin = sampled ? SteadyNanos(std::chrono::steady_clock::now()) : 0;
             const auto child_error = child.get();
+            if (sampled) observations.emplace_back(
+                begin, SteadyNanos(std::chrono::steady_clock::now()));
             if (child_error != ErrorCode::OK) error = child_error;
         }
         result_ = error;
@@ -2444,7 +2466,7 @@ class VSegmentOperationState final : public OperationState {
         const auto threshold = GetSpdkNofSlowTraceThresholdUs();
         if (error == ErrorCode::OK &&
             !(threshold > 0 && total_us >= threshold) &&
-            !logging::ShouldSampleHiFreqLog(parent_trace_id)) return;
+            !sampled) return;
         int64_t first_submit = 0;
         int64_t last_completion = 0;
         size_t timed_children = 0;
@@ -2452,6 +2474,27 @@ class VSegmentOperationState final : public OperationState {
         for (size_t i = 0; i < children.size(); ++i) {
             const auto timing = children[i].nofTiming();
             if (!timing) continue;
+            if (sampled) {
+                // Completion comes from the worker callback. get() return is
+                // only the caller's observation, and can occur much later.
+                const int64_t previous_completion = i == 0 ? 0 :
+                    children[i - 1].nofTiming().value_or(NofTransferTiming{}).completed_mono_ns;
+                MC_LOG(INFO) << "nof_vsegment_child trace_id=" << parent_trace_id
+                    << " vsegment_op_id=" << op_id << " child_idx=" << i
+                    << " submit_seq=" << timing->lane_task_sequence
+                    << " first_submit_mono_ns=" << timing->first_submit_mono_ns
+                    << " complete_mono_ns=" << timing->completed_mono_ns
+                    << " get_begin_mono_ns=" << observations[i].first
+                    << " get_end_mono_ns=" << observations[i].second
+                    << " get_block_us=" << (observations[i].second - observations[i].first) / 1000
+                    << " complete_to_observe_us=" << std::max<int64_t>(
+                        0, observations[i].second - timing->completed_mono_ns) / 1000
+                    << " serial_gap_us=" << (previous_completion ?
+                        (observations[i].first - previous_completion) / 1000 : 0)
+                    << " fifo_wait_us=" << timing->qos_fifo_wait_us
+                    << " first_completion_from_submit_us="
+                    << timing->first_submit_to_first_completion_us;
+            }
             ++timed_children;
             const auto submit = timing->first_submit_mono_ns;
             if (submit && (!first_submit || submit < first_submit)) {
@@ -2496,7 +2539,7 @@ std::optional<TransferFuture> TransferSubmitter::submitVSegment(
         auto state = std::make_shared<VSegmentOperationState>();
         state->parent_trace_id = logging::CurrentTraceId();
         if (GetSpdkNofSlowTraceThresholdUs() > 0 ||
-            logging::ShouldSampleHiFreqLog(state->parent_trace_id)) {
+            ShouldSampleStoreTransferDiagnostics(state->parent_trace_id)) {
             static std::atomic<uint64_t> next_op_id{1};
             state->op_id = next_op_id.fetch_add(1, std::memory_order_relaxed);
             state->started_at = std::chrono::steady_clock::now();
@@ -3051,6 +3094,9 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
     const TransferRequest::OpCode op_code, uint64_t vsegment_op_id,
     size_t child_index, size_t child_count) {
+    const auto prepare_start = current_read_phases
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     if (handle.transport_endpoint_.empty() || handle.size_ < size) {
         LOG(ERROR) << "Invalid NoF request endpoint="
                    << handle.transport_endpoint_
@@ -3094,7 +3140,15 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         task.timing->vsegment_offset_bytes = handle.buffer_address_;
         task.timing->vsegment_length_bytes = size;
     }
+    const auto enqueue_start = current_read_phases
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    if (current_read_phases) {
+        current_read_phases->nof_prepare_us +=
+            ElapsedMicros(prepare_start, enqueue_start);
+    }
     spdk_nvmf_pool_->submitTask(std::move(task));
+    AddReadPhase(&ReadPhaseDiagnostics::submit_us, enqueue_start);
 
     VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_;
     return TransferFuture(state);

@@ -488,6 +488,10 @@ std::ostream& operator<<(std::ostream& output, const RpcPoolCallTiming& timing) 
            << (timing.callback_entered
                    ? us(timing.begin, timing.callback_enter)
                    : -1)
+           << " pool_wait_upper_bound_us="
+           << (timing.callback_entered
+                   ? us(timing.begin, timing.callback_enter)
+                   : -1)
            << " client_submit_us="
            << (timing.submit_returned
                    ? us(timing.callback_enter, timing.submit_return)
@@ -1623,7 +1627,8 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     } else if (timing.backoff_count > 0) {
         status = "backoff_ok";
     }
-    MC_LOG(INFO) << "query_rpc_breakdown key[" << object_key << "] switch_us["
+    MC_LOG(INFO) << "query_rpc_breakdown trace_id=" << trace_id
+                 << " replica_cache_hit=0 key[" << object_key << "] switch_us["
                  << switch_us << "] rpc_first_us[" << timing.rpc_first_us
                  << "] route_refresh_us[" << timing.route_refresh_us
                  << "] retry_switch_us[" << timing.retry_switch_us

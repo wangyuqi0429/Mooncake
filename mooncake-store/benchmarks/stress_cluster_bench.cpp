@@ -1,4 +1,5 @@
 #include <numa.h>
+#include "store_diagnostics.h"
 #include <sched.h>
 #include <algorithm>
 #include <array>
@@ -2171,6 +2172,11 @@ class StressBenchmark {
 
     bool BeginMeasurement() {
         if (!EnsureNofPools()) return false;
+        {
+            std::lock_guard<std::mutex> lock(mooncake::read_histogram_mutex);
+            mooncake::read_histograms.clear();
+            mooncake::read_histograms_enabled = true;
+        }
         for (auto& bytes : measured_memory_bytes_) bytes.store(0);
         for (auto& bytes : measured_nof_bytes_) bytes.store(0);
         ub_before_ = mooncake::GetUbGpuDirectCounters().Snapshot();
@@ -2224,6 +2230,41 @@ class StressBenchmark {
     }
 
     void FinishMeasurement(const char* phase) {
+        {
+            std::lock_guard<std::mutex> lock(mooncake::read_histogram_mutex);
+            mooncake::read_histograms_enabled = false;
+            const std::array<const char*, 3> names{
+                "resolve_us", "enqueue_us", "completion_wait_us"};
+            for (const auto& [thread, hist] : mooncake::read_histograms) {
+                for (size_t p = 0; p < names.size(); ++p) {
+                    std::ostringstream buckets;
+                    const auto samples = std::accumulate(
+                        hist[p].begin(), hist[p].end(), uint64_t{0});
+                    const auto percentile_upper_us = [&](uint64_t percent) {
+                        const auto target = (samples * percent + 99) / 100;
+                        uint64_t cumulative = 0;
+                        for (size_t b = 0; b < hist[p].size(); ++b) {
+                            cumulative += hist[p][b];
+                            if (cumulative >= target) return (uint64_t{1} << b) - 1;
+                        }
+                        return uint64_t{0};
+                    };
+                    for (size_t b = 0; b < hist[p].size(); ++b) {
+                        if (hist[p][b]) buckets << b << "=" << hist[p][b] << ",";
+                    }
+                    LOG(INFO) << "read_phase_histogram phase=" << phase
+                              << " native_thread=" << thread
+                              << " field=" << names[p]
+                              << " samples=" << samples
+                              << " p50_upper_us=" << percentile_upper_us(50)
+                              << " p90_upper_us=" << percentile_upper_us(90)
+                              << " p99_upper_us=" << percentile_upper_us(99)
+                              << " scope=sampled_api_calls_including_failures"
+                              << " bucket_units=us bucket_rule=floor_log2_plus_one"
+                              << " buckets=" << buckets.str();
+                }
+            }
+        }
         const auto memory_read = measured_memory_bytes_[0].load();
         const auto memory_write = measured_memory_bytes_[1].load();
         const auto nof_read = measured_nof_bytes_[0].load();

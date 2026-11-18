@@ -31,6 +31,7 @@
 #include "mooncake_logging.h"
 
 #include "real_client.h"
+#include "store_diagnostics.h"
 #include "registered_pinned_memory.h"
 #include "gpu_direct_read.h"
 #include "client_buffer.h"
@@ -4290,6 +4291,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 // dst 已确认是设备内存但识别/域初始化失败：严格策略默认报错，
                 // 显式 MC_NOF_GPU_STAGING_FALLBACK=1 才回退 host staging
                 if (NofGpuStagingFallbackEnabled()) {
+                    MarkReadFallback();
                     manager.OnGpuStagingFallback();
                     manager.AddPayloadStagedBytes(total_size);
                     LOG(WARNING) << "NoF GPU Direct unavailable type="
@@ -4320,6 +4322,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
+            MarkReadFallback();
             auto alloc_result = client_buffer_allocator_->allocate(total_size);
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate temp buffer for GPU memory "
@@ -4509,6 +4512,10 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, bool size_is_buffer_capacity, bool verify_checksum) {
+    ReadPhaseDiagnostics phases;
+    phases.trace_id = logging::CurrentTraceId();
+    phases.sampled = ShouldSampleStoreTransferDiagnostics(phases.trace_id);
+    ScopedReadPhaseDiagnostics phase_scope(phases.sampled ? &phases : nullptr);
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
     const bool breakdown_log = mooncake::logging::ShouldSampleHiFreqLog(
@@ -4594,6 +4601,19 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
                      << metadata.select_us << "] local_endpoints_us["
                      << metadata.local_endpoints_us << "] select_replica_us["
                      << metadata.select_replica_us << "] read_us[" << read_us
+                     << "] phase_sampled[" << phases.sampled
+                     << "] vsegment_resolve_us[" << phases.resolve_us
+                     << "] nof_submit_us[" << phases.submit_us
+                     << "] nof_prepare_us[" << phases.nof_prepare_us
+                     << "] completion_wait_us[" << phases.wait_us
+                     << "] read_unattributed_us[" << std::max<int64_t>(
+                         0, read_us - phases.resolve_us - phases.submit_us -
+                         phases.nof_prepare_us - phases.wait_us)
+                     << "] fallback_path[" << phases.fallback
+                     << "] replica_cache_hit[0"
+                     << "] metadata_lookup_us["
+                     << (metadata.select_us + metadata.local_endpoints_us +
+                         metadata.select_replica_us)
                      << "] offload_rpc_us[" << offload_timing.offload_rpc_us
                      << "] transfer_data_us["
                      << offload_timing.transfer_data_us
@@ -5766,6 +5786,10 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
+    ReadPhaseDiagnostics phases;
+    phases.trace_id = logging::CurrentTraceId();
+    phases.sampled = ShouldSampleStoreTransferDiagnostics(phases.trace_id);
+    ScopedReadPhaseDiagnostics phase_scope(phases.sampled ? &phases : nullptr);
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // One dice roll per request (MC_HIFREQ_LOG_SAMPLE_RATE, default 1.0) gates
     // both the breakdown timing capture and its emission below.
@@ -6169,6 +6193,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                             .count();
         MC_LOG(INFO) << "batch_get_into_breakdown num_keys[" << num_keys
                      << "] start_time[" << FormatWallClock(t0_wall)
+                     << "] phase_sampled[" << phases.sampled
+                     << "] vsegment_resolve_us[" << phases.resolve_us
+                     << "] nof_submit_us[" << phases.submit_us
+                     << "] completion_wait_us[" << phases.wait_us
+                     << "] fallback_path[" << phases.fallback
                      << "] query_us[" << query_us << "] prep_us[" << prep_us
                      << "] read_us[" << read_us << "] total_us[" << total_us
                      << "] direct_ops[" << valid_operations.size()
