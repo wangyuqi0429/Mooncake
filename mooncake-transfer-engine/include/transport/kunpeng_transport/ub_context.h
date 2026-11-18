@@ -60,6 +60,10 @@ class UbWorkerPool {
 
     void redispatch(std::vector<Transport::Slice*>& slice_list, int thread_id);
 
+    bool isTargetSuppressed(int target_id);
+
+    void markTargetFailed(int target_id);
+
     void transferWorker(int thread_id);
 
     bool hasWorkerWork(int thread_id);
@@ -86,7 +90,13 @@ class UbWorkerPool {
         collective_slice_queue_;
     std::atomic<uint64_t> submitted_slice_count_;
     std::atomic<uint64_t> processed_slice_count_;
+    std::atomic<uint64_t> import_attempts_{0};
+    std::atomic<uint64_t> import_failures_{0};
+    std::atomic<uint64_t> import_suppressed_{0};
     uint64_t success_nr_polls = 0, failed_nr_polls = 0;
+    static constexpr uint64_t kFailedTargetCooldownNs = 1000000000ull;
+    std::mutex failed_target_mutex_;
+    std::unordered_map<int, uint64_t> failed_target_ids_;
 };
 
 class UbEndpointStore {
@@ -160,7 +170,8 @@ class UbContext {
           active_(true),
           show_work_request_flushed_error_(false),
           multipath_(globalConfig().urma_bonding_multipath),
-          numa_affinity_(globalConfig().ub_numa_affinity) {}
+          numa_affinity_(globalConfig().ub_numa_affinity),
+          electrical_network_(globalConfig().ub_electrical_network) {}
 
     virtual ~UbContext() = default;
 
@@ -244,6 +255,8 @@ class UbContext {
     bool multipath() const { return multipath_; }
 
     bool numa_affinity() const { return numa_affinity_; }
+
+    bool electrical_network() const { return electrical_network_; }
 
     // EndPoint Management
     std::shared_ptr<UbEndPoint> endpoint() {
@@ -404,6 +417,8 @@ class UbContext {
     bool multipath_ = false;
 
     bool numa_affinity_ = false;
+
+    bool electrical_network_ = true;
 };
 }  // namespace mooncake
 

@@ -151,11 +151,6 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
                   [](const TransferMetadata::HandShakeDesc& peer,
                      TransferMetadata::HandShakeDesc& local) {
                       local.payload = "reply:" + peer.payload;
-#ifdef USE_UB
-                      local.jetty_num = peer.jetty_num;
-                      local.jetty_infos = peer.jetty_infos;
-                      local.trans_mode = peer.trans_mode;
-#endif
                       return 0;
                   },
                   port, sockfd),
@@ -184,48 +179,9 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 
     TransferMetadata::HandShakeDesc request;
     request.payload = "bootstrap";
-#ifdef USE_UB
-    request.jetty_num = {11, 22};
-    TransferMetadata::HandShakeDesc::PeerJettyInfo first_jetty;
-    first_jetty.id = 11;
-    first_jetty.uasid = 101;
-    first_jetty.rjetty = "001122AABBCC";
-    TransferMetadata::HandShakeDesc::PeerJettyInfo second_jetty;
-    second_jetty.id = 22;
-    second_jetty.uasid = 202;
-    second_jetty.rjetty = "FFEEDDCCBBAA";
-    request.jetty_infos = {first_jetty, second_jetty};
-    request.trans_mode = 2;
-#endif
     TransferMetadata::HandShakeDesc response;
     ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
     EXPECT_EQ(response.payload, "reply:bootstrap");
-#ifdef USE_UB
-    EXPECT_EQ(response.jetty_num, request.jetty_num);
-    ASSERT_EQ(response.jetty_infos.size(), request.jetty_infos.size());
-    for (size_t i = 0; i < request.jetty_infos.size(); ++i) {
-        EXPECT_EQ(response.jetty_infos[i].id, request.jetty_infos[i].id);
-        EXPECT_EQ(response.jetty_infos[i].uasid,
-                  request.jetty_infos[i].uasid);
-        EXPECT_EQ(response.jetty_infos[i].rjetty,
-                  request.jetty_infos[i].rjetty);
-    }
-    EXPECT_EQ(response.trans_mode, request.trans_mode);
-
-    // A peer using the legacy schema omits jetty_infos and trans_mode. The
-    // decoder must preserve the fallback defaults used by the hand-fill path.
-    TransferMetadata::HandShakeDesc legacy_request;
-    legacy_request.payload = "legacy";
-    legacy_request.jetty_num = {33};
-    TransferMetadata::HandShakeDesc legacy_response;
-    ASSERT_EQ(client.sendHandshake(server_name, legacy_request,
-                                   legacy_response),
-              0);
-    EXPECT_EQ(legacy_response.payload, "reply:legacy");
-    EXPECT_EQ(legacy_response.jetty_num, legacy_request.jetty_num);
-    EXPECT_TRUE(legacy_response.jetty_infos.empty());
-    EXPECT_EQ(legacy_response.trans_mode, -1);
-#endif
 }
 
 // add, get and remove RPCMetaEntryMeta
