@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <limits>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -21,6 +22,24 @@ VSegmentAllocationResult ManagerError(ErrorCode error, std::string detail) {
     result.detail = std::move(detail);
     return result;
 }
+
+int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+uint64_t LogicalCapacity(const VSegmentProfile& profile) {
+    return profile.member_extent_size * profile.member_count;
+}
+
+// 自动推导"能接住一次写"的判据 L 时，把观测到的最大写长度按时间衰减，
+// 避免一次性的大对象永久抬高水位（水位偏高只会多建卷，不会写错，但会浪费配额）。
+constexpr int64_t kLengthDecayIntervalMs = 60 * 1000;
+constexpr int64_t kSpareBackoffMinMs = 100;
+constexpr int64_t kSpareBackoffMaxMs = 5 * 1000;
+// 一次补卷调用内最多串行补几条（T 很小，这个上限只是防御）。
+constexpr size_t kSpareChainLimit = 4;
 
 ReservationResult ReservationError(ErrorCode error, std::string detail) {
     ReservationResult result;
@@ -149,7 +168,28 @@ VSegmentAllocationResult VSegmentManager::RequestCreate(
                                             return CreateSingleFlight(
                                                 profile_name, creation_epoch);
                                         });
-                                return FinishCreate(std::move(result));
+                                auto finished = FinishCreate(std::move(result));
+                                // 建完再判一次：仍低于水位就置位，由下一次写或下一次
+                                // 装配把它消费掉。注意不能在这里递归调 RequestCreate：
+                                // pending_creations_ 里这条要等任务结束才 ready，
+                                // 递归只会立刻拿到 -105。
+                                if (finished) {
+                                    std::lock_guard<std::mutex> state_lock(mutex_);
+                                    const auto profile =
+                                        profiles_.find(profile_name);
+                                    if (owned_ && !degraded_ &&
+                                        profile != profiles_.end() &&
+                                        profile->second.spare_target != 0) {
+                                        const uint64_t candidate =
+                                            CandidateLengthLocked(profile->second);
+                                        if (ServiceableCountLocked(profile_name,
+                                                                   candidate) <
+                                            SpareTargetLocked(profile_name))
+                                            replenish_pending_.store(
+                                                true, std::memory_order_relaxed);
+                                    }
+                                }
+                                return finished;
                             })
                      .share());
     }
@@ -165,9 +205,16 @@ VSegmentPutStartResult VSegmentManager::StartPut(
     VSegmentCommitBatch* batch) {
     const auto& profile_name =
         requested_profile.empty() ? default_profile_ : requested_profile;
-    if (operation_id.empty() || length == 0 || !profiles_.count(profile_name))
+    const auto profile = profiles_.find(profile_name);
+    if (operation_id.empty() || length == 0 || profile == profiles_.end())
         return {ErrorCode::INVALID_PARAMS, operation_id, {},
                 "invalid PutStart operation, length, or profile"};
+    // 对象长度超过一条卷的逻辑容量时，Reserve 永远放不下；旧行为会在这条
+    // 分支上每次重试都触发一次建卷（白建，直到配额耗尽返回 -104）。
+    // 直接拒绝，且不触发任何建卷。
+    if (length > LogicalCapacity(profile->second))
+        return {ErrorCode::INVALID_PARAMS, operation_id, {},
+                "PutStart length exceeds vsegment logical capacity"};
 
     for (int pass = 0; pass < 2; ++pass) {
         std::shared_ptr<VSegmentDeferredCommitHandle> fence;
@@ -261,10 +308,21 @@ VSegmentPutStartResult VSegmentManager::StartPut(
                                      reservation.range.offset,
                                      reservation.range.length, operation_id},
                                     {}};
+                // 候补：这条卷如果刚被写到"再也接不住一次典型写"，置一个 bit，
+                // 出锁后再决定是否补一条（锁内不做建卷）。判定与计数都是 O(#卷)，
+                // 且只在这一次预留把某条卷写满时发生。
+                NoteWriteLength(length);
+                if (managed.logical_allocator->LargestFreeExtent() <
+                    CandidateLengthLocked(profile->second))
+                    replenish_pending_.store(true, std::memory_order_relaxed);
                 allocated = true;
                 break;
             }
         }
+        // 出锁消费候补信号：MaybeReplenish 自己会重新拿锁并调 RequestCreate
+        // （异步单飞），不能在这里持锁调用。
+        if (allocated && replenish_pending_.exchange(false))
+            MaybeReplenish(profile_name);
         if (allocated) {
             if (batch) {
                 batch->Add(committer_, fence);
@@ -1183,6 +1241,185 @@ VSegmentManagerStats VSegmentManager::Stats() const {
             ++stats.pending_creations;
     }
     return stats;
+}
+
+// ---------------------------------------------------------------------------
+// 候补（备用卷）
+// ---------------------------------------------------------------------------
+
+void VSegmentManager::NoteWriteLength(uint64_t length) {
+    if (length > observed_max_length_.load(std::memory_order_relaxed))
+        observed_max_length_.store(length, std::memory_order_relaxed);
+    const int64_t now = NowMs();
+    int64_t last = last_length_decay_ms_.load(std::memory_order_relaxed);
+    if (last == 0) {
+        last_length_decay_ms_.store(now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < kLengthDecayIntervalMs) return;
+    if (!last_length_decay_ms_.compare_exchange_strong(
+            last, now, std::memory_order_relaxed))
+        return;
+    observed_max_length_.store(
+        observed_max_length_.load(std::memory_order_relaxed) / 2,
+        std::memory_order_relaxed);
+}
+
+uint64_t VSegmentManager::CandidateLengthLocked(
+    const VSegmentProfile& profile) const {
+    const uint64_t capacity = LogicalCapacity(profile);
+    if (profile.candidate_length_bytes != 0)
+        return std::min(profile.candidate_length_bytes, capacity);
+    const uint64_t floor = std::max<uint64_t>(profile.stripe_size, 1);
+    const uint64_t observed =
+        observed_max_length_.load(std::memory_order_relaxed);
+    return std::min(capacity, std::max(floor, observed));
+}
+
+size_t VSegmentManager::ActiveCountLocked(
+    const std::string& profile_name) const {
+    size_t active = 0;
+    for (const auto& entry : vsegments_) {
+        const auto& managed = entry.second;
+        if (managed.profile_name == profile_name &&
+            managed.lifecycle == Lifecycle::ACTIVE)
+            ++active;
+    }
+    return active;
+}
+
+size_t VSegmentManager::ServiceableCountLocked(
+    const std::string& profile_name, uint64_t candidate_length) const {
+    size_t serviceable = 0;
+    for (const auto& entry : vsegments_) {
+        const auto& managed = entry.second;
+        if (managed.profile_name != profile_name ||
+            managed.lifecycle != Lifecycle::ACTIVE)
+            continue;
+        // 判据是"单段连续空闲"而不是空闲总量：Reserve 是 first-fit 找单段。
+        if (managed.logical_allocator->LargestFreeExtent() >= candidate_length)
+            ++serviceable;
+    }
+    return serviceable;
+}
+
+size_t VSegmentManager::QuotaHeadroomLocked(
+    const VSegmentProfile& profile) const {
+    if (profile.member_extent_size == 0) return 0;
+    std::set<std::string> visited;
+    size_t headroom = std::numeric_limits<size_t>::max();
+    for (const auto& config : quota_configs_) {
+        if (config.profile_name != profile.name) continue;
+        for (const auto& quota : config.quotas) {
+            if (!visited.insert(quota.segment_id).second) continue;
+            const uint64_t free_bytes =
+                physical_allocator_.FreeBytes(profile.name, quota.segment_id);
+            headroom = std::min<size_t>(
+                headroom, static_cast<size_t>(free_bytes /
+                                              profile.member_extent_size));
+        }
+    }
+    if (headroom == std::numeric_limits<size_t>::max()) return 0;
+    return headroom;
+}
+
+size_t VSegmentManager::SpareTargetLocked(
+    const std::string& profile_name) const {
+    const auto profile = profiles_.find(profile_name);
+    if (profile == profiles_.end()) return 0;
+    const size_t active = ActiveCountLocked(profile_name);
+    // spare_target == 0：目标就是现状，即"永不缺"，完全等价旧行为。
+    if (profile->second.spare_target == 0) return active;
+    const size_t headroom = QuotaHeadroomLocked(profile->second);
+    // R = 1：一次写占一条卷，因此"1 条在用 + spare_target 条备用"。
+    const size_t wanted =
+        1 + static_cast<size_t>(profile->second.spare_target);
+    const size_t floor_target = std::max<size_t>(
+        static_cast<size_t>(profile->second.initial_vsegment_count), wanted);
+    return std::min(active + headroom, floor_target);
+}
+
+void VSegmentManager::ClearSpareBackoffLocked(
+    const std::string& profile_name) {
+    spare_backoff_.erase(profile_name);
+}
+
+void VSegmentManager::RecordSpareFailureLocked(const std::string& profile_name,
+                                               ErrorCode error,
+                                               const std::string& detail) {
+    auto& state = spare_backoff_[profile_name];
+    if (state.failures < 8) ++state.failures;
+    const int64_t backoff_ms =
+        std::min<int64_t>(kSpareBackoffMaxMs,
+                          kSpareBackoffMinMs
+                              << std::min<uint32_t>(state.failures, 6));
+    state.next_attempt_ms = NowMs() + backoff_ms;
+    LOG(WARNING) << "vsegment spare replenish failed: partition="
+                 << partition_id_ << ", profile=" << profile_name
+                 << ", error=" << static_cast<int32_t>(error)
+                 << ", detail=" << detail << ", retry_in_ms=" << backoff_ms;
+}
+
+void VSegmentManager::MaybeReplenish(const std::string& profile_name) {
+    const auto profile = profiles_.find(profile_name);
+    if (profile == profiles_.end() || profile->second.spare_target == 0) return;
+    for (size_t attempt = 0; attempt < kSpareChainLimit; ++attempt) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!owned_ || degraded_) return;
+            const auto backoff = spare_backoff_.find(profile_name);
+            if (backoff != spare_backoff_.end() &&
+                NowMs() < backoff->second.next_attempt_ms)
+                return;
+            const uint64_t candidate = CandidateLengthLocked(profile->second);
+            const size_t serviceable =
+                ServiceableCountLocked(profile_name, candidate);
+            if (serviceable >= SpareTargetLocked(profile_name)) return;
+            // 目标水位已经顶到配额上限：再建也建不出来（Allocate 会 -104）。
+            // 每个 partition 只喊一次，避免写满一次刷一条 -104。
+            if (QuotaHeadroomLocked(profile->second) == 0) {
+                auto& state = spare_backoff_[profile_name];
+                if (!state.quota_warned) {
+                    state.quota_warned = true;
+                    LOG(WARNING)
+                        << "vsegment spare target clipped by quota: partition="
+                        << partition_id_ << ", profile=" << profile_name
+                        << ", active=" << ActiveCountLocked(profile_name)
+                        << ", serviceable=" << serviceable
+                        << ", member_extent_size="
+                        << profile->second.member_extent_size
+                        << ", member_count=" << profile->second.member_count;
+                }
+                return;
+            }
+        }
+        // 出锁再建卷：RequestCreate 内部会拿 mutex_ / pending_mutex_，并且
+        // 同一 (partition, profile) 已有在建时直接返回 -105（单飞）。
+        auto created = RequestCreate(profile_name);
+        if (!created) {
+            if (created.error == ErrorCode::VSEGMENT_CREATING) return;
+            std::lock_guard<std::mutex> lock(mutex_);
+            RecordSpareFailureLocked(profile_name, created.error,
+                                     created.detail);
+            return;
+        }
+        // 完成了一次建卷（拿到了已就绪的 pending 结果）：可能仍低于水位，
+        // 继续下一轮（有上限），一次只建一条。
+        std::lock_guard<std::mutex> lock(mutex_);
+        ClearSpareBackoffLocked(profile_name);
+    }
+}
+
+void VSegmentManager::MaybeReplenishAll() {
+    std::vector<std::string> names;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owned_ || degraded_) return;
+        for (const auto& entry : profiles_) {
+            if (entry.second.spare_target != 0) names.push_back(entry.first);
+        }
+    }
+    for (const auto& name : names) MaybeReplenish(name);
 }
 
 }  // namespace mooncake::vsegment

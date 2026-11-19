@@ -229,6 +229,13 @@ DEFINE_uint64(vsegment_member_extent_size, 0,
 DEFINE_double(vsegment_reserved_ratio, 0.0,
               "vsegment auto-plan: fraction reserved outside vsegment "
               "quotas, in [0, 1). Default 0 means no reservation.");
+DEFINE_uint32(vsegment_spare_target, 0,
+              "vsegment auto-plan: spare vsegment count per partition "
+              "(0 = disabled). When > 0 the master keeps 1 + spare_target "
+              "serviceable vsegments per partition (R=1).");
+DEFINE_uint64(vsegment_candidate_length_bytes, 0,
+              "vsegment auto-plan: write length used to decide whether a "
+              "vsegment can serve the next write (0 = automatic).");
 
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
@@ -1558,6 +1565,8 @@ BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
     policy.stripe_size = FLAGS_vsegment_stripe_size;
     policy.member_extent_size = FLAGS_vsegment_member_extent_size;
     policy.reserved_ratio = FLAGS_vsegment_reserved_ratio;
+    policy.spare_target = FLAGS_vsegment_spare_target;
+    policy.candidate_length_bytes = FLAGS_vsegment_candidate_length_bytes;
     LOG(INFO) << "VSegment auto-plan policy: member_count="
               << policy.member_count << ", stripe_size="
               << policy.stripe_size << ", member_extent_size="
@@ -1565,7 +1574,9 @@ BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
               << policy.reserved_ratio << ", required_medium="
               << (policy.required_medium.empty() ? "auto"
                                                  : policy.required_medium)
-              << ", io_alignment=" << policy.io_alignment;
+              << ", io_alignment=" << policy.io_alignment
+              << ", spare_target=" << policy.spare_target
+              << ", candidate_length_bytes=" << policy.candidate_length_bytes;
     return policy;
 }
 
@@ -1903,6 +1914,10 @@ int main(int argc, char* argv[]) {
                 auto_plan_policy->member_extent_size;
             supervisor_config.vsegment_auto_plan_reserved_ratio =
                 auto_plan_policy->reserved_ratio;
+            supervisor_config.vsegment_auto_plan_spare_target =
+                auto_plan_policy->spare_target;
+            supervisor_config.vsegment_auto_plan_candidate_length_bytes =
+                auto_plan_policy->candidate_length_bytes;
         }
 #endif
         mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);

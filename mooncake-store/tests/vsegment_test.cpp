@@ -463,6 +463,45 @@ PartitionVSegmentConfig Config() {
             .quotas = {{"segment-a", 0, 512}, {"segment-b", 1024, 512}}};
 }
 
+// ---- 候补（备用卷）测试辅助 ----
+VSegmentProfile ProfileWithSpare(uint32_t spare_target,
+                                 uint64_t candidate_length_bytes = 0,
+                                 uint32_t members = 2) {
+    auto profile = Profile(members);
+    profile.spare_target = spare_target;
+    profile.candidate_length_bytes = candidate_length_bytes;
+    return profile;
+}
+
+// 每个 psegment 只给 quota_length，用于把 Mmax（最多能建几条卷）压到 1。
+PartitionVSegmentConfig ConfigWithQuota(uint64_t quota_length) {
+    return {.partition_id = "partition-1",
+            .profile_name = "default",
+            .initial_vsegment_count = 1,
+            .config_generation = 1,
+            .quotas = {{"segment-a", 0, quota_length},
+                       {"segment-b", 1024, quota_length}}};
+}
+
+int CountMutations(const std::shared_ptr<TestStateCommitter>& committer,
+                   const std::string& mutation) {
+    return static_cast<int>(std::count(committer->mutations.begin(),
+                                       committer->mutations.end(), mutation));
+}
+
+// 轮询 RequestCreate 直到没有在建：它会把已完成的建卷结果取走并清空 pending。
+// 返回 true 表示最后一次拿到了成功结果。
+bool DrainCreations(VSegmentManager& manager,
+                    const std::string& profile_name = "default") {
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        auto result = manager.RequestCreate(profile_name);
+        if (result) return true;
+        if (result.error != ErrorCode::VSEGMENT_CREATING) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+}
+
 VSegmentView View() {
     PartitionQuotaAllocator allocator(Config());
     auto allocation = allocator.Allocate("vs-1", Profile());
@@ -3075,6 +3114,106 @@ TEST(BuildDiscoveredQuotaPlanTest, AutoMediumModeSkipsInsufficientMedium) {
     ASSERT_EQ(request.profile_specs.size(), 1u);
     EXPECT_EQ(request.profile_specs[0].required_medium, "NVMe");
     EXPECT_EQ(request.default_profile, "default-NVMe");
+}
+
+TEST(LogicalRangeAllocatorTest, LargestFreeExtentAndCanReserve) {
+    LogicalRangeAllocator allocator(1000);
+    EXPECT_EQ(allocator.LargestFreeExtent(), 1000u);
+    ASSERT_TRUE(allocator.Reserve("op-1", 300));
+    // 预留把区间从 free_ranges_ 里切走，最长连续空闲随之变短。
+    EXPECT_EQ(allocator.LargestFreeExtent(), 700u);
+    EXPECT_TRUE(allocator.CanReserve(700));
+    EXPECT_FALSE(allocator.CanReserve(701));
+}
+
+TEST(VSegmentConfigTest, RejectsInvalidSpareSettings) {
+    std::string detail;
+    auto profile = Profile();
+    profile.spare_target = 9;
+    EXPECT_EQ(ValidateProfile(profile, &detail), ErrorCode::INVALID_PARAMS)
+        << detail;
+
+    profile = Profile();
+    profile.candidate_length_bytes = profile.stripe_size - 1;
+    EXPECT_EQ(ValidateProfile(profile, &detail), ErrorCode::INVALID_PARAMS)
+        << detail;
+
+    profile = Profile();
+    profile.candidate_length_bytes =
+        profile.member_extent_size * profile.member_count + 1;
+    EXPECT_EQ(ValidateProfile(profile, &detail), ErrorCode::INVALID_PARAMS)
+        << detail;
+
+    profile = Profile();
+    profile.spare_target = 1;
+    profile.candidate_length_bytes =
+        profile.member_extent_size * profile.member_count;
+    EXPECT_EQ(ValidateProfile(profile, &detail), ErrorCode::OK) << detail;
+}
+
+TEST(VSegmentManagerTest, RejectsWriteLargerThanLogicalCapacity) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {Profile()}, committer);
+    ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    // C = member_extent_size * member_count = 512。
+    auto too_big = manager.StartPut("put-big", 513);
+    EXPECT_EQ(too_big.error, ErrorCode::INVALID_PARAMS);
+    EXPECT_NE(too_big.detail.find("logical capacity"), std::string::npos);
+    // 旧行为会在这里触发一次"白建卷"，修复后不应有任何建卷。
+    EXPECT_EQ(CountMutations(committer, "vsegment_create_begin"), 0);
+    EXPECT_EQ(CountMutations(committer, "vsegment_create"), 1);  // 只有首建
+
+    auto fits = manager.StartPut("put-fits", 512);
+    ASSERT_TRUE(fits) << fits.detail;
+}
+
+TEST(VSegmentSpareTest, DisabledByDefaultCreatesNothingBeyondInitial) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {Profile()}, committer);  // spare_target=0
+    ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    // 两次 256 写满唯一一条卷：关闭候补时不应有任何额外建卷。
+    ASSERT_TRUE(manager.StartPut("put-1", 256));
+    ASSERT_TRUE(manager.StartPut("put-2", 256));
+    manager.MaybeReplenishAll();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(CountMutations(committer, "vsegment_create_begin"), 0);
+    EXPECT_EQ(manager.Stats().active, 1u);
+}
+
+TEST(VSegmentSpareTest, ReplenishesAfterInstallToTarget) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {ProfileWithSpare(1)}, committer);
+    ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    EXPECT_EQ(manager.Stats().active, 1u);
+
+    manager.MaybeReplenishAll();  // T = 2：安装后补 1 条
+    EXPECT_TRUE(DrainCreations(manager));
+    EXPECT_EQ(manager.Stats().active, 2u);
+    EXPECT_EQ(CountMutations(committer, "vsegment_create_begin"), 1);
+}
+
+TEST(VSegmentSpareTest, ReplenishesWhenSegmentBecomesUnserviceable) {
+    auto committer = Committer();
+    VSegmentManager manager(Config(), {ProfileWithSpare(1)}, committer);
+    ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    // 只有一条卷；两次 256 把它写满（C=512），触发事件式补卷。
+    ASSERT_TRUE(manager.StartPut("put-1", 256));
+    ASSERT_TRUE(manager.StartPut("put-2", 256));
+    EXPECT_TRUE(DrainCreations(manager));
+    EXPECT_EQ(manager.Stats().active, 2u);
+    EXPECT_EQ(CountMutations(committer, "vsegment_create_begin"), 1);
+}
+
+TEST(VSegmentSpareTest, ClipsTargetToQuotaHeadroom) {
+    auto committer = Committer();
+    // 每个 psegment 配额 256 = 一条 extent：Mmax = 1，目标水位被裁到 1。
+    VSegmentManager manager(ConfigWithQuota(256), {ProfileWithSpare(1)},
+                            committer);
+    ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
+    manager.MaybeReplenishAll();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_EQ(CountMutations(committer, "vsegment_create_begin"), 0);
+    EXPECT_EQ(manager.Stats().active, 1u);
 }
 
 }  // namespace
