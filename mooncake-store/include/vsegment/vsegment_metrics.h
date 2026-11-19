@@ -27,6 +27,10 @@ struct VSegmentGaugeValues {
     uint64_t reservations{0};
     uint64_t committed_allocations{0};
     uint64_t pending_creations{0};
+    // VSegments owned by this SubMaster (preparing + active).
+    uint64_t vsegments{0};
+    // Unix seconds of the last successful refresh; 0 means "never refreshed".
+    uint64_t last_refresh_timestamp_seconds{0};
 };
 
 // Process-local vsegment metrics exported through the master's existing
@@ -57,6 +61,10 @@ class VSegmentMetrics {
         return formed_capacity_bytes_.load();
     }
     uint64_t formed_free_bytes() const { return formed_free_bytes_.load(); }
+    uint64_t vsegments() const { return vsegments_.load(); }
+    uint64_t last_refresh_timestamp_seconds() const {
+        return last_refresh_timestamp_seconds_.load();
+    }
     // allocated / total_capacity; 0 when no capacity is owned.
     double used_ratio() const;
 
@@ -73,6 +81,8 @@ class VSegmentMetrics {
     std::atomic<uint64_t> reservations_{0};
     std::atomic<uint64_t> committed_allocations_{0};
     std::atomic<uint64_t> pending_creations_{0};
+    std::atomic<uint64_t> vsegments_{0};
+    std::atomic<uint64_t> last_refresh_timestamp_seconds_{0};
     std::atomic<uint64_t> create_success_{0};
     std::atomic<uint64_t> create_failure_{0};
     std::atomic<uint64_t> release_success_{0};

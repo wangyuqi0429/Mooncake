@@ -21,6 +21,11 @@ void VSegmentMetrics::SetGauges(const VSegmentGaugeValues& values) {
     reservations_.store(values.reservations);
     committed_allocations_.store(values.committed_allocations);
     pending_creations_.store(values.pending_creations);
+    vsegments_.store(values.vsegments);
+    // Published last with release semantics: a reader that observes a new
+    // timestamp is guaranteed to also observe the values written above.
+    last_refresh_timestamp_seconds_.store(
+        values.last_refresh_timestamp_seconds, std::memory_order_release);
 }
 
 double VSegmentMetrics::used_ratio() const {
@@ -86,6 +91,16 @@ std::string VSegmentMetrics::Serialize() const {
         << "# TYPE mooncake_vsegment_pending_creations gauge\n"
         << "mooncake_vsegment_pending_creations "
         << pending_creations_.load() << '\n'
+        << "# HELP mooncake_vsegment_vsegments VSegments owned by this "
+           "SubMaster (preparing + active)\n"
+        << "# TYPE mooncake_vsegment_vsegments gauge\n"
+        << "mooncake_vsegment_vsegments " << vsegments_.load() << '\n'
+        << "# HELP mooncake_vsegment_metrics_last_refresh_timestamp_seconds "
+           "Unix time of the last successful metrics refresh (0 = never)\n"
+        << "# TYPE "
+           "mooncake_vsegment_metrics_last_refresh_timestamp_seconds gauge\n"
+        << "mooncake_vsegment_metrics_last_refresh_timestamp_seconds "
+        << last_refresh_timestamp_seconds_.load() << '\n'
         << "# HELP mooncake_vsegment_create_success_total Successful VSegment "
            "creations\n"
         << "# TYPE mooncake_vsegment_create_success_total counter\n"

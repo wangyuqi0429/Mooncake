@@ -177,6 +177,9 @@ class MasterService {
     // slot owner heartbeat: called by the supervisor around serve phases.
     ErrorCode StartInterMasterRpc();
     void StopInterMasterRpc();
+    // Stops the vsegment metrics refresh thread. Called by the supervisor
+    // when leaving the serve phase, before the oplog writer is stopped.
+    void StopVSegmentMetrics();
     cvm::InterMasterRpcClient* inter_master_rpc() const {
         return inter_master_rpc_.get();
     }

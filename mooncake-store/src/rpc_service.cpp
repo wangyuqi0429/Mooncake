@@ -2088,6 +2088,10 @@ void WrappedMasterService::StopInterMasterRpc() {
     master_service_.StopInterMasterRpc();
 }
 
+void WrappedMasterService::StopVSegmentMetrics() {
+    master_service_.StopVSegmentMetrics();
+}
+
 uint32_t WrappedMasterService::GetOwnedSlotCount() const {
     return master_service_.GetOwnedSlotCount();
 }
@@ -2102,10 +2106,12 @@ std::string MasterService::GetVSegmentStatusLogLine() const {
         os << ", generation=" << snapshot.config_generation
            << ", profiles=" << snapshot.profile_specs.size()
            << ", partitions_installed="
-           // PartitionCount/VSegmentCount take the manager lock internally;
-           // the snapshot reference is a lock-free view.
+           // PartitionCount takes the manager lock internally; the snapshot
+           // reference is a lock-free view. The vsegment count comes from the
+           // last metrics refresh so this line does not scan every manager.
            << vsegment_service_->PartitionCount()
-           << ", vsegments=" << vsegment_service_->VSegmentCount()
+           << ", vsegments="
+           << vsegment::VSegmentMetrics::Instance().vsegments()
            << " | pools=";
         bool first_pool = true;
         for (const auto& profile : snapshot.profile_specs) {

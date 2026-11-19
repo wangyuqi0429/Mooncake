@@ -1571,7 +1571,12 @@ void MasterService::ConstructVSegmentService(
         return std::set<std::string>(invalid_replica_endpoints_.begin(),
                                      invalid_replica_endpoints_.end());
     });
+    service->Start();
     vsegment_service_ = std::move(service);
+}
+
+void MasterService::StopVSegmentMetrics() {
+    if (vsegment_service_) vsegment_service_->Stop();
 }
 
 // vsegment reconcile 主体（原 RefreshVSegmentOwnership 后半），由冷启动同
@@ -1712,7 +1717,6 @@ ErrorCode MasterService::RunVSegmentOwnershipReconcile(
     }
     if (!batch) {
         if (local_batch.Flush() != ErrorCode::OK) complete = false;
-        vsegment_service_->RefreshMetrics();
     }
     if (!reconcile_fail_first.empty()) {
         LOG(ERROR) << "vsegment reconcile failures: count="
@@ -3300,6 +3304,7 @@ void MasterService::NoteVSegmentMountActivity() {}
 void MasterService::MaybeSpawnVSegmentInit() {}
 void MasterService::VSegmentInitThreadFunc() {}
 void MasterService::ConstructVSegmentService(vsegment::PartitionPhysicalQuotaSnapshot) {}
+void MasterService::StopVSegmentMetrics() {}
 uint32_t MasterService::GetOwnedSlotCount() const { return 0; }
 tl::expected<std::vector<Replica>, ErrorCode>
 MasterService::TryAllocateReplicasRemotely(
@@ -4398,6 +4403,10 @@ MasterService::~MasterService() {
             vsegment_init_thread_.join();
         }
     }
+
+    // Stop the metrics refresh thread before the oplog writer goes away so a
+    // refresh cycle can never race with a stopped committer.
+    if (vsegment_service_) vsegment_service_->Stop();
 
     if (ordered_oplog_writer_) {
         ordered_oplog_writer_->Stop();

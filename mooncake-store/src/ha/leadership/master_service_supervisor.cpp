@@ -945,6 +945,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             metrics_reporter.SetRole("standby");
             wrapped_master_service->StopSlotOwnerHeartbeat();
             wrapped_master_service->StopInterMasterRpc();
+            // Stop the vsegment metrics refresh thread while the serving
+            // instance is still alive; the gauges stay zeroed for standby.
+            wrapped_master_service->StopVSegmentMetrics();
             cvm_membership_coordinator.SetServeStopSignal(nullptr);
             DeactivateServingState(admin_server, label_reconciler);
             EnterStandbyMode(admin_server, *standby_controller,

@@ -1,8 +1,11 @@
 #include "vsegment/vsegment_service.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cstdlib>
+#include <exception>
 #include <string_view>
+#include <system_error>
 
 #include <glog/logging.h>
 
@@ -76,6 +79,57 @@ VSegmentService::VSegmentService(
     }
 }
 
+VSegmentService::~VSegmentService() { Stop(); }
+
+void VSegmentService::Start() {
+    std::lock_guard<std::mutex> lock(refresh_start_mutex_);
+    if (metrics_refresh_interval_.count() <= 0) return;
+    if (refresh_running_.exchange(true)) return;
+    // A new serving generation starts from zero so a promoted instance does
+    // not keep showing the previous leader's gauges.
+    VSegmentMetrics::Instance().SetGauges(VSegmentGaugeValues{});
+    try {
+        refresh_thread_ = std::thread([this] { RefreshLoop(); });
+    } catch (const std::system_error& error) {
+        // Metrics are best-effort: never fail the serving path because the
+        // refresh thread could not be created. Ownership changes still
+        // refresh synchronously through RefreshMetrics(true).
+        refresh_running_.store(false);
+        LOG(WARNING) << "vsegment metrics refresh thread unavailable: "
+                     << error.what();
+    }
+}
+
+void VSegmentService::Stop() {
+    std::lock_guard<std::mutex> lock(refresh_start_mutex_);
+    if (refresh_running_.exchange(false)) {
+        // Wake the loop from try_acquire_for(interval) without waiting a period.
+        refresh_stop_sem_.release();
+    }
+    if (refresh_thread_.joinable()) refresh_thread_.join();
+    // A demoted instance must not keep showing the previous leader's values.
+    VSegmentMetrics::Instance().SetGauges(VSegmentGaugeValues{});
+}
+
+void VSegmentService::RefreshLoop() {
+    // Clamp to one hour: the configured interval may be as large as
+    // kMaxMetricsRefreshIntervalMs, and steady_clock + interval would overflow.
+    const auto wait_interval = std::min(
+        metrics_refresh_interval_,
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::hours(1)));
+    while (refresh_running_.load(std::memory_order_acquire)) {
+        if (refresh_stop_sem_.try_acquire_for(wait_interval)) break;
+        try {
+            RefreshMetrics(true);
+        } catch (const std::exception& error) {
+            LOG(WARNING) << "vsegment metrics refresh failed: " << error.what();
+        } catch (...) {
+            LOG(WARNING) << "vsegment metrics refresh failed";
+        }
+    }
+}
+
 void VSegmentService::RefreshMetrics(bool force) {
     const auto interval_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -137,7 +191,14 @@ void VSegmentService::RefreshMetrics(bool force) {
         values.reservations += stats.reservations;
         values.committed_allocations += stats.committed_allocations;
         values.pending_creations += stats.pending_creations;
+        // Same population as the "vsegments=" field of the status log line.
+        values.vsegments += stats.preparing + stats.active;
     }
+    values.last_refresh_timestamp_seconds =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now()
+                                      .time_since_epoch())
+                                  .count());
     VSegmentMetrics::Instance().SetGauges(values);
     last_metrics_refresh_ns_.store(SteadyClockNowNs(),
                                    std::memory_order_relaxed);
@@ -327,7 +388,6 @@ VSegmentPutStartResult VSegmentService::StartPut(
         manager->StartPut(operation_id, length, profile_name, route_epoch);
     if (result.error == ErrorCode::STALE_ROUTE)
         VSegmentMetrics::Instance().IncStaleRoute();
-    RefreshMetrics();
     return result;
 }
 
@@ -340,7 +400,6 @@ VSegmentPutStartResult VSegmentService::StartPutOwned(
                 "Partition is not owned by this SubMaster"};
     auto result = manager->StartPut(operation_id, length, profile_name,
                                     manager->RouteEpoch());
-    RefreshMetrics();
     return result;
 }
 
@@ -384,7 +443,6 @@ VSegmentService::StartPutReplicasOwned(
     // backpressure, but the RPC does not wait for storage durability. A master
     // failure may therefore lose an unfinished reservation in either path.
     batch.DiscardDurabilityWaits();
-    RefreshMetrics();
     return results;
 }
 
@@ -401,7 +459,6 @@ ErrorCode VSegmentService::CommitPut(const VSegmentDescriptor& replica,
                                      object_id, &committed, route_epoch,
                                      &expected, batch);
     if (result != ErrorCode::OK) return result;
-    RefreshMetrics();
     return ErrorCode::OK;
 }
 
@@ -422,7 +479,6 @@ ErrorCode VSegmentService::AbortPut(const std::string& partition_id,
     if (!manager) return ErrorCode::STALE_ROUTE;
     const auto result =
         manager->AbortPut(vsegment_id, operation_id, route_epoch);
-    RefreshMetrics();
     return result;
 }
 
@@ -452,7 +508,6 @@ ErrorCode VSegmentService::ReleaseObject(const VSegmentDescriptor& replica,
         VSegmentMetrics::Instance().IncReleaseSuccess();
     else
         VSegmentMetrics::Instance().IncReleaseFailure();
-    RefreshMetrics();
     return result == ErrorCode::OBJECT_NOT_FOUND ? ErrorCode::OK : result;
 }
 
@@ -474,24 +529,6 @@ ErrorCode VSegmentService::LoadView(const std::string& partition_id,
 size_t VSegmentService::PartitionCount() {
     std::lock_guard<std::mutex> lock(mutex_);
     return partitions_.size();
-}
-
-size_t VSegmentService::VSegmentCount() {
-    std::vector<std::shared_ptr<VSegmentManager>> managers;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        managers.reserve(partitions_.size());
-        for (const auto& [id, manager] : partitions_) {
-            (void)id;
-            managers.push_back(manager);
-        }
-    }
-    size_t count = 0;
-    for (const auto& manager : managers) {
-        const auto stats = manager->Stats();
-        count += stats.active + stats.preparing;
-    }
-    return count;
 }
 
 }  // namespace mooncake::vsegment

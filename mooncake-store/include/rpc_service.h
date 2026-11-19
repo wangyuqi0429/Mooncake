@@ -330,6 +330,8 @@ class WrappedMasterService {
     // RPC endpoint). Starts/stops the peer discovery + connection pools.
     ErrorCode StartInterMasterRpc();
     void StopInterMasterRpc();
+    // Forwarded to MasterService: stops the vsegment metrics refresh thread.
+    void StopVSegmentMetrics();
 
     // Inter-master handshake RPC: returns this submaster's identity and
     // ownership summary so peers can verify the inter-master channel.

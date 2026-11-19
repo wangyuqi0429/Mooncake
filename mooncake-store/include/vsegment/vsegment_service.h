@@ -5,8 +5,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -21,11 +23,27 @@ namespace mooncake::vsegment {
 class VSegmentService final {
    public:
     // Reads MOONCAKE_VSEGMENT_METRICS_REFRESH_INTERVAL_MS, defaulting to
-    // 1000 ms. A value of 0 disables refresh throttling.
+    // 1000 ms. A value of 0 disables the automatic metrics refresh thread;
+    // gauges then only change on explicit RefreshMetrics(true).
     explicit VSegmentService(PartitionPhysicalQuotaSnapshot quota_snapshot);
     // Explicit interval injection is retained for tests.
     VSegmentService(PartitionPhysicalQuotaSnapshot quota_snapshot,
                     std::chrono::milliseconds metrics_refresh_interval);
+    ~VSegmentService();
+
+    VSegmentService(const VSegmentService&) = delete;
+    VSegmentService& operator=(const VSegmentService&) = delete;
+    VSegmentService(VSegmentService&&) = delete;
+    VSegmentService& operator=(VSegmentService&&) = delete;
+
+    // Starts the periodic metrics refresh thread (idempotent). A new serving
+    // generation starts from zero gauges so a promoted instance does not show
+    // the previous leader's values. No thread is started when the interval is
+    // zero or thread creation fails (the latter logs a warning and degrades).
+    void Start();
+    // Stops the refresh thread and joins it. Idempotent and safe to call from
+    // the serving-instance teardown path.
+    void Stop();
 
     ErrorCode AddPartition(
         const std::string& partition_id, uint64_t route_epoch,
@@ -60,11 +78,9 @@ class VSegmentService final {
         return partition_configs_.count(partition_id) != 0;
     }
     const std::vector<std::string>& PartitionIds() const { return partition_ids_; }
-    // Observability getters for the periodic VSegment Status log line:
-    // number of installed partition managers, and the number of vsegments
-    // (active + preparing) across them.
+    // Observability getter for the periodic VSegment Status log line:
+    // number of installed partition managers.
     size_t PartitionCount();
-    size_t VSegmentCount();
     // 注入运行时坏端点排除集提供者，并向所有已存在的 partition manager
     // 透传；后续新增的 manager 在 AddPartition 时同样透传。物理分配时用
     // 于把新 vsegment 的条带成员避开已判死的物理段。
@@ -110,6 +126,7 @@ class VSegmentService final {
    private:
     std::shared_ptr<VSegmentManager> FindPartition(
         const std::string& partition_id);
+    void RefreshLoop();
 
     PartitionPhysicalQuotaSnapshot quota_snapshot_;
     // Immutable indexes avoid scanning all quotas for each acquired slot.
@@ -123,6 +140,13 @@ class VSegmentService final {
     std::chrono::milliseconds metrics_refresh_interval_;
     std::atomic<int64_t> last_metrics_refresh_ns_{0};
     std::mutex metrics_refresh_mutex_;
+    // Refresh-thread lifecycle. Stop() sets the flag and releases the
+    // semaphore so an in-flight sleep returns immediately; start/stop are
+    // serialized by refresh_start_mutex_ and are idempotent.
+    std::mutex refresh_start_mutex_;
+    std::thread refresh_thread_;
+    std::atomic<bool> refresh_running_{false};
+    std::binary_semaphore refresh_stop_sem_{0};
 };
 
 }  // namespace mooncake::vsegment

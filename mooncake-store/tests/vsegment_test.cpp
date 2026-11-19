@@ -1958,7 +1958,7 @@ TEST(VSegmentServiceTest, OwnsPartitionPutAndViewLifecycle) {
               ErrorCode::STALE_ROUTE);
 }
 
-TEST(VSegmentServiceTest, ThrottlesMetricsRefreshAndForcesOnOwnershipChange) {
+TEST(VSegmentServiceTest, DataPathDoesNotRefreshMetrics) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 1;
     snapshot.policy_digest = "policy";
@@ -1969,8 +1969,8 @@ TEST(VSegmentServiceTest, ThrottlesMetricsRefreshAndForcesOnOwnershipChange) {
                         "DRAM",
                         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
 
-    // A long window makes non-forced refreshes deterministic no-ops.
-    VSegmentService service(snapshot, std::chrono::hours(1));
+    // Zero interval: no background thread, so only explicit refreshes publish.
+    VSegmentService service(snapshot, std::chrono::milliseconds(0));
     ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
               ErrorCode::OK);
     // quota = 2 segments x 512 B; capacity = 4 units / 2 members x 2 members
@@ -1987,12 +1987,17 @@ TEST(VSegmentServiceTest, ThrottlesMetricsRefreshAndForcesOnOwnershipChange) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     ASSERT_TRUE(started) << started.detail;
-    // Non-forced refresh is throttled: the new reservation is not visible.
+    // The Put path no longer touches the gauges.
     EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 0u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 0u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_formed_capacity_bytes"), 512u);
 
-    // An ownership change forces a refresh: the removed Partition is gone.
+    // An explicit refresh observes the in-flight reservation.
+    service.RefreshMetrics(true);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 80u);
+
+    // An ownership change still refreshes synchronously.
     ASSERT_EQ(service.RemovePartition("partition-1", 9), ErrorCode::OK);
     EXPECT_EQ(MetricValue("mooncake_vsegment_total_capacity_bytes"), 0u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_quota_bytes"), 0u);
@@ -2009,7 +2014,7 @@ TEST(VSegmentServiceTest, ReportsPoolCapacityUsageAndReservations) {
                         "DRAM",
                         {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
 
-    // Zero interval: every vsegment operation refreshes the gauges.
+    // No background thread: each step refreshes explicitly.
     VSegmentService service(snapshot, std::chrono::milliseconds(0));
     ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
               ErrorCode::OK);
@@ -2028,6 +2033,7 @@ TEST(VSegmentServiceTest, ReportsPoolCapacityUsageAndReservations) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     ASSERT_TRUE(started) << started.detail;
+    service.RefreshMetrics(true);
     EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 80u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_reserved_bytes"), 80u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_available_bytes"), 944u);
@@ -2037,19 +2043,21 @@ TEST(VSegmentServiceTest, ReportsPoolCapacityUsageAndReservations) {
 
     ASSERT_EQ(service.CommitPut(started.replica, 8, "put-1", "object-1"),
               ErrorCode::OK);
+    service.RefreshMetrics(true);
     EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 80u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_reserved_bytes"), 0u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_committed_allocations"), 1u);
 
     ASSERT_EQ(service.ReleaseObject(started.replica, "object-1"),
               ErrorCode::OK);
+    service.RefreshMetrics(true);
     EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 0u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_available_bytes"), 1024u);
     EXPECT_EQ(MetricValue("mooncake_vsegment_committed_allocations"), 0u);
     EXPECT_DOUBLE_EQ(MetricDoubleValue("mooncake_vsegment_used_ratio"), 0.0);
 }
 
-TEST(VSegmentServiceTest, ZeroIntervalRefreshesOnNonForcedCalls) {
+TEST(VSegmentServiceTest, ZeroIntervalStartsNoBackgroundRefresh) {
     PartitionPhysicalQuotaSnapshot snapshot;
     snapshot.config_generation = 1;
     snapshot.policy_digest = "policy";
@@ -2071,7 +2079,11 @@ TEST(VSegmentServiceTest, ZeroIntervalRefreshesOnNonForcedCalls) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     ASSERT_TRUE(started) << started.detail;
-    // Zero interval disables throttling: the reservation is visible.
+    // Zero interval starts no thread, so the reservation stays unpublished
+    // until an explicit refresh.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 0u);
+    service.RefreshMetrics(true);
     EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
 }
 
@@ -2102,7 +2114,238 @@ TEST(VSegmentServiceTest, ReadsMetricsRefreshIntervalFromEnvironment) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     ASSERT_TRUE(started) << started.detail;
+    // Environment value 0 disables the automatic refresh thread.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 0u);
+    service.RefreshMetrics(true);
     EXPECT_EQ(MetricValue("mooncake_vsegment_reservations"), 1u);
+}
+
+namespace {
+
+bool WaitForMetricValue(const std::string& name, uint64_t expected,
+                        std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (MetricValue(name) == expected) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return MetricValue(name) == expected;
+}
+
+uint64_t WaitForNonZeroMetric(const std::string& name,
+                              std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto value = MetricValue(name);
+        if (value != 0 && value != std::numeric_limits<uint64_t>::max())
+            return value;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return MetricValue(name);
+}
+
+uint64_t WaitForMetricChange(const std::string& name, uint64_t previous,
+                             std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto value = MetricValue(name);
+        if (value != previous) return value;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return MetricValue(name);
+}
+
+PartitionPhysicalQuotaSnapshot MetricTestSnapshot() {
+    PartitionPhysicalQuotaSnapshot snapshot;
+    snapshot.config_generation = 1;
+    snapshot.policy_digest = "policy";
+    snapshot.default_profile = "default";
+    snapshot.profile_specs = {Profile()};
+    snapshot.quotas = {{"partition-1",
+                        "default",
+                        "DRAM",
+                        {{"segment-a", 0, 512}, {"segment-b", 0, 512}}}};
+    return snapshot;
+}
+
+}  // namespace
+
+TEST(VSegmentServiceTest, BackgroundRefreshWithoutTraffic) {
+    VSegmentService service(MetricTestSnapshot(),
+                            std::chrono::milliseconds(20));
+    service.Start();
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_allocated_bytes"), 0u);
+
+    VSegmentPutStartResult started;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        started = service.StartPut("partition-1", 8, "put-1", 80);
+        if (started.error != ErrorCode::VSEGMENT_CREATING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(started) << started.detail;
+
+    // No further requests: the background thread must publish the reservation.
+    EXPECT_TRUE(WaitForMetricValue("mooncake_vsegment_allocated_bytes", 80,
+                                   std::chrono::milliseconds(1000)));
+    service.Stop();
+}
+
+TEST(VSegmentServiceTest, StartZeroesGauges) {
+    VSegmentGaugeValues stale;
+    stale.quota_bytes = 4096;
+    stale.total_capacity_bytes = 4096;
+    stale.last_refresh_timestamp_seconds = 123;
+    VSegmentMetrics::Instance().SetGauges(stale);
+
+    VSegmentService service(MetricTestSnapshot(), std::chrono::seconds(1));
+    service.Start();
+    EXPECT_EQ(MetricValue("mooncake_vsegment_quota_bytes"), 0u);
+    EXPECT_EQ(MetricValue("mooncake_vsegment_total_capacity_bytes"), 0u);
+    EXPECT_EQ(
+        MetricValue("mooncake_vsegment_metrics_last_refresh_timestamp_seconds"),
+        0u);
+    service.Stop();
+}
+
+TEST(VSegmentServiceTest, RefreshTimestampAdvances) {
+    const std::string name =
+        "mooncake_vsegment_metrics_last_refresh_timestamp_seconds";
+    VSegmentService service(MetricTestSnapshot(),
+                            std::chrono::milliseconds(20));
+    service.Start();
+    const auto first =
+        WaitForNonZeroMetric(name, std::chrono::milliseconds(2000));
+    ASSERT_NE(first, 0u);
+    ASSERT_NE(first, std::numeric_limits<uint64_t>::max());
+    // The timestamp has second granularity, so wait for the next second.
+    const auto second =
+        WaitForMetricChange(name, first, std::chrono::milliseconds(3000));
+    EXPECT_GT(second, first);
+    service.Stop();
+}
+
+TEST(VSegmentServiceTest, StopStopsRefreshThread) {
+    const std::string name =
+        "mooncake_vsegment_metrics_last_refresh_timestamp_seconds";
+    VSegmentService service(MetricTestSnapshot(),
+                            std::chrono::milliseconds(20));
+    service.Start();
+    ASSERT_NE(WaitForNonZeroMetric(name, std::chrono::milliseconds(2000)), 0u);
+    service.Stop();
+    EXPECT_EQ(MetricValue(name), 0u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(MetricValue(name), 0u);
+}
+
+TEST(VSegmentServiceTest, DestructorWakesFromLongInterval) {
+    auto done = std::async(std::launch::async, [] {
+        VSegmentService service(MetricTestSnapshot(), std::chrono::hours(1));
+        service.Start();
+        EXPECT_EQ(service.AddPartition("partition-1", 8, Committer()),
+                  ErrorCode::OK);
+    });
+    EXPECT_EQ(done.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+}
+
+TEST(VSegmentServiceTest, ConcurrentRefreshDuringRemove) {
+    VSegmentService service(MetricTestSnapshot(), std::chrono::milliseconds(0));
+    ASSERT_EQ(service.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> text_ok{true};
+    std::thread refresher([&] {
+        while (!stop.load()) service.RefreshMetrics(true);
+    });
+    std::thread churner([&] {
+        uint64_t epoch = 100;
+        for (int i = 0; i < 50; ++i) {
+            service.RemovePartition("partition-1", ++epoch);
+            service.AddPartition("partition-1", ++epoch, Committer());
+        }
+    });
+    for (int i = 0; i < 200; ++i) {
+        const auto text = VSegmentMetrics::Instance().Serialize();
+        if (text.find("mooncake_vsegment_available_bytes") ==
+            std::string::npos)
+            text_ok.store(false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    churner.join();
+    stop.store(true);
+    refresher.join();
+    EXPECT_TRUE(text_ok.load());
+    EXPECT_LE(MetricValue("mooncake_vsegment_available_bytes"),
+              MetricValue("mooncake_vsegment_total_capacity_bytes"));
+}
+
+TEST(VSegmentServiceTest, ForceRefreshCompletesUnderBackgroundTicks) {
+    VSegmentService service(MetricTestSnapshot(), std::chrono::milliseconds(1));
+    service.Start();
+    const auto begin = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) service.RefreshMetrics(true);
+    const auto elapsed = std::chrono::steady_clock::now() - begin;
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    service.Stop();
+}
+
+TEST(VSegmentMetricsTest, ConsistencyWithRefreshTimestamp) {
+    auto& metrics = VSegmentMetrics::Instance();
+    metrics.SetGauges(VSegmentGaugeValues{});
+    std::atomic<bool> stop{false};
+    std::thread writer([&] {
+        for (uint64_t i = 1; i <= 5000 && !stop.load(); ++i) {
+            VSegmentGaugeValues values;
+            values.quota_bytes = i;
+            values.total_capacity_bytes = 2 * i;
+            values.available_bytes = 3 * i;
+            values.last_refresh_timestamp_seconds = i;
+            metrics.SetGauges(values);
+        }
+    });
+    bool consistent = true;
+    for (int i = 0; i < 200; ++i) {
+        const auto timestamp = metrics.last_refresh_timestamp_seconds();
+        const auto quota = metrics.quota_bytes();
+        const auto available = metrics.available_bytes();
+        // Values are monotonically increasing with the timestamp; a reader
+        // that sees timestamp T must not see values older than T.
+        if (timestamp != 0 && (quota < timestamp || available < 3 * timestamp))
+            consistent = false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    stop.store(true);
+    writer.join();
+    EXPECT_TRUE(consistent);
+    metrics.SetGauges(VSegmentGaugeValues{});
+}
+
+TEST(VSegmentServiceTest, StartStopAcrossGenerations) {
+    {
+        VSegmentService first(MetricTestSnapshot(),
+                              std::chrono::milliseconds(20));
+        first.Start();
+        ASSERT_EQ(first.AddPartition("partition-1", 8, Committer()),
+                  ErrorCode::OK);
+        EXPECT_TRUE(WaitForMetricValue(
+            "mooncake_vsegment_total_capacity_bytes", 1024,
+            std::chrono::milliseconds(1000)));
+        first.Stop();
+        EXPECT_EQ(MetricValue("mooncake_vsegment_total_capacity_bytes"), 0u);
+    }
+    // A new serving generation starts from zero and repopulates on its own.
+    VSegmentService second(MetricTestSnapshot(), std::chrono::milliseconds(20));
+    second.Start();
+    EXPECT_EQ(MetricValue("mooncake_vsegment_total_capacity_bytes"), 0u);
+    ASSERT_EQ(second.AddPartition("partition-1", 8, Committer()),
+              ErrorCode::OK);
+    EXPECT_TRUE(WaitForMetricValue(
+        "mooncake_vsegment_total_capacity_bytes", 1024,
+        std::chrono::milliseconds(1000)));
+    second.Stop();
 }
 
 TEST(VSegmentServiceTest, RejectsDescriptorMismatchBeforeCommit) {
