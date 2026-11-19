@@ -222,6 +222,11 @@ class VSegmentManager {
                                   Lifecycle target);
 
     PartitionVSegmentSnapshot Snapshot() const;
+    // 候补（备用卷）：非阻塞。若该 profile 的"当下可服务卷数"低于目标水位，
+    // 就复用 RequestCreate 的异步单飞路径补建 1 条；失败按 100ms→5s 指数退避。
+    // spare_target == 0 时为空操作（完全等价旧行为）。
+    void MaybeReplenish(const std::string& profile_name);
+    void MaybeReplenishAll();
     ErrorCode Restore(const PartitionVSegmentSnapshot& snapshot,
                       std::string* detail = nullptr);
     ErrorCode ReconcileObjectReferences(
@@ -265,6 +270,20 @@ class VSegmentManager {
     // Static capacity derived from quota_configs_ and profiles_; constant
     // after construction.
     void ComputePoolCapacity();
+    // ---- 候补（备用卷）水位：以下 *Locked 均需持有 mutex_ ----
+    // 记录一次写长度，用于自动推导 "能接住一次写" 的判据 L（带时间衰减）。
+    void NoteWriteLength(uint64_t length);
+    uint64_t CandidateLengthLocked(const VSegmentProfile& profile) const;
+    size_t ActiveCountLocked(const std::string& profile_name) const;
+    size_t ServiceableCountLocked(const std::string& profile_name,
+                                  uint64_t candidate_length) const;
+    // 该 profile 还能再建几条卷：各 psegment 剩余配额 / member_extent_size 的最小值。
+    size_t QuotaHeadroomLocked(const VSegmentProfile& profile) const;
+    // 目标水位 T = min(现有+余量, max(initial, 1 + spare_target))；关闭时返回现有条数。
+    size_t SpareTargetLocked(const std::string& profile_name) const;
+    void ClearSpareBackoffLocked(const std::string& profile_name);
+    void RecordSpareFailureLocked(const std::string& profile_name,
+                                  ErrorCode error, const std::string& detail);
     std::string partition_id_;
     uint64_t config_generation_{0};
     uint64_t quota_bytes_{0};
@@ -294,6 +313,20 @@ class VSegmentManager {
                        std::shared_future<VSegmentAllocationResult>>
         pending_creations_;
     std::function<std::set<std::string>()> excluded_segments_provider_;
+    // ---- 候补（备用卷）状态 ----
+    // 热路径只置一个 bit；由 StartPut 出锁后消费，避免在锁内做建卷。
+    std::atomic<bool> replenish_pending_{false};
+    // 近期写长度的最大值（自动 C 的判据），每 60s 减半，避免一次性大对象永久抬高水位。
+    std::atomic<uint64_t> observed_max_length_{0};
+    std::atomic<int64_t> last_length_decay_ms_{0};
+    // per profile 的失败退避（mutex_ 保护）。
+    struct SpareBackoff {
+        uint32_t failures{0};
+        int64_t next_attempt_ms{0};
+        // 配额已经不够再建卷：只告警一次，不再反复尝试（否则每次写满都打 -104）。
+        bool quota_warned{false};
+    };
+    std::unordered_map<std::string, SpareBackoff> spare_backoff_;
 };
 
 }  // namespace mooncake::vsegment

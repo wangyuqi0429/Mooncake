@@ -214,6 +214,9 @@ ErrorCode VSegmentService::AddPartition(
     // reconciliation can safely retry only the missing count.
     result = manager->EnsureInitialVSegments(detail, batch);
     if (!batch) RefreshMetrics(true);
+    // 候补：装配完成后可服务卷数通常低于目标水位（initial 默认 1，T 默认 2）。
+    // 这里只点一次火，真正的建卷在 RequestCreate 的异步单飞里跑，不拉长装配时间。
+    if (result == ErrorCode::OK) manager->MaybeReplenishAll();
     return result;
 }
 
@@ -276,7 +279,10 @@ ErrorCode VSegmentService::ReconcilePartitionRoute(
     if (manager) {
         auto result = manager->SetRouteEpoch(route.route_epoch);
         if (result != ErrorCode::OK) return result;
-        return manager->EnsureInitialVSegments(detail, batch);
+        result = manager->EnsureInitialVSegments(detail, batch);
+        // 失主重获/续租后同样补到水位（spare_target=0 时为空操作）。
+        if (result == ErrorCode::OK) manager->MaybeReplenishAll();
+        return result;
     }
     return AddPartition(partition_id, route.route_epoch,
                         std::move(committer), recovered, detail, batch);

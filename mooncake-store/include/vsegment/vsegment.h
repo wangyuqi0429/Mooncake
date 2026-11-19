@@ -35,10 +35,15 @@ struct VSegmentProfile {
     uint64_t io_alignment{1};
     std::string required_medium;
     uint32_t initial_vsegment_count{1};
+    // 候补（备用卷）水位：0 = 关闭（完全等价旧行为）；>0 表示在 R=1 的前提下，
+    // 每个 partition 额外维持这么多条"当下就能接住一次写"的卷。
+    uint32_t spare_target{0};
+    // 判定"能接住一次写"所用的写入长度上界；0 = 自动（近期观测到的最大写长度）。
+    uint64_t candidate_length_bytes{0};
 };
 YLT_REFL(VSegmentProfile, name, member_count, stripe_size,
          member_extent_size, io_alignment, required_medium,
-         initial_vsegment_count);
+         initial_vsegment_count, spare_target, candidate_length_bytes);
 
 using VSegmentProfileSpec = VSegmentProfile;
 

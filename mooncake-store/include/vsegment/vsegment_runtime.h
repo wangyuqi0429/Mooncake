@@ -113,6 +113,14 @@ class LogicalRangeAllocator {
     // Bytes held by in-flight PutStart reservations. Together with
     // FreeBytes() and the committed ranges this partitions logical_capacity_.
     uint64_t ReservedBytes() const;
+    // Longest contiguous free range; 0 when no free range is left.
+    // A vsegment can serve a write of length L iff LargestFreeExtent() >= L:
+    // Reserve() is first-fit over single free ranges, so the sum of free bytes
+    // is not a sufficient test (fragmentation can make it lie).
+    uint64_t LargestFreeExtent() const;
+    bool CanReserve(uint64_t length) const {
+        return LargestFreeExtent() >= length;
+    }
     size_t ReservationCount() const;
     size_t CommittedCount() const;
     bool Empty() const;
