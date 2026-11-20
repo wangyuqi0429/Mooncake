@@ -83,7 +83,7 @@ uint32_t ReadMetricsSectionsFromEnv() {
     set("MC_MASTER_METRICS_PROMOTION", MasterMetricsSection::kPromotion,
         false);
     set("MC_MASTER_METRICS_HA", MasterMetricsSection::kHa, true);
-    set("MC_MASTER_METRICS_VSEGMENT", MasterMetricsSection::kVsegment, false);
+    set("MC_MASTER_METRICS_VSEGMENT", MasterMetricsSection::kVsegment, true);
     return sections;
 }
 
