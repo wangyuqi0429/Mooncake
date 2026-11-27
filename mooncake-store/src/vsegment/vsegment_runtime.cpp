@@ -312,6 +312,14 @@ uint64_t LogicalRangeAllocator::ReservedBytes() const {
     return bytes;
 }
 
+uint64_t LogicalRangeAllocator::LargestFreeExtent() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    uint64_t largest = 0;
+    for (const auto& range : free_ranges_)
+        largest = std::max(largest, range.length);
+    return largest;
+}
+
 size_t LogicalRangeAllocator::ReservationCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return reservations_.size();

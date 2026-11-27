@@ -67,10 +67,11 @@ ErrorCode BuildDiscoveredQuotaPlan(
     //     介质对应的 profile。
     const bool auto_medium_mode = policy.required_medium.empty();
     if (!auto_medium_mode) {
-        next.profile_specs = {{policy.profile_name, policy.member_count,
-                               policy.stripe_size, policy.member_extent_size,
-                               policy.io_alignment, policy.required_medium,
-                               policy.initial_vsegment_count}};
+        next.profile_specs = {
+            {policy.profile_name, policy.member_count, policy.stripe_size,
+             policy.member_extent_size, policy.io_alignment,
+             policy.required_medium, policy.initial_vsegment_count,
+             policy.spare_target, policy.candidate_length_bytes}};
         auto error = ValidateProfile(next.profile_specs.front(), detail);
         if (error != ErrorCode::OK) return error;
     }
@@ -160,8 +161,8 @@ ErrorCode BuildDiscoveredQuotaPlan(
             next.profile_specs.push_back(
                 {policy.profile_name + "-" + medium, policy.member_count,
                  policy.stripe_size, policy.member_extent_size,
-                 policy.io_alignment, medium,
-                 policy.initial_vsegment_count});
+                 policy.io_alignment, medium, policy.initial_vsegment_count,
+                 policy.spare_target, policy.candidate_length_bytes});
         }
         if (next.profile_specs.empty()) {
             if (detail) {

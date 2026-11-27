@@ -45,10 +45,16 @@ struct VSegmentUserPolicy {
     uint32_t initial_vsegment_count = 1;
     double reserved_ratio = 0.0;    // 默认不预留
     uint64_t config_generation = 1;
+    // 候补（备用卷）：0 = 关闭；>0 = 每个 partition
+    // 额外维持的备用卷条数（R=1）。
+    uint32_t spare_target = 0;
+    // 候补判定用的写入长度上界；0 = 自动（近期最大写长度）。
+    uint64_t candidate_length_bytes = 0;
 };
 YLT_REFL(VSegmentUserPolicy, member_count, stripe_size, member_extent_size,
          default_profile, profile_name, required_medium, io_alignment,
-         initial_vsegment_count, reserved_ratio, config_generation);
+         initial_vsegment_count, reserved_ratio, config_generation,
+         spare_target, candidate_length_bytes);
 
 // 从 CVM 自动发现的资源事实（SegmentDescriptor + MountEntry +
 // MasterRegistration）构建配额规划请求。资源事实（psegment ID、容量、

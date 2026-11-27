@@ -55,6 +55,16 @@ DEFINE_double(reserved_ratio, 0.0,
               "Default 0 means no reservation.");
 DEFINE_uint32(initial_vsegment_count, 1,
               "Initial vsegment count per partition. Default 1.");
+DEFINE_uint32(
+    spare_target, 0,
+    "Spare vsegment count per partition (0 = disabled). When > 0, the "
+    "master keeps `1 + spare_target` serviceable vsegments (R=1) so a "
+    "write never hits the creation window. Default 0.");
+DEFINE_uint64(
+    candidate_length_bytes, 0,
+    "Write length used to judge whether a vsegment can serve the next "
+    "write; 0 = automatic (recent maximum, capped at logical "
+    "capacity). Default 0.");
 DEFINE_string(default_profile, "default",
               "Default profile name. Default \"default\".");
 DEFINE_string(profile_name, "default",
@@ -308,6 +318,8 @@ int RunFromDiscovery(mooncake::vsegment::PartitionQuotaPlanRequest& request) {
     policy.initial_vsegment_count = FLAGS_initial_vsegment_count;
     policy.reserved_ratio = FLAGS_reserved_ratio;
     policy.config_generation = FLAGS_config_generation;
+    policy.spare_target = FLAGS_spare_target;
+    policy.candidate_length_bytes = FLAGS_candidate_length_bytes;
     std::string detail;
     error = mooncake::vsegment::BuildDiscoveredQuotaPlan(
         policy, descriptors, masters, mounts, &request, &detail,

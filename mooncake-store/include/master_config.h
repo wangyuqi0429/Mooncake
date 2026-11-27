@@ -276,6 +276,9 @@ class MasterServiceSupervisorConfig {
     uint64_t vsegment_auto_plan_stripe_size = 0;
     uint64_t vsegment_auto_plan_member_extent_size = 0;
     double vsegment_auto_plan_reserved_ratio = 0.0;
+    // 候补（备用卷）策略：0 = 关闭；candidate_length_bytes 0 = 自动。
+    uint32_t vsegment_auto_plan_spare_target = 0;
+    uint64_t vsegment_auto_plan_candidate_length_bytes = 0;
 
     // Metrics reporting to HA backend (etcd/redis).
     bool enable_metrics_report_to_backend =
