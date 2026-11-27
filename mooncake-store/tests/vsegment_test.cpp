@@ -3397,7 +3397,8 @@ TEST(VSegmentManagerTest, RejectsWriteLargerThanLogicalCapacity) {
 
 TEST(VSegmentSpareTest, DisabledByDefaultCreatesNothingBeyondInitial) {
     auto committer = Committer();
-    VSegmentManager manager(Config(), {Profile()}, committer);  // spare_target=0
+    VSegmentManager manager(Config(), {Profile()},
+                            committer);  // spare_target=0
     ASSERT_EQ(manager.EnsureInitialVSegments(), ErrorCode::OK);
     // 两次 256 写满唯一一条卷：关闭候补时不应有任何额外建卷。
     ASSERT_TRUE(manager.StartPut("put-1", 256));

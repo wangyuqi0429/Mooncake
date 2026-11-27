@@ -277,9 +277,11 @@ class VSegmentManager {
     size_t ActiveCountLocked(const std::string& profile_name) const;
     size_t ServiceableCountLocked(const std::string& profile_name,
                                   uint64_t candidate_length) const;
-    // 该 profile 还能再建几条卷：各 psegment 剩余配额 / member_extent_size 的最小值。
+    // 该 profile 还能再建几条卷：各 psegment 剩余配额 / member_extent_size
+    // 的最小值。
     size_t QuotaHeadroomLocked(const VSegmentProfile& profile) const;
-    // 目标水位 T = min(现有+余量, max(initial, 1 + spare_target))；关闭时返回现有条数。
+    // 目标水位 T = min(现有+余量, max(initial, 1 +
+    // spare_target))；关闭时返回现有条数。
     size_t SpareTargetLocked(const std::string& profile_name) const;
     void ClearSpareBackoffLocked(const std::string& profile_name);
     void RecordSpareFailureLocked(const std::string& profile_name,
@@ -316,14 +318,16 @@ class VSegmentManager {
     // ---- 候补（备用卷）状态 ----
     // 热路径只置一个 bit；由 StartPut 出锁后消费，避免在锁内做建卷。
     std::atomic<bool> replenish_pending_{false};
-    // 近期写长度的最大值（自动 C 的判据），每 60s 减半，避免一次性大对象永久抬高水位。
+    // 近期写长度的最大值（自动 C 的判据），每 60s
+    // 减半，避免一次性大对象永久抬高水位。
     std::atomic<uint64_t> observed_max_length_{0};
     std::atomic<int64_t> last_length_decay_ms_{0};
     // per profile 的失败退避（mutex_ 保护）。
     struct SpareBackoff {
         uint32_t failures{0};
         int64_t next_attempt_ms{0};
-        // 配额已经不够再建卷：只告警一次，不再反复尝试（否则每次写满都打 -104）。
+        // 配额已经不够再建卷：只告警一次，不再反复尝试（否则每次写满都打
+        // -104）。
         bool quota_warned{false};
     };
     std::unordered_map<std::string, SpareBackoff> spare_backoff_;

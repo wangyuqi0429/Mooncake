@@ -1568,10 +1568,10 @@ BuildVSegmentAutoPlanPolicy(const mooncake::MasterConfig& config) {
     policy.spare_target = FLAGS_vsegment_spare_target;
     policy.candidate_length_bytes = FLAGS_vsegment_candidate_length_bytes;
     LOG(INFO) << "VSegment auto-plan policy: member_count="
-              << policy.member_count << ", stripe_size="
-              << policy.stripe_size << ", member_extent_size="
-              << policy.member_extent_size << ", reserved_ratio="
-              << policy.reserved_ratio << ", required_medium="
+              << policy.member_count << ", stripe_size=" << policy.stripe_size
+              << ", member_extent_size=" << policy.member_extent_size
+              << ", reserved_ratio=" << policy.reserved_ratio
+              << ", required_medium="
               << (policy.required_medium.empty() ? "auto"
                                                  : policy.required_medium)
               << ", io_alignment=" << policy.io_alignment

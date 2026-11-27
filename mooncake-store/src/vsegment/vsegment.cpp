@@ -136,12 +136,13 @@ ErrorCode ValidateProfile(const VSegmentProfile& profile, std::string* detail) {
         std::numeric_limits<uint64_t>::max() / profile.member_count) {
         return Invalid("profile logical_capacity overflows", detail);
     }
-    // 候补水位：0 = 关闭；上限只是防呆（每条备用卷都占一份 member_count×E 的配额）。
+    // 候补水位：0 = 关闭；上限只是防呆（每条备用卷都占一份 member_count×E
+    // 的配额）。
     constexpr uint32_t kMaxSpareTarget = 8;
     if (profile.spare_target > kMaxSpareTarget) {
-        return Invalid("spare_target must be at most " +
-                           std::to_string(kMaxSpareTarget),
-                       detail);
+        return Invalid(
+            "spare_target must be at most " + std::to_string(kMaxSpareTarget),
+            detail);
     }
     if (profile.candidate_length_bytes != 0) {
         const uint64_t logical_capacity =
